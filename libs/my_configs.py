@@ -1,47 +1,109 @@
-import dataclasses
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import List, Tuple, Optional, Any, Dict
+import numpy as np
+
+# Sionna imports for type hints (mocked or real depending on environment)
+# In a real environment, you would import these properly if available for type checking.
+# from sionna.rt import Scene, PlanarArray, Transmitter, Receiver, Camera
+# from sionna.phy.mimo import StreamManagement
+# from sionna.phy.ofdm import ResourceGrid
+# from sionna.phy.nr import CarrierConfig
 
 @dataclass
-class AntennaConfig:
-    """アンテナ設定"""
-    pattern: str = "iso"            # アンテナパターン (e.g., 'iso', '3gpp-3d')
-    polarization: str = "VH"        # 偏波 (e.g., 'VH', 'V', 'H')
-    tilt_angle: float = 0.0         # チルト角 [deg]
-    num_rows: int = 1               # 行数
-    num_cols: int = 1               # 列数
-    element_spacing_row: float = 0.5 # 行間隔 [lambda]
-    element_spacing_col: float = 0.5 # 列間隔 [lambda]
+class SceneConfig:
+    """Configuration for sionna.rt.Scene"""
+    # Using 'filename' instead of loading from file inside config,
+    # but strictly mirroring __init__ might imply passing the loaded scene.
+    # Here we define parameters to *load* or *configure* the scene.
+    filename: Optional[str] = None
+    frequency: float = 3.5e9 # Hz
+    synthetic_array: bool = False
+    dtype: Any = "complex64" # tf.complex64
 
 @dataclass
-class WaveformConfig:
-    """波形・変調設定 (主にLinkレベル用)"""
-    modulation: str = "QAM16"       # 変調方式
-    coderate: float = 0.5           # 符号化率
-    subcarrier_spacing: float = 30e3 # サブキャリア間隔 [Hz]
-    num_ofdm_symbols: int = 14      # OFDMシンボル数
+class PlanarArrayConfig:
+    """Configuration for sionna.rt.PlanarArray"""
+    num_rows: int = 1
+    num_cols: int = 1
+    vertical_spacing: float = 0.5
+    horizontal_spacing: float = 0.5
+    pattern: str = "iso"
+    polarization: str = "VH"
+
 
 @dataclass
-class SimulationParameters:
-    """シミュレーション共通物理パラメータ"""
-    carrier_frequency: float = 3.5e9 # キャリア周波数 [Hz]
-    bandwidth: float = 100e6         # 帯域幅 [Hz]
-    noise_power: float = -174.0      # ノイズ電力密度 [dBm/Hz] (または絶対値)
+class TransmitterConfig:
+    """Configuration for sionna.rt.Transmitter"""
+    name: str
+    position: List[float] # [x, y, z]
+    orientation: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0]) # [yaw, pitch, roll]
+
+    # In Sionna, you pass an AntennaArray instance to Transmitter.
+    # Here we nest the config to create it.
+    antenna_array: PlanarArrayConfig = field(default_factory=PlanarArrayConfig)
 
 @dataclass
-class MasterConfig:
-    """
-    全ての実験設定を統括するクラス
-    実験カテゴリとRunning Nameを持ち、結果出力パスの解決に使われる
-    """
-    # [管理用メタデータ]
-    exp_category: str = "default"    # 実験カテゴリ (フォルダ名に対応)
-    run_name: str = "run001"         # 実行名 (結果フォルダ名に対応)
+class ReceiverConfig:
+    """Configuration for sionna.rt.Receiver"""
+    name: str
+    position: List[float] # [x, y, z]
+    orientation: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    antenna_array: PlanarArrayConfig = field(default_factory=PlanarArrayConfig)
 
-    # [物理層/システム設定]
-    antenna: AntennaConfig = field(default_factory=AntennaConfig)
-    waveform: WaveformConfig = field(default_factory=WaveformConfig)
-    params: SimulationParameters = field(default_factory=SimulationParameters)
+@dataclass
+class RayTracingConfig:
+    """Parameters for PathSolver.__call__"""
+    max_depth: int = 10
+    samples_per_src: int = 1000000
+    max_num_paths_per_src: int = 1000000
+    synthetic_array: bool = True
+    los: bool = True
+    specular_reflection: bool = True
+    diffuse_reflection: bool = False
+    refraction: bool = True
+    diffraction: bool = False
+    edge_diffraction: bool = False
+    diffraction_lit_region: bool = True
+    seed: int = 42
 
-    # [その他拡張用]
-    extra_params: Dict[str, Any] = field(default_factory=dict)
+# --- Logical Layer Configs (PHY) ---
+
+@dataclass
+class StreamManagementConfig:
+    """Configuration for sionna.phy.mimo.StreamManagement"""
+    rx_tx_association: np.ndarray # matrix of 0s and 1s
+    num_streams_per_tx: int = 1
+
+@dataclass
+class ResourceGridConfig:
+    """Configuration for sionna.phy.ofdm.ResourceGrid"""
+    num_ofdm_symbols: int = 14
+    fft_size: int = 64
+    subcarrier_spacing: float = 30e3
+    num_tx: int = 1
+    num_streams_per_tx: int = 1
+    cyclic_prefix_length: int = 0
+    pilot_pattern: Optional[str] = "kronecker"
+    pilot_ofdm_symbol_indices: Optional[List[int]] = field(default_factory=lambda: [2, 11])
+
+@dataclass
+class CarrierConfigConfig: # Naming collision potential, keeping consistent with Sionna class name suffix
+    """Configuration for sionna.phy.nr.CarrierConfig"""
+    n_cell_id: int = 1
+    subcarrier_spacing: float = 30
+    cyclic_prefix: str = "normal"
+    # ... add other parameters as needed from Sionna NR
+
+# --- Master Config ---
+
+@dataclass
+class SimulationConfig:
+    """Master configuration for the simulation run"""
+    scene: SceneConfig
+    transmitters: List[TransmitterConfig]
+    receivers: List[ReceiverConfig]
+    ray_tracing: RayTracingConfig
+
+    # Optional PHY layer configs
+    image_filename: Optional[str] = None # For saving coverage map etc.
+    output_dir: str = "results"

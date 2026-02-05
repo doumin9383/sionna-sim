@@ -1,85 +1,105 @@
 import os
-import sys
-import json
+import time
 import dataclasses
-from abc import ABC, abstractmethod
-from typing import Any
-
-# libs がパス解決されている前提でのインポート
-# 実験スクリプト側で sys.path.append される
-try:
-    from libs.my_configs import MasterConfig
-except ImportError:
-    # 開発中の単体テスト用などのフォールバック
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    from libs.my_configs import MasterConfig
+from dataclasses import asdict
+import tensorflow as tf
+import sionna
+from sionna.rt import Scene, PlanarArray, Transmitter, Receiver, Camera, PathSolver
+from libs.my_configs import SimulationConfig
+import numpy as np
 
 class SionnaRunner:
-    """
-    Sionnaシミュレーション実行の基底ランナー
-    設定の保持、結果保存ディレクトリの解決、スナップショット保存を担当する
-    """
-    def __init__(self, config: MasterConfig):
-        self.c = config
+    def __init__(self, config: SimulationConfig):
+        self.cfg = config
+        self.scene = None
+        self._setup_output_dir()
 
-    def _prepare_save_dir(self, base_result_dir: str, mode: str) -> str:
-        """
-        保存先ディレクトリを作成する
-        path: {base_result_dir}/{exp_category}/{results}/{run_name}_{mode}
-        """
-        # ユーザー要望に基づき experiments/expXX/results/runXX 形式もサポートできるよう
-        # 引数 base_result_dir は呼び出し元で調整可能とするが、
-        # ここでは単純に join する実装とする。
-
-        # 例: experiments/exp01/results/tilt_0_link
-        save_dir = os.path.join(base_result_dir, f"{self.c.run_name}_{mode}")
-        os.makedirs(save_dir, exist_ok=True)
-        return save_dir
-
-    def _save_snapshot(self, save_dir: str):
-        """
-        現在の設定を再現可能なPythonコードとして保存する
-        """
-        snapshot_path = os.path.join(save_dir, "config_snapshot.py")
-
+    def _setup_output_dir(self):
+        os.makedirs(self.cfg.output_dir, exist_ok=True)
+        # Save config snapshot
+        snapshot_path = os.path.join(self.cfg.output_dir, "config_snapshot.py")
         with open(snapshot_path, "w") as f:
-            f.write("import sys\nimport os\n")
-            f.write("# プロジェクトルートへのパス解決 (環境に合わせて調整が必要になる場合あり)\n")
-            f.write("sys.path.append(os.path.abspath('../../../..'))\n\n")
+            f.write(f"from libs.my_configs import *\nimport numpy as np\n\n")
+            f.write(f"config = {repr(self.cfg)}")
 
-            f.write("from libs.my_configs import MasterConfig, AntennaConfig, WaveformConfig, SimulationParameters\n\n")
+    def load_scene(self):
+        """Loads and configures the Sionna Scene"""
+        # Create Scene
+        # Note: Scene() loading logic is complex, often involves load_scene(filename)
+        # Here we assume loading from file if provided, or empty
+        if self.cfg.scene.filename:
+            self.scene = sionna.rt.load_scene(self.cfg.scene.filename)
+        else:
+            self.scene = Scene() # Default empty scene or use other params
 
-            f.write("# Reconstructed Configuration\n")
-            f.write(f"config = {repr(self.c)}\n")
+        # Configure scene parameters
+        self.scene.frequency = self.cfg.scene.frequency
+        self.scene.synthetic_array = self.cfg.scene.synthetic_array
 
-        # JSON形式でも保存（可読性のため）
-        json_path = os.path.join(save_dir, "config.json")
+        # Add Transmitters
+        for tx_cfg in self.cfg.transmitters:
+            # Create Antenna Array
+            # unpack PlanarArrayConfig to PlanarArray
+            array_params = asdict(tx_cfg.antenna_array)
+            # 'pattern' is a string in config, PlanarArray expects string or callable.
+            # PlanarArray(..., pattern='iso', ...) works.
+
+            antenna_array = PlanarArray(**array_params)
+
+            # Set scene's tx_array before adding the transmitter
+            # Transmitter uses the currently set scene.tx_array designated by the scene
+            # or we need to ensure it's linked.
+            # In Sionna RT, standard flow is scene.tx_array = ..., scene.add(Transmitter(...))
+            self.scene.tx_array = antenna_array
+
+            # Create Transmitter
+            # Setup params, excluding 'antenna_array' from dict as we pass the object
+            tx_params = asdict(tx_cfg)
+            del tx_params['antenna_array'] # remove nested config dict
+
+            tx = Transmitter(**tx_params)
+            self.scene.add(tx)
+
+        # Add Receivers
+        for rx_cfg in self.cfg.receivers:
+            array_params = asdict(rx_cfg.antenna_array)
+            antenna_array = PlanarArray(**array_params)
+
+            # Set scene's rx_array
+            self.scene.rx_array = antenna_array
+
+            rx_params = asdict(rx_cfg)
+            del rx_params['antenna_array']
+
+            rx = Receiver(**rx_params)
+            self.scene.add(rx)
+
+    def run_ray_tracing(self):
+        """Executes compute_paths using PathSolver"""
+        if self.scene is None:
+            raise ValueError("Scene not loaded. Call load_scene() first.")
+
+        rt_params = asdict(self.cfg.ray_tracing)
+
+        solver = PathSolver()
+        paths = solver(self.scene, **rt_params)
+
+        # Example processing: coverage map or path collection
+        # For now, just return paths
+        return paths
+
+    def run(self):
+        print(f"Starting simulation...")
+        self.load_scene()
+        paths = self.run_ray_tracing()
+        print(f"Ray tracing computed. Paths object: {type(paths)}")
         try:
-            with open(json_path, "w") as f:
-                json.dump(dataclasses.asdict(self.c), f, indent=4)
+             # Attempt to access 'a' or 'cir' to confirm
+             print(f"Paths coefficients 'a' type: {type(paths.a)}")
+             print(f"Paths shape (if tensor): {paths.a.shape if hasattr(paths.a, 'shape') else 'N/A'}")
         except Exception as e:
-            print(f"Warning: Failed to save JSON config. {e}")
+             print(f"Could not inspect paths details: {e}")
 
-    def run_link_level(self, base_result_dir: str):
-        """
-        リンクレベルシミュレーションを実行する (具象メソッド)
-        """
-        print(f"--> [Link-Level] Running: {self.c.exp_category} / {self.c.run_name}")
-        save_dir = self._prepare_save_dir(base_result_dir, "link")
-        self._save_snapshot(save_dir)
-
-        # ここにSionnaのリンクレベルシミュレーション構築ロジックが入る
-        # self._execute_link_sim(save_dir) (未実装)
-        print(f"    Saved snapshot to {save_dir}")
-
-    def run_system_level(self, base_result_dir: str):
-        """
-        システムレベルシミュレーションを実行する (具象メソッド)
-        """
-        print(f"--> [System-Level] Running: {self.c.exp_category} / {self.c.run_name}")
-        save_dir = self._prepare_save_dir(base_result_dir, "system")
-        self._save_snapshot(save_dir)
-
-        # ここにSionnaのシステムレベルシミュレーション構築ロジックが入る
-        # self._execute_system_sim(save_dir) (未実装)
-        print(f"    Saved snapshot to {save_dir}")
+        # Save results/metrics (dummy implementation)
+        # paths.save(...)
+        return paths
