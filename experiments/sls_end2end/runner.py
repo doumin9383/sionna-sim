@@ -4,13 +4,28 @@ import json
 import dataclasses
 import numpy as np
 import tensorflow as tf
+# Sionna imports
 import sionna
-from sionna.channel.gen.3gpp import UMa, UMi
-from sionna.channel import Antenna, AntennaArray, PanelArray
-from sionna.mimo import StreamManagement
-from sionna.ofdm import ResourceGrid, ResourceGridMapper, LSChannelEstimator, LMMSEEqualizer
-from sionna.mapping import Mapper, Demapper
-from sionna.utils import BinarySource, ebnodb2no, insert_dims, flatten_last_dims, log10, expand_to_rank
+try:
+    from sionna.phy.channel.tr38901 import UMa, UMi, Antenna, AntennaArray, PanelArray
+    from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
+except ImportError:
+    # Fallback or alternative locations if 1.2.1 struct is different
+    from sionna.phy.channel.tr38901 import UMa, UMi
+    from sionna.rt import Antenna, AntennaArray, PanelArray
+    from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
+
+from sionna.phy.mimo import StreamManagement
+from sionna.phy.ofdm import ResourceGrid, ResourceGridMapper, LSChannelEstimator, LMMSEEqualizer
+from sionna.phy.mapping import Mapper, Demapper
+# utils might be in sionna.utils (if exposed by package) or sionna.phy.utils
+try:
+    # Attempt import from sionna.utils (standard)
+    from sionna.utils import ebnodb2no, insert_dims, flatten_last_dims, log10, expand_to_rank
+except ImportError:
+    # Fallback to sionna.phy.utils
+    from sionna.phy.utils import ebnodb2no, insert_dims, flatten_last_dims, log10, expand_to_rank
+
 
 # プロジェクトルートの解決
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -72,16 +87,22 @@ class MySLSRunner:
 
         # Antenna Arrays
         # Example 3GPP Panel Array for BS
+        # Correctly instantiating with positional arguments per Sionna v1.2.1
         self.bs_array = PanelArray(num_rows_per_panel=4,
                                    num_cols_per_panel=4,
-                                   polarization="VH",
+                                   polarization="dual",
+                                   polarization_type="VH",
+                                   antenna_pattern="38.901",
+                                   carrier_frequency=self.c.carrier.carrier_frequency,
                                    panel_vertical_spacing=3.0,
-                                   panel_horizontal_spacing=3.0,
-                                   pattern="3gpp",
-                                   carrier_frequency=self.c.carrier.carrier_frequency)
+                                   panel_horizontal_spacing=3.0)
 
         # Single Antenna for UT
-        self.ut_array = Antenna(pattern="iso", polarization="V", carrier_frequency=self.c.carrier.carrier_frequency)
+        # Correctly instantiating Antenna
+        self.ut_array = Antenna(polarization="single",
+                                polarization_type="V",
+                                antenna_pattern="omni",
+                                carrier_frequency=self.c.carrier.carrier_frequency)
 
         # Note: In a full SLS, we would define positions here.
         # For this template, we will rely on the Channel Model's internal topology generation
@@ -136,42 +157,61 @@ class MySLSRunner:
         min_dist = self.c.topology.min_dist
         max_dist = isd / 2
         for _ in range(self.num_ut):
+            # For 3GPP models, distances must be realistic (> 10m usually)
+            # Default min_dist in config is usually 10/35m.
             r = np.sqrt(np.random.uniform(min_dist**2, max_dist**2))
             phi = np.random.uniform(0, 2*np.pi)
             x = r * np.cos(phi)
             y = r * np.sin(phi)
             ut_locs.append([x, y, self.c.topology.ue_height])
 
-        # Convert to Tensor
+        # Convert to Tensor and Expand Dims for Batch
         bs_locs = tf.constant(bs_locs, dtype=tf.float32)
+        bs_locs = tf.expand_dims(bs_locs, axis=0) # [1, num_bs, 3]
+
         ut_locs = tf.constant(ut_locs, dtype=tf.float32)
+        ut_locs = tf.expand_dims(ut_locs, axis=0) # [1, num_ut, 3]
 
         # Set Topology
-        # Note: UMa needs explicit set_topology call with tensors
-        # Or you pass them to the channel setup if built-in.
-        # Check Sionna API: channel.set_topology(ut_locs, bs_locs, ut_orientations, bs_orientations)
+        # Check Sionna API: channel.set_topology(ut_locs, bs_locs, ut_orientations, bs_orientations, ut_velocities, in_state)
 
         # Orientations (zeros)
-        ut_orn = tf.zeros((self.num_ut, 3), dtype=tf.float32)
-        bs_orn = tf.zeros((len(bs_locs), 3), dtype=tf.float32) # Using len(bs_locs) instead of self.num_bs for safety
+        ut_orn = tf.zeros((self.batch_size, self.num_ut, 3), dtype=tf.float32)
+        bs_orn = tf.zeros((self.batch_size, self.num_bs, 3), dtype=tf.float32)
 
-        self.channel_model.set_topology(ut_locs, bs_locs, ut_orn, bs_orn)
+        # User State (Indoor/Outdoor) - Required for UMa
+        # 0: Outdoor, 1: Indoor. Assuming all outdoor for simplicity.
+        # Shape: [batch_size, num_ut]
+        in_state = tf.zeros((self.batch_size, self.num_ut), dtype=tf.bool)
+
+        # UT Velocities - Required
+        # Shape: [batch_size, num_ut, 3]
+        ut_vel = tf.zeros((self.batch_size, self.num_ut, 3), dtype=tf.float32)
+
+        self.channel_model.set_topology(ut_loc=ut_locs,
+                                        bs_loc=bs_locs,
+                                        ut_orientations=ut_orn,
+                                        bs_orientations=bs_orn,
+                                        ut_velocities=ut_vel,
+                                        in_state=in_state)
 
         # 2. Time Evolution Loop
-        # Generate Channel Response
-        # channel_response = self.channel_model(num_time_steps=...)
-        # We perform a single snapshot here for verification
+        # Generate Channel Response (CIR)
+        print("    Generating channel coefficients (CIR)...")
+        # Use sampling frequency inferred from ResourceGrid or Config
+        sampling_freq = self.c.carrier.subcarrier_spacing * self.c.carrier.fft_size # e.g. 30e3 * 1024 ~ 30MHz
+        num_time_samples = self.c.carrier.num_ofdm_symbols # Number of time steps? For SystemLevel, it's duration.
 
-        print("    Generating channel response...")
-        # num_time_samples should match resource grid structure or needs
-        h_freq = self.channel_model(num_time_samples=self.c.carrier.num_ofdm_symbols, # Rough approx
-                                    subcarrier_spacing=self.c.carrier.subcarrier_spacing,
-                                    fft_size=self.c.carrier.fft_size)
+        # Get CIR (a, tau)
+        cir = self.channel_model(num_time_samples=num_time_samples,
+                                 sampling_frequency=sampling_freq)
+
+        # 3. Frequency Domain Conversion
+        print("    Converting to Frequency Domain...")
+        frequencies = subcarrier_frequencies(self.c.carrier.fft_size, self.c.carrier.subcarrier_spacing)
+        h_freq = cir_to_ofdm_channel(frequencies, *cir, normalize=True)
 
         print(f"    Channel Shape: {h_freq.shape}")
-
-        # 3. Processing (Placeholder for full chain: Coding, Modulation, etc.)
-        # This confirms the physics/channel part works.
 
         return h_freq
 
