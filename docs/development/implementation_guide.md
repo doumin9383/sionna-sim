@@ -12,6 +12,10 @@
 - **Config First:** シミュレーションの全パラメータは `libs/my_configs.py` 内のデータクラスとして定義し、ロジック（`libs/sim_core.py`）内にハードコードしないでください。
 - **再現性:** 実行時に使用した Config オブジェクトは、必ず再利用可能な形（`repr()`の出力など）でログ保存してください。
 
+### 1.3 バージョン固有の実装詳細
+- **PathSolver:** 本環境のSionna (`sionna-rt`) では `Scene.compute_paths` メソッドではなく、独立した `PathSolver` クラスを使用する必要があります。`sim_core.py` はこの仕様に基づいて実装されています。
+- **RayTracingConfig:** `PathSolver.__call__` の引数（`max_depth`, `samples_per_src` 等）と整合させています。
+
 ## 2. ディレクトリ構成の意図
 
 ```text

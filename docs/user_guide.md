@@ -35,6 +35,8 @@ python experiments/exp01_demo/run_sweep.py
 - **Scene**: シーン（3Dモデル）の設定
 - **StreamManagement**: 送受信アンテナ間のストリーム割り当て
 - **ResourceGrid**: 時間・周波数リソースの設定
+- **RayTracingConfig**: パス計算 (`PathSolver`) のパラメータ設定
+- **CarrierConfig**: 5G NR キャリア設定
 
 設定を変更して新しい実験を行う場合は、`experiments/` 以下に新しいフォルダ（例: `exp02_my_test`）を作成し、スクリプトをコピーして編集することを推奨します。
 
