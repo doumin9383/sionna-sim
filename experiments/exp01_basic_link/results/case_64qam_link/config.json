@@ -1,0 +1,25 @@
+{
+    "exp_category": "exp01_basic_link",
+    "run_name": "case_64qam",
+    "antenna": {
+        "pattern": "iso",
+        "polarization": "VH",
+        "tilt_angle": 0.0,
+        "num_rows": 1,
+        "num_cols": 1,
+        "element_spacing_row": 0.5,
+        "element_spacing_col": 0.5
+    },
+    "waveform": {
+        "modulation": "QAM64",
+        "coderate": 0.5,
+        "subcarrier_spacing": 30000.0,
+        "num_ofdm_symbols": 14
+    },
+    "params": {
+        "carrier_frequency": 3500000000.0,
+        "bandwidth": 100000000.0,
+        "noise_power": -174.0
+    },
+    "extra_params": {}
+}
