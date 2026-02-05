@@ -1,0 +1,10 @@
+# Configuration
+
+Sionna PHY's configuration API. It can be used to set global variables
+which can be used by all of its modules and functions.
+
+<div class="autoclass" members="">
+
+sionna.phy.config.Config
+
+</div>
