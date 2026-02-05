@@ -1,3 +1,5 @@
+import sionna
+import tensorflow as tf
 # Additional external libraries
 import matplotlib.pyplot as plt
 import numpy as np

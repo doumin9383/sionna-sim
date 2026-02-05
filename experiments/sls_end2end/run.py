@@ -7,8 +7,15 @@ project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 sys.path.append(project_root)
 # ----------------------------------------
 
-from libs.sls_configs import SLSMasterConfig, CarrierConfig, TopologyConfig, ChannelConfig, AntennaConfig
+from libs.sls_configs import (
+    SLSMasterConfig,
+    CarrierConfig,
+    TopologyConfig,
+    ChannelConfig,
+    AntennaConfig,
+)
 from experiments.sls_end2end.runner import MySLSRunner
+
 
 def get_scenarios():
     """実験シナリオ定義"""
@@ -19,28 +26,24 @@ def get_scenarios():
             # SLS固有設定
             carrier=CarrierConfig(
                 subcarrier_spacing=30e3,
-                bandwidth=100e6,
-                carrier_frequency=3.5e9
+                bandwidth=2.16e6,  # 72 subcarriers * 30kHz
+                fft_size=72,  # Small for testing
+                carrier_frequency=3.5e9,
             ),
             topology=TopologyConfig(
                 inter_site_distance=500.0,
-                num_sites=1, # Simplified for template verification
-                num_sectors=1, # Simplified
-                num_ues_per_sector=5 # Reduced for speed
+                num_sites=1,  # Simplified for template verification
+                num_sectors=1,  # Simplified
+                num_ues_per_sector=2,  # Reduced for speed
             ),
-            channel=ChannelConfig(
-                model_name="UMa",
-                los_probability=None
-            ),
+            channel=ChannelConfig(model_name="UMa", los_probability=None),
             # 共通設定
             antenna=AntennaConfig(
-                pattern="3gpp",
-                num_rows=4,
-                num_cols=4,
-                polarization="VH"
-            )
+                pattern="3gpp", num_rows=4, num_cols=4, polarization="VH"
+            ),
         )
     ]
+
 
 if __name__ == "__main__":
     results_dir = os.path.join(current_dir, "results")
