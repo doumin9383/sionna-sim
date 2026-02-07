@@ -25,39 +25,33 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         self,
         pusch_config,
         enable_transform_precoding=False,
-        dtype=tf.complex64,
+        output_domain="time",
         **kwargs,
     ):
-        """
-        Args:
-            pusch_config (PUSCHConfig): The PUSCH configuration.
-            enable_transform_precoding (bool): If True, applies DFT spreading (DFTS-OFDM).
-                                               Make sure pusch_config.transform_precoding is False (CP-OFDM)
-                                               to avoid double processing or MCS table mismatches.
-            dtype (tf.DType): Complex dtype for processing.
-        """
-        super().__init__(pusch_config, dtype=dtype, **kwargs)
+        super().__init__(pusch_config, output_domain=output_domain, **kwargs)
         self.enable_transform_precoding = enable_transform_precoding
 
-        # Instantiate OFDM Modulator as it's not exposed as a public attribute in PUSCHTransmitter
-        # We rely on self.resource_grid which is initialized by PUSCHTransmitter
-        self.ofdm_modulator = OFDMModulator(self.resource_grid, dtype=dtype)
+        # We use the internal modulator from PUSCHTransmitter
+        # which is already configured for the correct resource grid and CP lengths.
+        # It's usually accessible via self._ofdm_modulator after super().__init__
+        pass
 
     def call(self, batch_size=1):
         """
         Executes the PUSCH transmission chain.
         """
 
-        # 1. TB Encoding (Bits -> Coded Bits)
-        # _tb_encoder returns coded bits.
-        b = self._tb_encoder(batch_size)
+        # 1. Generate Bits and Encode (Bits -> Coded Bits)
+        # Standard PUSCHTransmitter uses _binary_source to generate bits.
+        b = self._binary_source([batch_size, self._num_tx, self._tb_size])
+        c = self._tb_encoder(b)
 
         # 2. Modulation (Coded Bits -> Symbols)
-        c = self._mapper(b)
+        x_symbols = self._mapper(c)
 
         # 3. Layer Mapping (Symbols -> Layers)
         # Output shape: [batch_size, num_layers, num_symbols_per_layer]
-        x_layers = self._layer_mapper(c)
+        x_layers = self._layer_mapper(x_symbols)
 
         # 4. Transform Precoding (DFT Spreading) - OPTIONAL
         if self.enable_transform_precoding:
@@ -70,7 +64,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         x_rg = self._resource_grid_mapper(x_layers)
 
         # 6. OFDM Modulation
-        x_time = self.ofdm_modulator(x_rg)
+        x_time = self._ofdm_modulator(x_rg)
 
         return x_time
 

@@ -19,7 +19,13 @@ from experiments.sls_end2end_hybrid_beam.components.pusch_model import (
 )
 
 
-def run_papr_simulation(output_file="mpr_table.csv"):
+def run_papr_simulation(
+    output_file="experiments/sls_end2end_hybrid_beam/results/mpr_table.csv",
+):
+
+    # Ensure results directory exists
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    results_dir = os.path.dirname(output_file)
 
     # Simulation Parameters
     batch_size = 100  # Adjust based on GPU memory
@@ -60,21 +66,25 @@ def run_papr_simulation(output_file="mpr_table.csv"):
         )
 
     results = []
+    all_papr_data = {}
 
     print(f"Starting PAPR Simulation with {len(scenarios)} scenarios...")
 
     for sc in tqdm(scenarios):
+        # Scenario identifier for filenames
+        scenario_id = f"{sc['waveform']}_{sc['modulation']}_Rank{sc['rank']}"
+
         # Instantiate Model
-        # Note: num_tx_ant should be >= rank
         num_tx = 4
         if sc["rank"] > num_tx:
-            num_tx = sc["rank"]  # Ensure enough antennas
+            num_tx = sc["rank"]
 
         try:
             model = PUSCHCommunicationModel(
                 carrier_frequency=3.5e9,
                 subcarrier_spacing=30e3,
                 num_tx_ant=num_tx,
+                num_rx_ant=num_tx,
                 num_layers=sc["rank"],
                 enable_transform_precoding=sc["transform_precoding"],
                 mcs_index=sc["mcs_index"],
@@ -83,23 +93,29 @@ def run_papr_simulation(output_file="mpr_table.csv"):
 
             papr_values = []
 
-            for _ in range(num_batches):
+            for i in range(num_batches):
                 # Generate signal
                 x = model.transmitter(batch_size)
-                # x: [batch, tx, time]
+
+                # Save a sample waveform for EVERY scenario (just the first batch)
+                if i == 0:
+                    plot_individual_waveform(x, scenario_id, results_dir)
 
                 # Compute PAPR
-                # Note: We compute for the oversampled signal inside compute_papr logic if integrated?
-                # Using the integrated method in PUSCHCommunicationModel
-                papr_db_batch = model.compute_papr(x)  # Returns [batch, tx]
-
-                # Flatten and collect
+                papr_db_batch = model.compute_papr(x)
                 papr_values.extend(papr_db_batch.numpy().flatten())
 
-            # Compute 99.9% CCDF (0.1% probability of exceeding)
-            # Sort descending
+            # Store for global comparison
+            wave_mod_key = f"{sc['waveform']} ({sc['modulation']})"
+            if wave_mod_key not in all_papr_data:
+                all_papr_data[wave_mod_key] = []
+            all_papr_data[wave_mod_key].extend(papr_values)
+
+            # Compute and Plot individual CCDF
             papr_sorted = np.sort(papr_values)
-            # Index for 99.9%
+            plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
+
+            # Compute 99.9% CCDF
             idx = int(0.999 * len(papr_sorted))
             papr_999 = papr_sorted[idx]
 
@@ -111,17 +127,94 @@ def run_papr_simulation(output_file="mpr_table.csv"):
         except Exception as e:
             print(f"Error in scenario {sc}: {e}")
 
+    # Plot Comparison CCDF (Cleaned up)
+    plot_summary_ccdf(all_papr_data, results_dir)
+
     # Save to CSV
     df = pd.DataFrame(results)
     df.to_csv(output_file, index=False)
     print(f"Simulation Complete. Results saved to {output_file}")
-    print(df)
+
+
+def plot_individual_waveform(x, scenario_id, results_dir):
+    """Saves a plot of the time domain waveform for a specific scenario."""
+    import matplotlib.pyplot as plt
+
+    plt.switch_backend("Agg")
+
+    # Take the first batch, first antenna
+    # Plot a longer sequence to see the "flatness" across multiple symbols
+    num_samples = min(x.shape[-1], 5000)
+    sample = tf.abs(x[0, 0, :num_samples]).numpy()
+
+    # Calculate RMS for reference
+    rms = np.sqrt(np.mean(sample**2))
+
+    plt.figure(figsize=(15, 5))
+    plt.plot(sample, lw=0.8, label="Instantaneous Amplitude")
+    plt.axhline(
+        y=rms, color="r", linestyle="--", alpha=0.7, label=f"RMS Level ({rms:.2f})"
+    )
+
+    plt.title(f"Time Domain Amplitude (Long View): {scenario_id}")
+    plt.xlabel("Time Samples")
+    plt.ylabel("Absolute Amplitude")
+    plt.legend(loc="upper right")
+    plt.grid(True, alpha=0.3)
+
+    save_path = os.path.join(results_dir, "waveforms", f"waveform_{scenario_id}.png")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+
+
+def plot_individual_ccdf(papr_sorted, scenario_id, results_dir):
+    """Saves a CCDF plot for a specific scenario."""
+    import matplotlib.pyplot as plt
+
+    plt.switch_backend("Agg")
+
+    ccdf = 1.0 - np.arange(len(papr_sorted)) / float(len(papr_sorted))
+
+    plt.figure(figsize=(8, 6))
+    plt.semilogy(papr_sorted, ccdf, lw=2)
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.xlabel("PAPR [dB]")
+    plt.ylabel("CCDF (Prob > PAPR)")
+    plt.title(f"PAPR CCDF: {scenario_id}")
+    plt.ylim(1e-3, 1)
+    plt.xlim(0, 15)
+
+    save_path = os.path.join(results_dir, "ccdfs", f"ccdf_{scenario_id}.png")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+
+
+def plot_summary_ccdf(all_papr_data, results_dir):
+    """Saves a summary CCDF plot with all modulations compared."""
+    import matplotlib.pyplot as plt
+
+    plt.switch_backend("Agg")
+
+    plt.figure(figsize=(12, 8))
+    for label, values in all_papr_data.items():
+        values = np.sort(values)
+        ccdf = 1.0 - np.arange(len(values)) / float(len(values))
+        plt.semilogy(values, ccdf, label=label, lw=2)
+
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.xlabel("PAPR [dB]")
+    plt.ylabel("CCDF (Prob > PAPR)")
+    plt.title("PAPR CCDF Summary Comparison")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.ylim(1e-3, 1)
+    plt.xlim(0, 15)
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, "papr_ccdf_summary.png"))
+    plt.close()
 
 
 if __name__ == "__main__":
-    # Ensure directory exists
-    os.makedirs(
-        os.path.dirname("lls_scripts/"), exist_ok=True
-    )  # Create if running from root relative
     # Actually checking path
     run_papr_simulation()

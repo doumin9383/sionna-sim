@@ -3,7 +3,7 @@
 #
 
 import tensorflow as tf
-from sionna.phy.nr import PUSCHConfig, PUSCHReceiver
+from sionna.phy.nr import PUSCHConfig, PUSCHReceiver, CarrierConfig
 from .pusch_transmitter_wrapper import HybridPUSCHTransmitter
 from .channel_models import GeneratHybridBeamformingTimeChannel
 
@@ -33,20 +33,16 @@ class PUSCHCommunicationModel(tf.keras.Model):
         super().__init__()
 
         # 1. Configuration
-        self.pusch_config = PUSCHConfig(
-            carrier={
-                "subcarrier_spacing": subcarrier_spacing / 1e3,  # kHz
-                "carrier_frequency": carrier_frequency,
-            }
-        )
+        carrier_config = CarrierConfig()
+        carrier_config.subcarrier_spacing = subcarrier_spacing / 1e3
+        carrier_config.carrier_frequency = carrier_frequency
+
+        self.pusch_config = PUSCHConfig(carrier=carrier_config)
+        self.pusch_config.output_domain = domain
 
         # Adjust config based on inputs
-        self.pusch_config.num_antenna_ports = (
-            num_tx_ant  # For PUSCH, usually 1 port per layer or mapped?
-        )
-        # In Sionna PUSCHConfig, num_antenna_ports is for DMRS ports usually.
-        # But transmitter uses it for output dim.
-
+        # In Sionna NR, num_antenna_ports must match num_layers for PUSCHConfig
+        self.pusch_config.num_antenna_ports = num_layers
         self.pusch_config.num_layers = num_layers
 
         # Modulation / MCS
@@ -66,6 +62,7 @@ class PUSCHCommunicationModel(tf.keras.Model):
         self.transmitter = HybridPUSCHTransmitter(
             self.pusch_config,
             enable_transform_precoding=self.manual_transform_precoding,
+            output_domain=domain,
         )
 
         # 3. Channel (Placeholder/Future use)
