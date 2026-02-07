@@ -1,0 +1,4 @@
+{
+    "adapter_class": "StandardAdapter",
+    "original_file": "test_external_rt_data/dummy_rt.h5"
+}
