@@ -95,7 +95,7 @@ class RBGChannelModel(ChannelModel):
         return self._model
 
 
-class ChunkedTimeChannel(GenerateTimeChannel):
+class ChunkedGenerateTimeChannel(GenerateTimeChannel):
     """
     Generates Time Domain Channel (CIR or Waveform) supporting FDRA masks.
     Inherits from GenerateTimeChannel.
@@ -158,7 +158,7 @@ class ChunkedTimeChannel(GenerateTimeChannel):
         return super().call(batch_size)
 
 
-class ChunkedOFDMChannel(GenerateOFDMChannel):
+class ChunkedGenerateOFDMChannel(GenerateOFDMChannel):
     """
     Generates Frequency Domain Channel with optimizations for RBG-based processing (SLS).
     Inherits from GenerateOFDMChannel.
@@ -231,9 +231,9 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         return h_rbg
 
 
-class HybridOFDMChannel(ChunkedOFDMChannel):
+class GenerateHybridBeamformingOFDMChannel(ChunkedGenerateOFDMChannel):
     """
-    Adds Analog Beamforming capabilities to the ChunkedOFDMChannel.
+    Adds Analog Beamforming capabilities to the ChunkedGenerateOFDMChannel.
     """
 
     def __init__(

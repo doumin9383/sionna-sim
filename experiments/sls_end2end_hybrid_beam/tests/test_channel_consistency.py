@@ -7,8 +7,8 @@ from sionna.phy.channel.tr38901 import PanelArray
 import sionna
 from experiments.sls_end2end_hybrid_beam.components.channel_models import (
     RBGChannelModel,
-    ChunkedTimeChannel,
-    ChunkedOFDMChannel,
+    ChunkedGenerateTimeChannel,
+    ChunkedGenerateOFDMChannel,
 )
 
 
@@ -75,16 +75,16 @@ class TestChannelConsistency(unittest.TestCase):
         bandwidth = self.subcarrier_spacing * self.fft_size
         num_time_samples = self.fft_size + 16  # roughly CP
 
-        # Correctly instantiating ChunkedTimeChannel might require knowing l_min/l_max beforehand
+        # Correctly instantiating ChunkedGenerateTimeChannel might require knowing l_min/l_max beforehand
         # or letting it default if Sionna allows.
         # But for this test, we care about the internal call to model()
 
         # For this test, let's mock or verify via the exposed get_paths()
 
-        ch_time = ChunkedTimeChannel(
+        ch_time = ChunkedGenerateTimeChannel(
             model, bandwidth=bandwidth, num_time_samples=1000, l_min=-10, l_max=100
         )
-        ch_ofdm = ChunkedOFDMChannel(model, self.rg)
+        ch_ofdm = ChunkedGenerateOFDMChannel(model, self.rg)
 
         # Create a topology first (needed for UMa)
         # We can use a minimal dummy topology or use Sionna's gen_topology utils.
@@ -117,8 +117,8 @@ class TestChannelConsistency(unittest.TestCase):
         # get_paths() in both just calls model(num_samples, freq).
         # If input args differ, output differs.
 
-        # ChunkedTimeChannel calls: model(num_time_samples, sampling_freq)
-        # ChunkedOFDMChannel calls: model(num_time_samples, sampling_freq)
+        # ChunkedGenerateTimeChannel calls: model(num_time_samples, sampling_freq)
+        # ChunkedGenerateOFDMChannel calls: model(num_time_samples, sampling_freq)
         # We must ensure they pass the SAME args if we want identical raw paths.
 
         # Check args passed in init/defaults

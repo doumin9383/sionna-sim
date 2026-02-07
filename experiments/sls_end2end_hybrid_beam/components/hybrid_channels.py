@@ -8,7 +8,7 @@ from sionna.phy.channel import (
 from sionna.phy.channel.tr38901 import PanelArray
 
 
-class ChunkedOFDMChannel(GenerateOFDMChannel):
+class ChunkedGenerateOFDMChannel(GenerateOFDMChannel):
     """
     Extends GenerateOFDMChannel to support chunk-based generation.
     """
@@ -54,7 +54,7 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         return h_freq_chunk
 
 
-class HybridOFDMChannel(GenerateOFDMChannel):
+class GenerateHybridBeamformingOFDMChannel(GenerateOFDMChannel):
     """
     Sionna-compatible Block that generates a Digital Port Channel by applying
     Analog Beamforming to an underlying physical channel.

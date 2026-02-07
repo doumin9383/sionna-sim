@@ -9,7 +9,7 @@ graph TD
         DP[Digital Precoding/Equalization]
     end
 
-    subgraph "HybridOFDMChannel (Digital-to-Analog Bridge)"
+    subgraph "GenerateHybridBeamformingOFDMChannel (Digital-to-Analog Bridge)"
         direction TB
         subgraph "Internal Processing"
             PC["Physical Channel<br/>(GenerateOFDMChannel)"]
@@ -25,7 +25,7 @@ graph TD
     end
 
     %% Connections
-    DS -->|Port Indices| HybridOFDMChannel
+    DS -->|Port Indices| GenerateHybridBeamformingOFDMChannel
     DP -->|Effective H_port| DS
 
     PC -->|CIR (a, tau)| CH
@@ -36,14 +36,14 @@ graph TD
     CH_MOD -->|Geometry/Pathloss| PC
     PA -->|Array Geometry| PC
 
-    style HybridOFDMChannel fill:#f9f,stroke:#333,stroke-width:2px
+    style GenerateHybridBeamformingOFDMChannel fill:#f9f,stroke:#333,stroke-width:2px
     style Digital Domain fill:#bbf,stroke:#333
     style Physical Domain fill:#bfb,stroke:#333
 ```
 
 ## 各コンポーネントの役割
 
-### 1. HybridOFDMChannel (本クラス)
+### 1. GenerateHybridBeamformingOFDMChannel (本クラス)
 *   **役割**: デジタルポートと物理アンテナの「翻訳者」です。
 *   **入力**: `batch_size`
 *   **出力**: デジタルポート単位の周波数応答 $H_{port}$
@@ -51,7 +51,7 @@ graph TD
 
 ### 2. GenerateOFDMChannel (継承元)
 *   **役割**: 物理的なマルチパス特性（CIR: Channel Impulse Response）を周波数ドメインの素子レベルチャネル $H_{elem}$ に変換します。
-*   **最適化**: `HybridOFDMChannel` ではこれをラップし、チャンク分割生成を行うことで大規模MIMO実行時のメモリ消費を劇的に抑えています。
+*   **最適化**: `GenerateHybridBeamformingOFDMChannel` ではこれをラップし、チャンク分割生成を行うことで大規模MIMO実行時のメモリ消費を劇的に抑えています。
 
 ### 3. W_RF / A_RF (アナログ重み)
 *   **役割**: RF位相シフタを表します。
@@ -68,10 +68,10 @@ graph TD
 ### インスタンス化
 
 ```python
-from hybrid_channels import HybridOFDMChannel
+from hybrid_channels import GenerateHybridBeamformingOFDMChannel
 
 # Generator の作成
-hybrid_channel = HybridOFDMChannel(
+hybrid_channel = GenerateHybridBeamformingOFDMChannel(
     channel_model,      # UMa, UMi 等
     resource_grid,      # ResourceGrid
     tx_array,           # 送信側 PanelArray

@@ -4,8 +4,8 @@ from sionna.phy.mimo import StreamManagement
 from sionna.phy.channel.tr38901 import PanelArray
 from experiments.sls_end2end_hybrid_beam.components.channel_models import (
     RBGChannelModel,
-    ChunkedTimeChannel,
-    HybridOFDMChannel,
+    ChunkedGenerateTimeChannel,
+    GenerateHybridBeamformingOFDMChannel,
 )
 
 
@@ -58,12 +58,12 @@ def test_rbg_channel_model():
 
 
 def test_chunked_time_channel(channel_model):
-    print("\nTesting ChunkedTimeChannel...")
+    print("\nTesting ChunkedGenerateTimeChannel...")
     bandwidth = 10e6
     num_time_samples = 1000
     l_min, l_max = -6, 20
 
-    time_channel = ChunkedTimeChannel(
+    time_channel = ChunkedGenerateTimeChannel(
         channel_model=channel_model,
         bandwidth=bandwidth,
         num_time_samples=num_time_samples,
@@ -78,11 +78,11 @@ def test_chunked_time_channel(channel_model):
     # [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_time_steps, l_max - l_min + 1]
     # Check rank
     assert len(h_time.shape) == 7
-    print("ChunkedTimeChannel.get_cir() passed.")
+    print("ChunkedGenerateTimeChannel.get_cir() passed.")
 
 
 def test_hybrid_ofdm_channel(channel_model, bs_array, ut_array):
-    print("\nTesting HybridOFDMChannel...")
+    print("\nTesting GenerateHybridBeamformingOFDMChannel...")
 
     # Resource Grid
     rg = ResourceGrid(num_ofdm_symbols=14, fft_size=512, subcarrier_spacing=30e3)
@@ -90,7 +90,7 @@ def test_hybrid_ofdm_channel(channel_model, bs_array, ut_array):
     num_tx_ports = 4
     num_rx_ports = 2
 
-    hybrid_channel = HybridOFDMChannel(
+    hybrid_channel = GenerateHybridBeamformingOFDMChannel(
         channel_model=channel_model,
         resource_grid=rg,
         tx_array=bs_array,
@@ -118,7 +118,7 @@ def test_hybrid_ofdm_channel(channel_model, bs_array, ut_array):
     assert h_port.shape[2] == num_rx_ports  # rx_port is at index 2 (brqtpsc)
     assert h_port.shape[4] == num_tx_ports  # tx_port is at index 4
 
-    print("HybridOFDMChannel passed.")
+    print("GenerateHybridBeamformingOFDMChannel passed.")
 
 
 if __name__ == "__main__":
