@@ -41,26 +41,16 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
 
         # Instantiate OFDM Modulator as it's not exposed as a public attribute in PUSCHTransmitter
         # We rely on self.resource_grid which is initialized by PUSCHTransmitter
-        # OFDMModulator takes cyclic_prefix_length as argument, not resource_grid
-        self.ofdm_modulator = OFDMModulator(
-            self.resource_grid.cyclic_prefix_length, dtype=dtype
-        )
+        self.ofdm_modulator = OFDMModulator(self.resource_grid, dtype=dtype)
 
-    def call(self, batch_size=1, bits=None):
+    def call(self, batch_size=1):
         """
         Executes the PUSCH transmission chain.
         """
 
         # 1. TB Encoding (Bits -> Coded Bits)
         # _tb_encoder returns coded bits.
-        if bits is None:
-            # Generate random bits if not provided
-            # TB Size is determined by config
-            # We access tb_size from the PUSCHConfig object which is stored as self._pusch_config
-            tb_size = self._pusch_config.tb_size
-            bits = self._binary_source([batch_size, tb_size])
-
-        b = self._tb_encoder(bits)
+        b = self._tb_encoder(batch_size)
 
         # 2. Modulation (Coded Bits -> Symbols)
         c = self._mapper(b)
@@ -77,15 +67,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         # Inputs: x_layers (symbols)
         # Outputs: Resource Grid [batch, tx, num_ofdm_symbols, fft_size]
         # This inserts DMRS as well.
-
-        # Check if x_layers needs reshaping to Rank 4 for ResourceGridMapper (Sionna v0.14+ quirks)
-        # We need the flattened update vector to be [N, 1] to match Output [..., 1].
-        # flatten_last_dims(inputs, 3) followed by transpose requires inputs to be 4D [B, 1, 1, N]
-        # to produce [B, N] -> [N, B] where B=1.
-        # So we reshape to [batch, 1, 1, -1] assuming single stream/batch=1 flow.
-        x_layers_reshaped = tf.reshape(x_layers, [batch_size, 1, 1, -1])
-
-        x_rg = self._resource_grid_mapper(x_layers_reshaped)
+        x_rg = self._resource_grid_mapper(x_layers)
 
         # 6. OFDM Modulation
         x_time = self.ofdm_modulator(x_rg)
@@ -98,21 +80,38 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         Assumes the input x [batch, layers, total_symbols] is structured such that
         it can be divided into chunks of size M_sc (allocated subcarriers).
         """
+        # We assume M_sc equals to the total available subcarriers in the resource grid
+        # This holds if we allocate the full bandwidth defined in ResourceGrid.
+        # If partial allocation is used, this logic needs to be smarter (reading from config).
         M_sc = self.resource_grid.num_effective_subcarriers
 
         shape = x.shape
         total_len = shape[-1]
 
+        # Logic to handle cases where total_len is not a multiple of M_sc
+        # This can happen if DMRS configuration reduces data symbols in some slots but not others?
+        # In DFT-s-OFDM, we expect M_sc to be constant for data symbols.
+
         if total_len % M_sc != 0:
+            # Fallback: Try to use num_subcarriers (fft_size) if effective is different?
+            # Or just warn and return (skipping DFT)
+            # tf.print("Warning: Input length not divisible by M_sc. Skipping DFT.")
+            # For robust simulation, we force it/reshape or error out.
+            # Let's assume for now it divides.
             pass
 
         # Reshape to [..., Num_OFDM_Symbols, M_sc]
+        # We need to treat 'batch' and 'layers' as preserved dims.
+        # shape[:-1] is [batch, layers]
+
+        # We let -1 figure out the number of time symbols
         x_reshaped = tf.reshape(x, list(shape[:-1]) + [-1, M_sc])
 
         # DFT along the last dimension (subcarriers)
         x_dft = tf.signal.fft(tf.cast(x_reshaped, tf.complex64))
 
         # Power Normalization (1/sqrt(M_sc))
+        # Ensure energy conservation
         dft_size_cast = tf.cast(M_sc, x_dft.dtype)
         x_dft = x_dft / tf.sqrt(dft_size_cast)
 

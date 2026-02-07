@@ -21,16 +21,16 @@ from experiments.sls_end2end_hybrid_beam.components.pusch_model import (
 
 def run_papr_simulation(output_file="mpr_table.csv"):
 
-    # Simulation Parameters (Small Setup for Verification)
-    batch_size = 1  # Reduced batch size to 1 to work around ResourceGridMapper issue
-    num_batches = 50  # Increased batches to get some data points
+    # Simulation Parameters
+    batch_size = 100  # Adjust based on GPU memory
+    num_batches = 10  # Total samples = 1000 slots
 
     # Scenarios to sweep
     scenarios = []
 
     # Define Modulation to MCS Index mapping (approximate for Table 1)
-    # Reduced set for quick verification
-    modulations = {"QPSK": 2, "16QAM": 11}
+    # QPSK: 2, 16QAM: 11, 64QAM: 20, 256QAM: 28 (Sample indices)
+    modulations = {"QPSK": 2, "16QAM": 11, "64QAM": 20, "256QAM": 28}
 
     # 1. CP-OFDM
     for mod_name, mcs_idx in modulations.items():
@@ -46,7 +46,8 @@ def run_papr_simulation(output_file="mpr_table.csv"):
             )
 
     # 2. DFT-s-OFDM (Transform Precoding)
-    # Usually Rank 1 only for DFT-s-OFDM
+    # Usually Rank 1 only for DFT-s-OFDM in typical usage (though MIMO is possible in Rel 16+)
+    # We stick to Rank 1 for now as per instructions "DFT-s-OFDMは通常Rank 1"
     for mod_name, mcs_idx in modulations.items():
         scenarios.append(
             {
@@ -65,8 +66,9 @@ def run_papr_simulation(output_file="mpr_table.csv"):
     for sc in tqdm(scenarios):
         # Instantiate Model
         # Note: num_tx_ant should be >= rank
-        # We enforce num_tx = rank to avoid mismatch with PUSCHConfig
-        num_tx = sc["rank"]
+        num_tx = 4
+        if sc["rank"] > num_tx:
+            num_tx = sc["rank"]  # Ensure enough antennas
 
         try:
             model = PUSCHCommunicationModel(
@@ -87,6 +89,8 @@ def run_papr_simulation(output_file="mpr_table.csv"):
                 # x: [batch, tx, time]
 
                 # Compute PAPR
+                # Note: We compute for the oversampled signal inside compute_papr logic if integrated?
+                # Using the integrated method in PUSCHCommunicationModel
                 papr_db_batch = model.compute_papr(x)  # Returns [batch, tx]
 
                 # Flatten and collect
@@ -95,12 +99,9 @@ def run_papr_simulation(output_file="mpr_table.csv"):
             # Compute 99.9% CCDF (0.1% probability of exceeding)
             # Sort descending
             papr_sorted = np.sort(papr_values)
-            if len(papr_sorted) > 0:
-                idx = int(0.999 * len(papr_sorted))
-                idx = min(idx, len(papr_sorted) - 1)
-                papr_999 = papr_sorted[idx]
-            else:
-                papr_999 = np.nan
+            # Index for 99.9%
+            idx = int(0.999 * len(papr_sorted))
+            papr_999 = papr_sorted[idx]
 
             # Record result
             res = sc.copy()
@@ -109,9 +110,6 @@ def run_papr_simulation(output_file="mpr_table.csv"):
 
         except Exception as e:
             print(f"Error in scenario {sc}: {e}")
-            import traceback
-
-            traceback.print_exc()
 
     # Save to CSV
     df = pd.DataFrame(results)
@@ -122,5 +120,8 @@ def run_papr_simulation(output_file="mpr_table.csv"):
 
 if __name__ == "__main__":
     # Ensure directory exists
-    os.makedirs(os.path.dirname("lls_scripts/"), exist_ok=True)
+    os.makedirs(
+        os.path.dirname("lls_scripts/"), exist_ok=True
+    )  # Create if running from root relative
+    # Actually checking path
     run_papr_simulation()
