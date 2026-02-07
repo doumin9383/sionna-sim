@@ -15,6 +15,9 @@ from sionna.phy.channel.tr38901 import UMi, UMa, RMa
 # Local Components
 from .components.hybrid_channel_interface import HybridChannelInterface
 from .components.simplified_link_adaptation import WaterFillingLinkAdaptation
+from .components.mpr_model import MPRModel
+from .components.power_control import PowerControl
+from .components.link_adaptation import MCSLinkAdaptation
 from .components.get_stream_management import get_stream_management
 from .components.get_hist import init_result_history, record_results
 
@@ -125,13 +128,18 @@ class HybridSystemSimulator(Block):
             precision=self.precision,
         )
 
-        # Instantiate simplified link adaptation
-        self.link_adaptation = WaterFillingLinkAdaptation(
+        # Instantiate simplified link adaptation (Physics Abstraction for SINR)
+        self.phy_abstraction = WaterFillingLinkAdaptation(
             resource_grid=resource_grid,
-            transmitter=None,  # Placeholder
+            transmitter=None,
             num_streams_per_tx=self.num_streams_per_ut,
             precision=self.precision,
         )
+
+        # Instantiate SLS components
+        self.mpr_model = MPRModel()
+        self.power_control = PowerControl(p_power_class=ut_max_power_dbm)
+        self.mcs_adapter = MCSLinkAdaptation()
 
     def _setup_channel_model(
         self,
@@ -257,14 +265,84 @@ class HybridSystemSimulator(Block):
             # Effective Noise per stream: N0 + Interference
             noise_plus_interference = self.no + interference_total
 
-            # 4. Link Adaptation (Water Filling + Throughput)
-            total_power = dbm_to_watt(tx_power_dbm)
-            p_alloc, sinr = self.link_adaptation.call(
+            # 4. Power Control & Link Adaptation
+            # a. Calculate Path Loss (Simple Euclidean distance based approximation for PC)
+            # ut_loc: [batch, num_ut, 3]
+            # serving_bs_idx: [batch, num_ut]
+            # bs_loc: [batch, num_bs, 3]
+            serving_bs_loc = tf.gather(self.bs_loc, serving_bs_idx, batch_dims=1)
+            dist = tf.norm(self.ut_loc - serving_bs_loc, axis=-1)  # [batch, num_ut]
+
+            # Simple UMi Path Loss Model for 3.5GHz (Placeholder)
+            # PL = 28.0 + 22*log10(d) + 20*log10(fc)
+            fc_ghz = 3.5
+            dist_safe = tf.maximum(dist, 1.0)
+            pl_db = (
+                28.0
+                + 22.0 * tf.math.log(dist_safe) / tf.math.log(10.0)
+                + 20.0 * tf.math.log(fc_ghz) / tf.math.log(10.0)
+            )
+
+            # b. Get MPR
+            # Assuming "CP-OFDM" and Rank 1 for simplified PC
+            # In future, use actual scheduler rank
+            mpr_val = self.mpr_model.get_mpr("CP-OFDM", 1)  # Scalar approximation
+
+            # c. Calculate Tx Power
+            if self.direction == "uplink":
+                # num_rbs: Total RBs (assuming full bw allocation for now or partial)
+                # resource_grid.num_effective_subcarriers / 12
+                num_rbs = self.resource_grid.num_effective_subcarriers / 12.0
+                p_tx_dbm = self.power_control.calculate_tx_power(
+                    pl_db, num_rbs, mpr_val
+                )
+            else:
+                # Downlink: Use fixed power (split among streams/users handled in Power Allocation?)
+                # For now, use the passed tx_power_dbm argument
+                # But tx_power_dbm is scalar/tensor? call(..., tx_power_dbm)
+                # If scalar, broadcast to users?
+                # In DL, total BS power is split.
+                # Here simplified: Assume tx_power_dbm is per-link or per-user equivalent?
+                # Or total BS power?
+                # Using the argument passed to call()
+                p_tx_dbm = tx_power_dbm
+
+            # Broadcast p_tx_dbm to [batch, num_ut] if it calculated scalar/vector
+            # p_tx_dbm might be tensor [batch, num_ut]
+            total_power = dbm_to_watt(p_tx_dbm)
+
+            # Reshape/Broadcast for broadcasting: [batch, num_ut, 1, 1, 1]
+            if len(total_power.shape) == 0:  # Scalar
+                total_power = tf.broadcast_to(
+                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
+                )
+            elif len(total_power.shape) == 2:  # [batch, num_ut]
+                total_power = tf.reshape(
+                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
+                )
+            elif len(total_power.shape) == 3:  # [batch, num_ut, 1]
+                total_power = tf.reshape(
+                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
+                )
+            else:
+                # Attempt to broadcast/reshape if dimensions allow, safeguard
+                total_power = tf.reshape(
+                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
+                )
+
+            # d. Physics Abstraction (Water Filling -> SINR)
+            p_alloc, sinr = self.phy_abstraction.call(
                 s_serv, noise_plus_interference, total_power
             )
 
-            # Shannon Capacity
-            capacity_per_re = self.link_adaptation.calculate_throughput(sinr)
+            # e. MCS Selection & Throughput
+            # MCS Adapter expects SINR in dB
+            sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
+
+            # Use Discrete MCS Table Lookup
+            # Returns Spectral Efficiency (bits/symbol) including BLER penalty
+            capacity_per_re = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+
             throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
 
             # Store and Update

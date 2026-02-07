@@ -77,12 +77,38 @@ def run_test():
     )
 
     # 5. Run Simulation
-    print("Starting simulation...")
-    num_slots = 5
+    # 5. Run Simulation
+    print("Starting simulation (Small Setup)...")
+    num_slots = 1  # Reduced for quick verification
     tx_power_dbm = 43.0
 
+    # Enable XLA for potential speedup if available, but for debugging eager might be safer
+    # tf.config.optimizer.set_jit(True)
+
     # Run
+    # Note: simulator.py loops internally.
+    # To see progress, we might need to modify simulator.py or just trust it returns quickly.
+    # With num_slots=1, it should be fast.
     history = sim(num_slots, tx_power_dbm)
+
+    print("Simulation completed.")
+    print("History shape:", history.shape)
+
+    # Save results to a file for inspection
+    avg_tput = tf.reduce_mean(history, axis=[1, -1]).numpy()
+    print("Average Metric per slot:", avg_tput)
+
+    try:
+        import csv
+
+        with open("simulation_results.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Slot", "Average_Throughput_bps"])
+            for i, val in enumerate(avg_tput):
+                writer.writerow([i, val])
+        print("Results saved to simulation_results.csv")
+    except Exception as e:
+        print(f"Failed to save results: {e}")
 
     print("Simulation completed.")
     print("History shape:", history.shape)

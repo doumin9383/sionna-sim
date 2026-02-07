@@ -8,8 +8,10 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.8",
     "numpy>=1.26.4",
+    "pandas>=2.3.3",
     "pandoc>=2.4",
     "pypandoc>=1.16.2",
     "sionna==1.2.1",
     "tensorflow[and-cuda]>=2.18.1",
+    "tqdm>=4.67.3",
 ]

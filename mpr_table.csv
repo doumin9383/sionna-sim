@@ -1,0 +1,9 @@
+waveform,transform_precoding,modulation,mcs_index,rank,papr_db_99.9
+CP-OFDM,False,QPSK,2,1,10.386059
+CP-OFDM,False,QPSK,2,2,10.762233
+CP-OFDM,False,QPSK,2,4,10.973281
+CP-OFDM,False,16QAM,11,1,10.568981
+CP-OFDM,False,16QAM,11,2,10.5751295
+CP-OFDM,False,16QAM,11,4,11.399832
+DFT-s-OFDM,True,QPSK,2,1,8.312931
+DFT-s-OFDM,True,16QAM,11,1,8.676262

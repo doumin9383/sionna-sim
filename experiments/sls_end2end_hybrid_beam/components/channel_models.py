@@ -95,7 +95,7 @@ class RBGChannelModel(ChannelModel):
         return self._model
 
 
-class ChunkedGenerateTimeChannel(GenerateTimeChannel):
+class ChunkedTimeChannel(GenerateTimeChannel):
     """
     Generates Time Domain Channel (CIR or Waveform) supporting FDRA masks.
     Inherits from GenerateTimeChannel.
@@ -158,7 +158,7 @@ class ChunkedGenerateTimeChannel(GenerateTimeChannel):
         return super().call(batch_size)
 
 
-class ChunkedGenerateOFDMChannel(GenerateOFDMChannel):
+class ChunkedOFDMChannel(GenerateOFDMChannel):
     """
     Generates Frequency Domain Channel with optimizations for RBG-based processing (SLS).
     Inherits from GenerateOFDMChannel.
@@ -231,9 +231,9 @@ class ChunkedGenerateOFDMChannel(GenerateOFDMChannel):
         return h_rbg
 
 
-class GenerateHybridBeamformingOFDMChannel(ChunkedGenerateOFDMChannel):
+class HybridOFDMChannel(ChunkedOFDMChannel):
     """
-    Adds Analog Beamforming capabilities to the ChunkedGenerateOFDMChannel.
+    Adds Analog Beamforming capabilities to the ChunkedOFDMChannel.
     """
 
     def __init__(
@@ -326,6 +326,117 @@ class GenerateHybridBeamformingOFDMChannel(ChunkedGenerateOFDMChannel):
         # 1. Get physical channel (Element domain) - calling parent
         # Note: standard GenerateOFDMChannel returns [b, r, u, t, v, o, s]
         h_elem = super().__call__(batch_size)
+
+        # 2. Apply Analog Beamforming
+        h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
+
+        return h_port
+
+
+class GeneratHybridBeamformingTimeChannel(ChunkedTimeChannel):
+    """
+    Adds Analog Beamforming capabilities to the ChunkedTimeChannel.
+    Generates time-domain channel impulse response (CIR) after applying analog beamforming weights.
+    """
+
+    def __init__(
+        self,
+        channel_model,
+        bandwidth,
+        num_time_samples,
+        tx_array,
+        rx_array,
+        num_tx_ports,
+        num_rx_ports,
+        l_min,
+        l_max,
+        normalize_channel=False,
+        precision=None,
+    ):
+        super().__init__(
+            channel_model=channel_model,
+            bandwidth=bandwidth,
+            num_time_samples=num_time_samples,
+            l_min=l_min,
+            l_max=l_max,
+            normalize_channel=normalize_channel,
+            precision=precision,
+        )
+
+        self.tx_array = tx_array
+        self.rx_array = rx_array
+        self.num_tx_ports = num_tx_ports
+        self.num_rx_ports = num_rx_ports
+
+        # Initialize Default Weights
+        self._init_default_weights()
+
+    def _init_default_weights(self):
+        # Default: Identity mapping (first N elements)
+        self.w_rf = tf.eye(
+            self.tx_array.num_ant, num_columns=self.num_tx_ports, dtype=tf.complex64
+        )
+        self.a_rf = tf.eye(
+            self.rx_array.num_ant, num_columns=self.num_rx_ports, dtype=tf.complex64
+        )
+
+    def set_analog_weights(self, w_rf, a_rf):
+        self.w_rf = w_rf
+        self.a_rf = a_rf
+
+    def _apply_weights(self, h_elem, w_rf, a_rf):
+        """
+        Applies weights using Einsum to Time Domain Channel (CIR).
+        h_elem: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_path, num_time_samples]
+        w_rf  : [num_tx_ant, num_tx_ports] or broadcastable
+        a_rf  : [num_rx_ant, num_rx_ports] or broadcastable
+
+        Returns:
+        h_port: [batch, num_rx, num_rx_ports, num_tx, num_tx_ports, num_path, num_time_samples]
+        """
+        # TX Beamforming
+        # h_elem indices: b (batch), r (rx), u (rx_ant), t (tx), v (tx_ant), p (path), s (sample)
+        # w_rf indices:   v (tx_ant), m (tx_port)
+        # Target:         b, r, u, t, m, p, s
+
+        # Determine equation based on w_rf rank
+        if len(w_rf.shape) == 2:  # [v, m] - static weights for all
+            eq_tx = "brutvps,vm->brutmps"
+        elif len(w_rf.shape) == 3:  # [t, v, m] or [b, v, m]
+            if w_rf.shape[0] == h_elem.shape[3]:  # matches num_tx
+                eq_tx = "brutvps,tvm->brutmps"
+            else:  # assumes [batch, v, m]
+                eq_tx = "brutvps,bvm->brutmps"
+        else:  # [b, t, v, m]
+            eq_tx = "brutvps,btvm->brutmps"
+
+        h_tx_bf = tf.einsum(eq_tx, h_elem, w_rf)
+
+        # RX Beamforming
+        # h_tx_bf indices: b, r, u, t, m, p, s
+        # a_rf indices:    u (rx_ant), n (rx_port)
+        # Target:          b, r, n, t, m, p, s
+
+        if len(a_rf.shape) == 2:  # [u, n]
+            eq_rx = "brutmps,un->brntmps"
+        elif len(a_rf.shape) == 3:  # [r, u, n] or [b, u, n]
+            if a_rf.shape[0] == h_elem.shape[1]:  # matches num_rx
+                eq_rx = "brutmps,run->brntmps"
+            else:  # assumes [batch, u, n]
+                eq_rx = "brutmps,bun->brntmps"
+        else:  # [b, r, u, n]
+            eq_rx = "brutmps,brun->brntmps"
+
+        h_port = tf.einsum(eq_rx, h_tx_bf, tf.math.conj(a_rf))
+        return h_port
+
+    def get_cir(self, batch_size=None):
+        """
+        Return the port-domain CIR.
+        """
+        # 1. Get physical channel CIR (Element domain) - calling parent
+        # Parent (ChunkedTimeChannel) returns [b, r, u, t, v, p, s]
+        h_elem = super().get_cir(batch_size)
 
         # 2. Apply Analog Beamforming
         h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
