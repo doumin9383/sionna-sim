@@ -81,22 +81,18 @@ class RBGChannelModel(ChannelModel):
         else:
             raise ValueError(f"Unknown scenario: {scenario}")
 
-        # Expose properties from the internal model
-        self.num_tx = self._model.num_tx
-        self.num_tx_ant = self._model.num_tx_ant
-        self.num_rx = self._model.num_rx
-        self.num_rx_ant = self._model.num_rx_ant
+        pass
 
     def set_topology(self, *args, **kwargs):
         """Pass topology down to the internal model"""
         self._model.set_topology(*args, **kwargs)
 
-    def __call__(self, num_time_samples, sampling_frequency):
+    def __call__(self, *args, **kwargs):
         """
         Delegate the call to the internal model.
         Returns: (a, tau)
         """
-        return self._model(num_time_samples, sampling_frequency)
+        return self._model(*args, **kwargs)
 
     @property
     def model(self):
@@ -129,6 +125,7 @@ class ChunkedTimeChannel(GenerateTimeChannel):
             normalize_channel=normalize_channel,
             precision=precision,
         )
+        self._channel_model = channel_model
 
     def get_cir(self, batch_size=None):
         """
@@ -139,7 +136,8 @@ class ChunkedTimeChannel(GenerateTimeChannel):
              This method exposes the intermediate steps if needed or returns the final h_time)
         """
         # Generate paths
-        a, tau = self._channel_model(self._num_time_samples, self._sampling_frequency)
+        # Use _num_time_steps and _bandwidth (acting as sampling freq)
+        a, tau = self._channel_model(self._num_time_steps, self._bandwidth)
 
         # Note: In standard Sionna, GenerateTimeChannel.__call__ does:
         # a, tau = self._channel_model(...)
@@ -170,6 +168,7 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
             normalize_channel=normalize_channel,
             precision=precision,
         )
+        self._channel_model = channel_model
 
         # Pre-compute all frequencies and RBG centers
         self._all_frequencies = subcarrier_frequencies(
@@ -181,7 +180,10 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         """
         Expose path generation for consistency verification.
         """
-        a, tau = self._channel_model(self._num_time_samples, self._sampling_frequency)
+        # Use _num_ofdm_symbols and _sampling_frequency
+        # Note: GenerateOFDMChannel might pass batch_size too, but here we keep it simple for now
+        # or we verify what args correspond to.
+        a, tau = self._channel_model(self._num_ofdm_symbols, self._sampling_frequency)
         return a, tau
 
     def get_rbg_channel(self, batch_size, rbg_size, active_rbgs=None):

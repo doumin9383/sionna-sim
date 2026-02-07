@@ -1,6 +1,6 @@
 import tensorflow as tf
 from sionna.phy import Block
-from .hybrid_channels import HybridOFDMChannel
+from .channel_models import HybridOFDMChannel
 
 
 class HybridChannelInterface(Block):
@@ -43,7 +43,7 @@ class HybridChannelInterface(Block):
         """
         Returns full SVD results and the underlying port channel.
         """
-        h_port = self.hybrid_channel.get_port_channel(batch_size)
+        h_port = self.hybrid_channel(batch_size)
         # Permute: [batch, num_rx, num_tx, num_ofdm, num_sc, num_rx_ports, num_tx_ports]
         h_permutes = tf.transpose(h_port, perm=[0, 1, 3, 5, 6, 2, 4])
         s, u, v = tf.linalg.svd(h_permutes)
