@@ -11,21 +11,16 @@ sys.path.append(project_root)
 from experiments.sls_end2end_hybrid_beam.simulator import (
     HybridSystemSimulator,
 )
+from experiments.sls_end2end_hybrid_beam.my_configs import HybridSLSConfig
+from libs.my_configs import ResourceGridConfig
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid
 
 
 def run_test():
     # 1. Configuration
-    batch_size = 1
     carrier_frequency = 3.5e9
-    subcarrier_spacing = 30e3
-    fft_size = 24
-    num_ofdm_symbols = 1
-    num_ut_per_sector = 1
-    num_rings = 1  # 1 site + 1 ring = 7 sites, 21 cells
 
-    # 2. Arrays
     # BS: Single Panel 4x4, Cross-pol
     bs_array = PanelArray(
         num_rows=1,
@@ -49,32 +44,44 @@ def run_test():
         carrier_frequency=carrier_frequency,
     )
 
-    # 3. Resource Grid
-    rg = ResourceGrid(
-        num_ofdm_symbols=num_ofdm_symbols,
-        fft_size=fft_size,
-        subcarrier_spacing=subcarrier_spacing,
+    # Resource Grid Config
+    rg_config = ResourceGridConfig(
+        num_ofdm_symbols=1,
+        fft_size=24,
+        subcarrier_spacing=30e3,
         num_tx=1,
         num_streams_per_tx=1,
         cyclic_prefix_length=6,
-        pilot_pattern=None,  # No pilots for this MVP
-    )  # No header
+        pilot_pattern=None,
+    )
+    # Convert RG config to Sionna Object (Simulator needs the object for now)
+    rg = ResourceGrid(
+        num_ofdm_symbols=rg_config.num_ofdm_symbols,
+        fft_size=rg_config.fft_size,
+        subcarrier_spacing=rg_config.subcarrier_spacing,
+        num_tx=rg_config.num_tx,
+        num_streams_per_tx=rg_config.num_streams_per_tx,
+        cyclic_prefix_length=rg_config.cyclic_prefix_length,
+        pilot_pattern=rg_config.pilot_pattern,
+    )
 
-    # 4. Instantiate Simulator
-    sim = HybridSystemSimulator(
-        batch_size=batch_size,
-        num_rings=num_rings,
-        num_ut_per_sector=num_ut_per_sector,
+    # Master Config
+    config = HybridSLSConfig(
+        batch_size=1,
+        num_rings=1,
+        num_ut_per_sector=1,
+        num_slots=1,
         carrier_frequency=carrier_frequency,
         resource_grid=rg,
+        bs_array=bs_array,
+        ut_array=ut_array,
         scenario="uma",
         direction="downlink",
-        ut_array=ut_array,
-        bs_array=bs_array,
-        bs_max_power_dbm=43.0,
-        ut_max_power_dbm=23.0,
-        coherence_time=10,  # slots
+        coherence_time=10,
     )
+
+    # 4. Instantiate Simulator
+    sim = HybridSystemSimulator(config=config)
 
     # 5. Run Simulation
     # 5. Run Simulation
@@ -101,12 +108,14 @@ def run_test():
     try:
         import csv
 
-        with open("simulation_results.csv", "w", newline="") as f:
+        os.makedirs(config.output_dir, exist_ok=True)
+        csv_path = os.path.join(config.output_dir, "simulation_results.csv")
+        with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Slot", "Average_Throughput_bps"])
             for i, val in enumerate(avg_tput):
                 writer.writerow([i, val])
-        print("Results saved to simulation_results.csv")
+        print(f"Results saved to {csv_path}")
     except Exception as e:
         print(f"Failed to save results: {e}")
 

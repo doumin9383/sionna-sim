@@ -14,40 +14,37 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from experiments.sls_end2end_hybrid_beam.my_configs import LLSSweepConfig
 from experiments.sls_end2end_hybrid_beam.components.pusch_model import (
     PUSCHCommunicationModel,
 )
 
 
-def run_papr_simulation(
-    output_file="experiments/sls_end2end_hybrid_beam/results/mpr_table.csv",
-):
+def run_papr_simulation(config: LLSSweepConfig = LLSSweepConfig()):
 
+    output_file = config.output_file
     # Ensure results directory exists
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     results_dir = os.path.dirname(output_file)
 
     # Simulation Parameters
-    batch_size = 100  # Adjust based on GPU memory
-    num_batches = 10  # Total samples = 1000 slots
+    batch_size = config.batch_size
+    num_batches = config.num_batches
 
-    # Scenarios to sweep (Optimized for VRAM and relevance)
+    # Scenarios to sweep
     scenarios = []
-    modulations = {"QPSK": 2, "16QAM": 11, "64QAM": 20, "256QAM": 28}
-    waveforms = [("CP-OFDM", False), ("DFT-s-OFDM", True)]
-    ranks = [1, 2, 4]  # Rank 8 is very heavy, reducing to 1, 2, 4
-    rb_counts = [1, 20, 100]  # Representative counts
-    granularities = [2, "Wideband"]  # Most relevant cases
 
-    # Iterate through combinations
-    for wf_name, is_dft_s in waveforms:
-        for mod_name, mcs_idx in modulations.items():
-            for rank in ranks:
+    # Iterate through combinations from config
+    for wf in config.waveforms:
+        wf_name = wf["name"]
+        is_dft_s = wf["is_dft_s"]
+        for mod_name, mcs_idx in config.modulations.items():
+            for rank in config.ranks:
                 # DFT-s-OFDM is usually Rank 1
                 if is_dft_s and rank > 1:
                     continue
-                for num_rb in rb_counts:
-                    for gran in granularities:
+                for num_rb in config.rb_counts:
+                    for gran in config.granularities:
                         scenarios.append(
                             {
                                 "waveform": wf_name,
@@ -84,8 +81,8 @@ def run_papr_simulation(
 
         try:
             model = PUSCHCommunicationModel(
-                carrier_frequency=3.5e9,
-                subcarrier_spacing=30e3,
+                carrier_frequency=config.carrier_frequency,
+                subcarrier_spacing=config.subcarrier_spacing,
                 num_tx_ant=num_tx,
                 num_rx_ant=num_tx,
                 num_layers=sc["rank"],
@@ -93,7 +90,7 @@ def run_papr_simulation(
                 enable_transform_precoding=sc["transform_precoding"],
                 mcs_index=sc["mcs_index"],
                 precoding_granularity=sc["granularity"],
-                papr_oversampling_factor=4,
+                papr_oversampling_factor=config.papr_oversampling_factor,
             )
 
             papr_values = []

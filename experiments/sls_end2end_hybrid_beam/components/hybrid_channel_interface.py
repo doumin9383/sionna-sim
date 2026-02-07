@@ -1,12 +1,12 @@
 import tensorflow as tf
 from sionna.phy import Block
-from .channel_models import GenerateHybridBeamformingOFDMChannel
+from .channel_models import HybridOFDMChannel
 
 
 class HybridChannelInterface(Block):
     """
     Interface for Hybrid Beamforming Channel.
-    Wraps GenerateHybridBeamformingOFDMChannel to provide effective channel gains via SVD.
+    Wraps HybridOFDMChannel to provide effective channel gains via SVD.
     """
 
     def __init__(
@@ -24,8 +24,8 @@ class HybridChannelInterface(Block):
         self.channel_model = channel_model
         self.resource_grid = resource_grid
 
-        # Instantiate the GenerateHybridBeamformingOFDMChannel
-        self.hybrid_channel = GenerateHybridBeamformingOFDMChannel(
+        # Instantiate the HybridOFDMChannel
+        self.hybrid_channel = HybridOFDMChannel(
             channel_model=channel_model,
             resource_grid=resource_grid,
             tx_array=tx_array,

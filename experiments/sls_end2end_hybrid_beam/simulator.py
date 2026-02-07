@@ -28,23 +28,14 @@ sionna.phy.config.seed = 42
 sionna.phy.config.precision = "single"  # 'single' or 'double'
 
 
+from .my_configs import HybridSLSConfig
+
+
 class HybridSystemSimulator(Block):
 
     def __init__(
         self,
-        batch_size,
-        num_rings,
-        num_ut_per_sector,
-        carrier_frequency,
-        resource_grid,
-        scenario,
-        direction,
-        ut_array,
-        bs_array,
-        bs_max_power_dbm,
-        ut_max_power_dbm,
-        coherence_time,
-        pf_beta=0.98,
+        config: HybridSLSConfig,
         max_bs_ut_dist=None,
         min_bs_ut_dist=None,
         temperature=294,
@@ -55,22 +46,21 @@ class HybridSystemSimulator(Block):
     ):
         super().__init__(precision=precision)
 
-        assert scenario in ["umi", "uma", "rma"]
-        assert direction in ["uplink", "downlink"]
-        self.scenario = scenario
-        self.batch_size = int(batch_size)
-        self.resource_grid = resource_grid
-        self.num_ut_per_sector = int(num_ut_per_sector)
-        self.direction = direction
-        self.bs_max_power_dbm = bs_max_power_dbm  # [dBm]
-        self.ut_max_power_dbm = ut_max_power_dbm  # [dBm]
-        self.coherence_time = tf.cast(coherence_time, tf.int32)  # [slots]
-        num_cells = get_num_hex_in_grid(num_rings)
+        self.config = config
+        self.scenario = config.scenario
+        self.batch_size = int(config.batch_size)
+        self.resource_grid = config.resource_grid
+        self.num_ut_per_sector = int(config.num_ut_per_sector)
+        self.direction = config.direction
+        self.bs_max_power_dbm = config.bs_max_power_dbm  # [dBm]
+        self.ut_max_power_dbm = config.ut_max_power_dbm  # [dBm]
+        self.coherence_time = tf.cast(config.coherence_time, tf.int32)  # [slots]
+        num_cells = get_num_hex_in_grid(config.num_rings)
         self.num_bs = num_cells * 3
         self.num_ut = self.num_bs * self.num_ut_per_sector
-        self.num_ut_ant = ut_array.num_ant
-        self.num_bs_ant = bs_array.num_ant
-        if bs_array.polarization == "dual":
+        self.num_ut_ant = config.ut_array.num_ant
+        self.num_bs_ant = config.bs_array.num_ant
+        if config.bs_array.polarization == "dual":
             self.num_bs_ant *= 2
         if self.direction == "uplink":
             self.num_tx, self.num_rx = self.num_ut, self.num_bs
@@ -82,55 +72,56 @@ class HybridSystemSimulator(Block):
             self.num_tx_per_sector = 1
 
         # Assume 1 stream for UT antenna
-        self.num_streams_per_ut = resource_grid.num_streams_per_tx
+        self.num_streams_per_ut = config.resource_grid.num_streams_per_tx
 
         # Set TX-RX pairs via StreamManagement
         self.stream_management = get_stream_management(
-            direction,
+            config.direction,
             self.num_rx,
             self.num_tx,
             self.num_streams_per_ut,
-            num_ut_per_sector,
+            config.num_ut_per_sector,
         )
         # Noise power per subcarrier
         self.no = tf.cast(
-            BOLTZMANN_CONSTANT * temperature * resource_grid.subcarrier_spacing,
+            BOLTZMANN_CONSTANT * temperature * config.resource_grid.subcarrier_spacing,
             self.rdtype,
         )
 
         # Slot duration [sec]
         self.slot_duration = (
-            resource_grid.ofdm_symbol_duration * resource_grid.num_ofdm_symbols
+            config.resource_grid.ofdm_symbol_duration
+            * config.resource_grid.num_ofdm_symbols
         )
 
         # Initialize channel model based on scenario
         self._setup_channel_model(
-            scenario,
-            carrier_frequency,
+            config.scenario,
+            config.carrier_frequency,
             o2i_model,
-            ut_array,
-            bs_array,
+            config.ut_array,
+            config.bs_array,
             average_street_width,
             average_building_height,
         )
 
         # Generate multicell topology
-        self._setup_topology(num_rings, min_bs_ut_dist, max_bs_ut_dist)
+        self._setup_topology(config.num_rings, min_bs_ut_dist, max_bs_ut_dist)
 
         # Instantiate the Hybrid Channel Interface
         self.channel_interface = HybridChannelInterface(
             channel_model=self.channel_model,
-            resource_grid=resource_grid,
-            tx_array=bs_array,  # Mapping bs_array to tx_array
-            rx_array=ut_array,  # Mapping ut_array to rx_array
-            num_tx_ports=bs_array.num_ant,
-            num_rx_ports=ut_array.num_ant,
+            resource_grid=config.resource_grid,
+            tx_array=config.bs_array,  # Mapping bs_array to tx_array
+            rx_array=config.ut_array,  # Mapping ut_array to rx_array
+            num_tx_ports=config.bs_array.num_ant,
+            num_rx_ports=config.ut_array.num_ant,
             precision=self.precision,
         )
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
         self.phy_abstraction = WaterFillingLinkAdaptation(
-            resource_grid=resource_grid,
+            resource_grid=config.resource_grid,
             transmitter=None,
             num_streams_per_tx=self.num_streams_per_ut,
             precision=self.precision,
@@ -138,7 +129,7 @@ class HybridSystemSimulator(Block):
 
         # Instantiate SLS components
         self.mpr_model = MPRModel()
-        self.power_control = PowerControl(p_power_class=ut_max_power_dbm)
+        self.power_control = PowerControl(p_power_class=config.ut_max_power_dbm)
         self.mcs_adapter = MCSLinkAdaptation()
 
     def _setup_channel_model(
