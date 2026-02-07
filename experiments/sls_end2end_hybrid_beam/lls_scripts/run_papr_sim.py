@@ -31,53 +31,56 @@ def run_papr_simulation(
     batch_size = 100  # Adjust based on GPU memory
     num_batches = 10  # Total samples = 1000 slots
 
-    # Scenarios to sweep
+    # Scenarios to sweep (Optimized for VRAM and relevance)
     scenarios = []
-
-    # Define Modulation to MCS Index mapping (approximate for Table 1)
-    # QPSK: 2, 16QAM: 11, 64QAM: 20, 256QAM: 28 (Sample indices)
     modulations = {"QPSK": 2, "16QAM": 11, "64QAM": 20, "256QAM": 28}
+    waveforms = [("CP-OFDM", False), ("DFT-s-OFDM", True)]
+    ranks = [1, 2, 4]  # Rank 8 is very heavy, reducing to 1, 2, 4
+    rb_counts = [1, 20, 100]  # Representative counts
+    granularities = [2, "Wideband"]  # Most relevant cases
 
-    # 1. CP-OFDM
-    for mod_name, mcs_idx in modulations.items():
-        for rank in [1, 2, 4]:
-            scenarios.append(
-                {
-                    "waveform": "CP-OFDM",
-                    "transform_precoding": False,
-                    "modulation": mod_name,
-                    "mcs_index": mcs_idx,
-                    "rank": rank,
-                }
-            )
-
-    # 2. DFT-s-OFDM (Transform Precoding)
-    # Usually Rank 1 only for DFT-s-OFDM in typical usage (though MIMO is possible in Rel 16+)
-    # We stick to Rank 1 for now as per instructions "DFT-s-OFDMは通常Rank 1"
-    for mod_name, mcs_idx in modulations.items():
-        scenarios.append(
-            {
-                "waveform": "DFT-s-OFDM",
-                "transform_precoding": True,
-                "modulation": mod_name,
-                "mcs_index": mcs_idx,
-                "rank": 1,
-            }
-        )
+    # Iterate through combinations
+    for wf_name, is_dft_s in waveforms:
+        for mod_name, mcs_idx in modulations.items():
+            for rank in ranks:
+                # DFT-s-OFDM is usually Rank 1
+                if is_dft_s and rank > 1:
+                    continue
+                for num_rb in rb_counts:
+                    for gran in granularities:
+                        scenarios.append(
+                            {
+                                "waveform": wf_name,
+                                "transform_precoding": is_dft_s,
+                                "modulation": mod_name,
+                                "mcs_index": mcs_idx,
+                                "rank": rank,
+                                "num_rb": num_rb,
+                                "granularity": gran,
+                            }
+                        )
 
     results = []
     all_papr_data = {}
 
     print(f"Starting PAPR Simulation with {len(scenarios)} scenarios...")
 
+    # For large sweeps, reduce batches if needed
+    current_num_batches = num_batches
+    if len(scenarios) > 50:
+        current_num_batches = 5  # Faster sweep for large scenario count
+
     for sc in tqdm(scenarios):
         # Scenario identifier for filenames
-        scenario_id = f"{sc['waveform']}_{sc['modulation']}_Rank{sc['rank']}"
+        # Shorten ID to avoid too long filenames
+        gran_str = (
+            f"G{sc['granularity']}" if isinstance(sc["granularity"], int) else "GWB"
+        )
+        scenario_id = f"{sc['waveform']}_{sc['modulation']}_R{sc['rank']}_RB{sc['num_rb']}_{gran_str}"
 
         # Instantiate Model
-        num_tx = 4
-        if sc["rank"] > num_tx:
-            num_tx = sc["rank"]
+        # Antennas: Use 8 as base or same as rank
+        num_tx = max(sc["rank"], 8)
 
         try:
             model = PUSCHCommunicationModel(
@@ -86,34 +89,38 @@ def run_papr_simulation(
                 num_tx_ant=num_tx,
                 num_rx_ant=num_tx,
                 num_layers=sc["rank"],
+                num_rb=sc["num_rb"],
                 enable_transform_precoding=sc["transform_precoding"],
                 mcs_index=sc["mcs_index"],
+                precoding_granularity=sc["granularity"],
                 papr_oversampling_factor=4,
             )
 
             papr_values = []
 
-            for i in range(num_batches):
+            for i in range(current_num_batches):
                 # Generate signal
                 x = model.transmitter(batch_size)
 
-                # Save a sample waveform for EVERY scenario (just the first batch)
-                if i == 0:
+                # Save a sample waveform (only for a subset to avoid flooding disk)
+                if i == 0 and sc["num_rb"] == 100 and sc["rank"] == 1:
                     plot_individual_waveform(x, scenario_id, results_dir)
 
                 # Compute PAPR
                 papr_db_batch = model.compute_papr(x)
                 papr_values.extend(papr_db_batch.numpy().flatten())
 
-            # Store for global comparison
-            wave_mod_key = f"{sc['waveform']} ({sc['modulation']})"
-            if wave_mod_key not in all_papr_data:
-                all_papr_data[wave_mod_key] = []
-            all_papr_data[wave_mod_key].extend(papr_values)
+            # Store for global comparison (Selective labels to avoid cluttered legend)
+            if sc["num_rb"] == 50 and sc["granularity"] == "Wideband":
+                wave_mod_key = f"{sc['waveform']} ({sc['modulation']}) R{sc['rank']}"
+                if wave_mod_key not in all_papr_data:
+                    all_papr_data[wave_mod_key] = []
+                all_papr_data[wave_mod_key].extend(papr_values)
 
-            # Compute and Plot individual CCDF
+            # Compute and Plot individual CCDF (Selective)
             papr_sorted = np.sort(papr_values)
-            plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
+            if sc["num_rb"] == 100:
+                plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
 
             # Compute 99.9% CCDF
             idx = int(0.999 * len(papr_sorted))
@@ -124,8 +131,17 @@ def run_papr_simulation(
             res["papr_db_99.9"] = papr_999
             results.append(res)
 
+            # --- Memory Management ---
+            # Important for large sweeps on limited VRAM
+            del model
+            tf.keras.backend.clear_session()
+            import gc
+
+            gc.collect()
+
         except Exception as e:
             print(f"Error in scenario {sc}: {e}")
+            tf.keras.backend.clear_session()
 
     # Plot Comparison CCDF (Cleaned up)
     plot_summary_ccdf(all_papr_data, results_dir)
@@ -137,35 +153,46 @@ def run_papr_simulation(
 
 
 def plot_individual_waveform(x, scenario_id, results_dir):
-    """Saves a plot of the time domain waveform for a specific scenario."""
+    """Saves a plot of the time domain waveform with subplots for antennas."""
     import matplotlib.pyplot as plt
 
     plt.switch_backend("Agg")
 
-    # Take the first batch, first antenna
-    # Plot a longer sequence to see the "flatness" across multiple symbols
-    num_samples = min(x.shape[-1], 5000)
-    sample = tf.abs(x[0, 0, :num_samples]).numpy()
+    # x shape: [batch, tx, time]
+    # Plot enough samples to see one whole slot or a significant part of it
+    # 15000 samples is usually ~4 OFDM symbols at typical SCS/FFT
+    num_samples = min(x.shape[-1], 15000)
 
-    # Calculate RMS for reference
-    rms = np.sqrt(np.mean(sample**2))
-
-    plt.figure(figsize=(15, 5))
-    plt.plot(sample, lw=0.8, label="Instantaneous Amplitude")
-    plt.axhline(
-        y=rms, color="r", linestyle="--", alpha=0.7, label=f"RMS Level ({rms:.2f})"
+    num_ant_to_plot = min(x.shape[1], 4)
+    fig, axes = plt.subplots(
+        num_ant_to_plot, 1, figsize=(15, 3 * num_ant_to_plot), sharex=True
     )
+    if num_ant_to_plot == 1:
+        axes = [axes]
 
-    plt.title(f"Time Domain Amplitude (Long View): {scenario_id}")
-    plt.xlabel("Time Samples")
-    plt.ylabel("Absolute Amplitude")
-    plt.legend(loc="upper right")
-    plt.grid(True, alpha=0.3)
+    for i in range(num_ant_to_plot):
+        sample = tf.abs(x[0, i, :num_samples]).numpy()
+        rms = np.sqrt(np.mean(sample**2))
+
+        ax = axes[i]
+        ax.plot(sample, lw=0.6, label=f"Ant {i} Amplitude")
+        ax.axhline(
+            y=rms, color="r", linestyle="--", alpha=0.6, label=f"RMS ({rms:.2f})"
+        )
+
+        ax.set_ylabel("Amplitude")
+        ax.legend(loc="upper right", fontsize="small")
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.set_title(f"Time Domain Waveform (Multi-Antenna): {scenario_id}")
+
+    axes[-1].set_xlabel("Time Samples")
+    plt.tight_layout()
 
     save_path = os.path.join(results_dir, "waveforms", f"waveform_{scenario_id}.png")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
-    plt.close()
+    plt.close(fig)
 
 
 def plot_individual_ccdf(papr_sorted, scenario_id, results_dir):

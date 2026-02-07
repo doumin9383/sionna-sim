@@ -24,10 +24,11 @@ class PUSCHCommunicationModel(tf.keras.Model):
         num_tx_ant=4,
         num_rx_ant=4,
         num_layers=1,
+        num_rb=50,
         domain="time",  # "time" or "freq"
         enable_transform_precoding=False,
         mcs_index=16,
-        constellation="qam256",  # Used if transform_precoding=False (CP-OFDM) manually controlled
+        precoding_granularity=None,  # None, "Wideband", or int (in RBs)
         papr_oversampling_factor=4,
     ):
         super().__init__()
@@ -36,25 +37,22 @@ class PUSCHCommunicationModel(tf.keras.Model):
         carrier_config = CarrierConfig()
         carrier_config.subcarrier_spacing = subcarrier_spacing / 1e3
         carrier_config.carrier_frequency = carrier_frequency
+        carrier_config.n_size_grid = num_rb  # Set bandwidth by RB count
 
         self.pusch_config = PUSCHConfig(carrier=carrier_config)
         self.pusch_config.output_domain = domain
 
         # Adjust config based on inputs
         # In Sionna NR, num_antenna_ports must match num_layers for PUSCHConfig
+        # when using it to map layers to ports.
+        # We will handle precoding (port to antenna) in our wrapper if needed.
         self.pusch_config.num_antenna_ports = num_layers
         self.pusch_config.num_layers = num_layers
 
         # Modulation / MCS
-        # If manual control of modulation is needed (e.g. for PAPR sweep):
-        # We can set target_coderate or mcs_index.
-        # For PAPR, we often want specific constellation.
-        # PUSCHConfig uses mcs_index to determine modulation order.
         self.pusch_config.mcs_index = mcs_index
 
         # Transform Precoding (DFT-s-OFDM)
-        # We keep the config.transform_precoding FALSE to use our manual implementation/wrapper
-        # unless we decide to use Sionna's native support with caveats.
         self.pusch_config.transform_precoding = False
         self.manual_transform_precoding = enable_transform_precoding
 
@@ -63,14 +61,9 @@ class PUSCHCommunicationModel(tf.keras.Model):
             self.pusch_config,
             enable_transform_precoding=self.manual_transform_precoding,
             output_domain=domain,
+            num_tx_ant=num_tx_ant,
+            precoding_granularity=precoding_granularity,
         )
-
-        # 3. Channel (Placeholder/Future use)
-        # For PAPR sim, we don't strictly need the channel, but for BLER we do.
-        # We instantiate it to ensure connections are valid.
-        # We need array configurations. For now, we assume simplistic arrays or pass them.
-        # Since arguments are simple numbers, we might need to create Arrays inside or accept them.
-        # For this MVP, we skip complex channel setup if only PAPR is requested.
 
         # 4. Receiver
         self.receiver = PUSCHReceiver(self.transmitter)
