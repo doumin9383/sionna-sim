@@ -37,3 +37,6 @@ ENV/
 
 # My Project junk
 results/
+# Projects
+sionna/
+sionna-rt/

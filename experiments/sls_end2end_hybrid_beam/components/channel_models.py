@@ -49,11 +49,6 @@ class RBGChannelModel(ChannelModel):
         precision=None,
     ):
         super().__init__(
-            num_tx=1,
-            num_tx_ant=1,
-            num_rx=1,
-            num_rx_ant=1,
-            carrier_frequency=carrier_frequency,
             precision=precision,
         )
 
@@ -129,24 +124,34 @@ class ChunkedTimeChannel(GenerateTimeChannel):
 
     def get_cir(self, batch_size=None):
         """
-        Explicitly get CIR (Channel Impulse Response) from the model.
+        Explicitly get CIR (Discrete Time Channel Impulse Response) from the model.
         Returns:
             h_time: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_path, num_time_samples]
-            (Note: GenerateTimeChannel usually produces h_time by convolving a, tau.
-             This method exposes the intermediate steps if needed or returns the final h_time)
+            (The discrete time channel taps)
         """
-        # Generate paths
+        # 1. Generate paths (a, tau)
         # Use _num_time_steps and _bandwidth (acting as sampling freq)
-        a, tau = self._channel_model(self._num_time_steps, self._bandwidth)
+        # However, for cir_to_time_channel, we need to ensure we have enough time steps
+        # to cover the delay spread + filter length.
+        # But here _channel_model usually just needs (num_time_steps, sampling_frequency)
+        # to generate time-variant paths if mobility is involved.
+        # If static, it might ignore num_time_steps.
 
-        # Note: In standard Sionna, GenerateTimeChannel.__call__ does:
-        # a, tau = self._channel_model(...)
-        # h_time = cir_to_time_channel(self._bandwidth, a, tau, self._l_min, self._l_max, ...)
-        # We can implement specific logic here if we need FDRA masking in time domain
-        # (which is complex, usually done by applying mask in freq and IFFT).
+        # We use the total number of time steps required for the output
+        total_time_steps = self._num_time_steps + self._l_tot - 1
+        a, tau = self._channel_model(total_time_steps, self._bandwidth)
 
-        # For now, we return the standard paths for consistency checking.
-        return a, tau
+        # 2. Convert to Discrete Time Channel (h_time)
+        h_time = cir_to_time_channel(
+            self._bandwidth,
+            a,
+            tau,
+            l_min=self._l_min,
+            l_max=self._l_max,
+            normalize=self._normalize_channel,
+        )
+
+        return h_time
 
     def call(self, batch_size=None):
         # Default behavior of GenerateTimeChannel
@@ -169,6 +174,7 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
             precision=precision,
         )
         self._channel_model = channel_model
+        self._resource_grid = resource_grid
 
         # Pre-compute all frequencies and RBG centers
         self._all_frequencies = subcarrier_frequencies(
@@ -180,10 +186,14 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         """
         Expose path generation for consistency verification.
         """
-        # Use _num_ofdm_symbols and _sampling_frequency
-        # Note: GenerateOFDMChannel might pass batch_size too, but here we keep it simple for now
-        # or we verify what args correspond to.
-        a, tau = self._channel_model(self._num_ofdm_symbols, self._sampling_frequency)
+        # GenerateOFDMChannel stores necessary parameters in:
+        # self._resource_grid.num_ofdm_symbols
+        # sampling_frequency = 1 / self._resource_grid.ofdm_symbol_duration
+
+        num_ofdm_symbols = self._resource_grid.num_ofdm_symbols
+        sampling_frequency = 1.0 / self._resource_grid.ofdm_symbol_duration
+
+        a, tau = self._channel_model(num_ofdm_symbols, sampling_frequency)
         return a, tau
 
     def get_rbg_channel(self, batch_size, rbg_size, active_rbgs=None):
@@ -192,15 +202,33 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         """
         a, tau = self.get_paths(batch_size)
 
-        # Here we would implement the logic to sample H(f) only at RBG centers
-        # or compute average H(f) per RBG.
-        # For this frame, we simply convert CIR to OFDM channel for specific frequencies.
+        # Calculate RBG center frequencies
+        # RBG size is in number of subcarriers
+        # We assume RBGs are contiguous blocks
 
-        # This implementation will be refined in the SLS task.
-        h_ofdm = cir_to_ofdm_channel(
-            self._all_frequencies, a, tau, normalize=self._normalize_channel
+        # Create RBG indices (centers)
+        # Shape: [num_rbgs]
+        # Example: rbg_size=16. Indices: 8, 24, 40...
+        num_subcarriers = self._resource_grid.fft_size
+        num_rbgs = num_subcarriers // rbg_size
+
+        # Calculate indices of RBG centers
+        rbg_indices = tf.range(num_rbgs) * rbg_size + (rbg_size // 2)
+
+        # Gather frequencies at these indices
+        rbg_freqs = tf.gather(self._all_frequencies, rbg_indices)
+
+        # If active_rbgs is provided (mask), we might want to filter further,
+        # but usually we want the whole grid sampled at RBG resolution for scheduling.
+        # If active_rbgs corresponds to specific RBG indices required:
+        if active_rbgs is not None:
+            rbg_freqs = tf.gather(rbg_freqs, active_rbgs)
+
+        # Generate Channel freq response only at these frequencies
+        h_rbg = cir_to_ofdm_channel(
+            rbg_freqs, a, tau, normalize=self._normalize_channel
         )
-        return h_ofdm
+        return h_rbg
 
 
 class HybridOFDMChannel(ChunkedOFDMChannel):
@@ -251,37 +279,53 @@ class HybridOFDMChannel(ChunkedOFDMChannel):
         """
         Applies weights using Einsum.
         h_elem: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm, num_sc]
+        w_rf  : [num_tx_ant, num_tx_ports] or broadcastable
+        a_rf  : [num_rx_ant, num_rx_ports] or broadcastable
         """
         # TX Beamforming
-        # Support broadcasting
-        # Determine equation based on w rank
-        if len(w_rf.shape) == 2:  # [v, p]
+        # h_elem indices: b (batch), r (rx), u (rx_ant), t (tx), v (tx_ant), s (sym), c (sc)
+        # w_rf indices:   v (tx_ant), p (tx_port)
+        # Target:         b, r, u, t, p, s, c
+
+        # Determine equation based on w_rf rank
+        if len(w_rf.shape) == 2:  # [v, p] - static weights for all
             eq_tx = "brutvsc,vp->brutpsc"
-        elif len(w_rf.shape) == 3:  # [t, v, p]
-            eq_tx = "brutvsc,tvp->brutpsc"
+        elif len(w_rf.shape) == 3:  # [t, v, p] or [b, v, p] - depend on context
+            # Assuming [num_tx, num_tx_ant, num_tx_ports] if mismatch batch
+            if w_rf.shape[0] == h_elem.shape[3]:  # matches num_tx
+                eq_tx = "brutvsc,tvp->brutpsc"
+            else:  # assumes [batch, v, p]
+                eq_tx = "brutvsc,bvp->brutpsc"
         else:  # [b, t, v, p]
             eq_tx = "brutvsc,btvp->brutpsc"
 
         h_tx_bf = tf.einsum(eq_tx, h_elem, w_rf)
 
         # RX Beamforming
+        # h_tx_bf indices: b, r, u, t, p, s, c
+        # a_rf indices:    u (rx_ant), q (rx_port)
+        # Target:          b, r, q, t, p, s, c
+
         if len(a_rf.shape) == 2:  # [u, q]
             eq_rx = "brutpsc,uq->brqtpsc"
-        elif len(a_rf.shape) == 3:  # [r, u, q]
-            eq_rx = "brutpsc,ruq->brqtpsc"
+        elif len(a_rf.shape) == 3:  # [r, u, q] or [b, u, q]
+            if a_rf.shape[0] == h_elem.shape[1]:  # matches num_rx
+                eq_rx = "brutpsc,ruq->brqtpsc"
+            else:  # assumes [batch, u, q]
+                eq_rx = "brutpsc,buq->brqtpsc"
         else:  # [b, r, u, q]
             eq_rx = "brutpsc,bruq->brqtpsc"
 
         h_port = tf.einsum(eq_rx, h_tx_bf, tf.math.conj(a_rf))
         return h_port
 
-    def call(self, batch_size=None):
+    def __call__(self, batch_size=None):
         """
         Return the port-domain channel.
         """
         # 1. Get physical channel (Element domain) - calling parent
         # Note: standard GenerateOFDMChannel returns [b, r, u, t, v, o, s]
-        h_elem = super().call(batch_size)
+        h_elem = super().__call__(batch_size)
 
         # 2. Apply Analog Beamforming
         h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
