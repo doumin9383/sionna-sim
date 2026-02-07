@@ -1,0 +1,293 @@
+import sionna
+import tensorflow as tf
+
+# Additional external libraries
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Sionna components
+from sionna.sys import gen_hexgrid_topology, get_num_hex_in_grid
+from sionna.phy.constants import BOLTZMANN_CONSTANT
+from sionna.phy.utils import dbm_to_watt
+from sionna.phy import Block
+from sionna.phy.channel.tr38901 import UMi, UMa, RMa
+
+# Local Components
+from .components.hybrid_channel_interface import HybridChannelInterface
+from .components.simplified_link_adaptation import WaterFillingLinkAdaptation
+from .components.get_stream_management import get_stream_management
+from .components.get_hist import init_result_history, record_results
+
+# Set random seed for reproducibility
+sionna.phy.config.seed = 42
+
+# Internal computational precision
+sionna.phy.config.precision = "single"  # 'single' or 'double'
+
+
+class HybridSystemSimulator(Block):
+
+    def __init__(
+        self,
+        batch_size,
+        num_rings,
+        num_ut_per_sector,
+        carrier_frequency,
+        resource_grid,
+        scenario,
+        direction,
+        ut_array,
+        bs_array,
+        bs_max_power_dbm,
+        ut_max_power_dbm,
+        coherence_time,
+        pf_beta=0.98,
+        max_bs_ut_dist=None,
+        min_bs_ut_dist=None,
+        temperature=294,
+        o2i_model="low",
+        average_street_width=20.0,
+        average_building_height=5.0,
+        precision=None,
+    ):
+        super().__init__(precision=precision)
+
+        assert scenario in ["umi", "uma", "rma"]
+        assert direction in ["uplink", "downlink"]
+        self.scenario = scenario
+        self.batch_size = int(batch_size)
+        self.resource_grid = resource_grid
+        self.num_ut_per_sector = int(num_ut_per_sector)
+        self.direction = direction
+        self.bs_max_power_dbm = bs_max_power_dbm  # [dBm]
+        self.ut_max_power_dbm = ut_max_power_dbm  # [dBm]
+        self.coherence_time = tf.cast(coherence_time, tf.int32)  # [slots]
+        num_cells = get_num_hex_in_grid(num_rings)
+        self.num_bs = num_cells * 3
+        self.num_ut = self.num_bs * self.num_ut_per_sector
+        self.num_ut_ant = ut_array.num_ant
+        self.num_bs_ant = bs_array.num_ant
+        if bs_array.polarization == "dual":
+            self.num_bs_ant *= 2
+        if self.direction == "uplink":
+            self.num_tx, self.num_rx = self.num_ut, self.num_bs
+            self.num_tx_ant, self.num_rx_ant = self.num_ut_ant, self.num_bs_ant
+            self.num_tx_per_sector = self.num_ut_per_sector
+        else:
+            self.num_tx, self.num_rx = self.num_bs, self.num_ut
+            self.num_tx_ant, self.num_rx_ant = self.num_bs_ant, self.num_ut_ant
+            self.num_tx_per_sector = 1
+
+        # Assume 1 stream for UT antenna
+        self.num_streams_per_ut = resource_grid.num_streams_per_tx
+
+        # Set TX-RX pairs via StreamManagement
+        self.stream_management = get_stream_management(
+            direction,
+            self.num_rx,
+            self.num_tx,
+            self.num_streams_per_ut,
+            num_ut_per_sector,
+        )
+        # Noise power per subcarrier
+        self.no = tf.cast(
+            BOLTZMANN_CONSTANT * temperature * resource_grid.subcarrier_spacing,
+            self.rdtype,
+        )
+
+        # Slot duration [sec]
+        self.slot_duration = (
+            resource_grid.ofdm_symbol_duration * resource_grid.num_ofdm_symbols
+        )
+
+        # Initialize channel model based on scenario
+        self._setup_channel_model(
+            scenario,
+            carrier_frequency,
+            o2i_model,
+            ut_array,
+            bs_array,
+            average_street_width,
+            average_building_height,
+        )
+
+        # Generate multicell topology
+        self._setup_topology(num_rings, min_bs_ut_dist, max_bs_ut_dist)
+
+        # Instantiate the Hybrid Channel Interface
+        self.channel_interface = HybridChannelInterface(
+            channel_model=self.channel_model,
+            resource_grid=resource_grid,
+            tx_array=bs_array,  # Mapping bs_array to tx_array
+            rx_array=ut_array,  # Mapping ut_array to rx_array
+            num_tx_ports=bs_array.num_ant,
+            num_rx_ports=ut_array.num_ant,
+            precision=self.precision,
+        )
+
+        # Instantiate simplified link adaptation
+        self.link_adaptation = WaterFillingLinkAdaptation(
+            resource_grid=resource_grid,
+            transmitter=None,  # Placeholder
+            num_streams_per_tx=self.num_streams_per_ut,
+            precision=self.precision,
+        )
+
+    def _setup_channel_model(
+        self,
+        scenario,
+        carrier_frequency,
+        o2i_model,
+        ut_array,
+        bs_array,
+        average_street_width,
+        average_building_height,
+    ):
+        """Initialize appropriate channel model based on scenario"""
+        common_params = {
+            "carrier_frequency": carrier_frequency,
+            "ut_array": ut_array,
+            "bs_array": bs_array,
+            "direction": self.direction,
+            "enable_pathloss": True,
+            "enable_shadow_fading": True,
+            "precision": self.precision,
+        }
+
+        if scenario == "umi":  # Urban micro-cell
+            self.channel_model = UMi(o2i_model=o2i_model, **common_params)
+        elif scenario == "uma":  # Urban macro-cell
+            self.channel_model = UMa(o2i_model=o2i_model, **common_params)
+        elif scenario == "rma":  # Rural macro-cell
+            self.channel_model = RMa(
+                average_street_width=average_street_width,
+                average_building_height=average_building_height,
+                **common_params,
+            )
+
+    def _setup_topology(self, num_rings, min_bs_ut_dist, max_bs_ut_dist):
+        """Generate and set up network topology"""
+        (
+            self.ut_loc,
+            self.bs_loc,
+            self.ut_orientations,
+            self.bs_orientations,
+            self.ut_velocities,
+            self.in_state,
+            self.los,
+            self.bs_virtual_loc,
+            self.grid,
+        ) = gen_hexgrid_topology(
+            batch_size=self.batch_size,
+            num_rings=num_rings,
+            num_ut_per_sector=self.num_ut_per_sector,
+            min_bs_ut_dist=min_bs_ut_dist,
+            max_bs_ut_dist=max_bs_ut_dist,
+            scenario=self.scenario,
+            los=True,
+            return_grid=True,
+            precision=self.precision,
+        )
+
+        # Set topology in channel model
+        self.channel_model.set_topology(
+            self.ut_loc,
+            self.bs_loc,
+            self.ut_orientations,
+            self.bs_orientations,
+            self.ut_velocities,
+            self.in_state,
+            self.los,
+            self.bs_virtual_loc,
+        )
+
+    @tf.function(jit_compile=False)
+    def call(self, num_slots, tx_power_dbm):
+        # Initialize result history
+        throughput_history = tf.TensorArray(dtype=self.rdtype, size=num_slots)
+
+        # BS-UT Association
+        # [num_ut] -> values are serving BS indices
+        serving_bs_idx = tf.argmax(self.stream_management.rx_tx_association, axis=1)
+
+        # --------------- #
+        # Simulate a slot #
+        # --------------- #
+        def simulate_slot(slot, throughput_history):
+            # 1. Get Full Channel Information (SVD results for all pairs)
+            # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
+            h, s_all, u_all, v_all = self.channel_interface.get_full_channel_info(
+                self.batch_size
+            )
+
+            # 2. Extract Serving Precoders and Combiners
+            serving_bs_idx_batched = tf.broadcast_to(
+                serving_bs_idx, [self.batch_size, self.num_ut]
+            )
+
+            # Extract serving S, U, V [batch, num_ut, ofdm, sc, ...]
+            s_serv = tf.gather(s_all, serving_bs_idx_batched, axis=2, batch_dims=2)
+            u_serv = tf.gather(u_all, serving_bs_idx_batched, axis=2, batch_dims=2)
+            v_serv = tf.gather(v_all, serving_bs_idx_batched, axis=2, batch_dims=2)
+
+            # 3. Calculate Interference (The "Box" for future extensions)
+            # BS_precoders: Assuming UT i is served by BS i (for num_ut_per_sector=1).
+            bs_precoders = v_serv
+
+            # a. UT i's combiner applied to all BS links: H_u = U_i^H * H_ij
+            # [batch, ut, bs, ofdm, sc, streams, tx_p]
+            h_u = tf.einsum("buosrp,bujosrt->bujospt", tf.math.conj(u_serv), h)
+
+            # b. BS j's precoder applied: H_eff = H_u * V_j
+            # [batch, ut, bs, ofdm, sc, streams_i, streams_j]
+            h_eff = tf.einsum("bujospt,bjostq->bujospq", h_u, bs_precoders)
+
+            # c. Interference summation
+            # Interference power to user i: sum over j != serving_bs_idx[i] of |h_eff_ij|^2
+            interference_per_bs = tf.reduce_sum(tf.square(tf.abs(h_eff)), axis=-1)
+
+            # Mask out serving link
+            mask = tf.one_hot(serving_bs_idx, depth=self.num_bs)
+            mask = tf.reshape(mask, [1, self.num_ut, self.num_bs, 1, 1, 1])
+
+            interference_total = tf.reduce_sum(
+                interference_per_bs * (1.0 - mask), axis=2
+            )
+
+            # Effective Noise per stream: N0 + Interference
+            noise_plus_interference = self.no + interference_total
+
+            # 4. Link Adaptation (Water Filling + Throughput)
+            total_power = dbm_to_watt(tx_power_dbm)
+            p_alloc, sinr = self.link_adaptation.call(
+                s_serv, noise_plus_interference, total_power
+            )
+
+            # Shannon Capacity
+            capacity_per_re = self.link_adaptation.calculate_throughput(sinr)
+            throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
+
+            # Store and Update
+            throughput_history = throughput_history.write(slot, throughput_per_user)
+            self.ut_loc = self.ut_loc + self.ut_velocities * self.slot_duration
+            self.channel_model.set_topology(
+                self.ut_loc,
+                self.bs_loc,
+                self.ut_orientations,
+                self.bs_orientations,
+                self.ut_velocities,
+                self.in_state,
+                self.los,
+                self.bs_virtual_loc,
+            )
+
+            return slot + 1, throughput_history
+
+        # Run loop
+        _, final_history = tf.while_loop(
+            lambda i, *_: i < num_slots,
+            simulate_slot,
+            [0, throughput_history],
+        )
+
+        return final_history.stack()
