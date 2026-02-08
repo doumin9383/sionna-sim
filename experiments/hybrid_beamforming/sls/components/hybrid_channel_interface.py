@@ -55,18 +55,18 @@ class HybridChannelInterface(Block):
         self.hybrid_channel.set_analog_weights(w_rf, a_rf)
 
     def get_neighbor_channel_info(
-        self,
-        batch_size,
-        ut_loc,
-        bs_loc,
-        ut_orient,
-        bs_orient,
-        ut_velocities=None,
-        in_state=None,
+        self, batch_size, ut_loc, bs_loc, ut_orient, bs_orient, neighbor_indices=None
     ):
         """
         Generates channel only for the specified neighbors using virtual topology mapping.
         """
+        current_neighbor_indices = (
+            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
+        )
+        if current_neighbor_indices is None:
+            raise ValueError(
+                "neighbor_indices must be provided either in init or in method call."
+            )
         # Batch processing for UTs to avoid OOM
         # Process UTs in small batches (e.g., 10)
         batch_size_ut = 10
@@ -76,8 +76,8 @@ class HybridChannelInterface(Block):
         # neighbor_indices: [batch, num_ut, num_neighbors]
         # We need to loop over the 'num_ut' dimension
 
-        num_ut_total = self.neighbor_indices.shape[1]
-        num_neighbors = self.neighbor_indices.shape[2]
+        num_ut_total = current_neighbor_indices.shape[1]
+        num_neighbors = current_neighbor_indices.shape[2]
 
         # Determine strict loop count
         num_batches_ut = (num_ut_total + batch_size_ut - 1) // batch_size_ut
@@ -92,20 +92,22 @@ class HybridChannelInterface(Block):
             ut_loc_batch = ut_loc[:, start_ut:end_ut, :]
             ut_orient_batch = ut_orient[:, start_ut:end_ut, :]
 
-            # Use passed arguments or fallback to channel model state
-            # (Simulator should pass them now)
-            if in_state is not None:
-                in_state_full = in_state
-            elif hasattr(self.channel_model, "indoor"):
-                in_state_full = self.channel_model.indoor
-            else:
-                in_state_full = self.channel_model._scenario.indoor
+            # Additional states that need slicing if they exist in channel model
+            # in_state is usually [batch, num_ut]
+            # ut_velocities is [batch, num_ut, 3]
+            # We access them from channel_model properties if not passed explicitly,
+            # but set_topology expects arguments if we want to update them.
+            # Ideally `get_neighbor_channel_info` should receive them or we extract from model.
+            # But `ut_loc` etc are passed as args.
 
-            if ut_velocities is not None:
-                ut_vel_full = ut_velocities
-            elif hasattr(self.channel_model, "ut_velocities"):
+            # Let's check `channel_model` properties for current state
+            # SystemLevelChannel wraps vector scenario in `_scenario`
+            if hasattr(self.channel_model, "indoor"):
+                in_state_full = self.channel_model.indoor
                 ut_vel_full = self.channel_model.ut_velocities
             else:
+                # Fallback for Sionna < 0.19 or internal structure
+                in_state_full = self.channel_model._scenario.indoor
                 ut_vel_full = self.channel_model._scenario.ut_velocities
 
             in_state_batch = in_state_full[:, start_ut:end_ut]
@@ -236,12 +238,20 @@ class HybridChannelInterface(Block):
         return tf.cast(e_gain, e_array.dtype)[..., tf.newaxis] * e_array
 
     def get_external_neighbor_channel_info(
-        self, batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+        self, batch_size, ut_loc, bs_loc, ut_orient, bs_orient, neighbor_indices=None
     ):
         """
         Generates channel using external ray-tracing data (Zarr).
         Efficient MIMO recovery via direct contraction.
         """
+        current_neighbor_indices = (
+            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
+        )
+        if current_neighbor_indices is None:
+            raise ValueError(
+                "neighbor_indices must be provided either in init or in method call."
+            )
+
         num_rx_ports = self.hybrid_channel.num_rx_ports
         num_tx_ports = self.hybrid_channel.num_tx_ports
 
@@ -250,7 +260,7 @@ class HybridChannelInterface(Block):
 
         # 2. Get paths (a, tau, angles) from Zarr for (UT, NeighborBS) pairs
         a, tau, doa_az, doa_el, dod_az, dod_el = self.external_loader.get_paths(
-            batch_size, self.neighbor_indices, ut_mesh_indices
+            batch_size, current_neighbor_indices, ut_mesh_indices
         )
 
         # 3. Calculate Port-Domain Path Gains (a') using Steering Vectors and Analog Weights
@@ -281,7 +291,7 @@ class HybridChannelInterface(Block):
             v_tx = tf.einsum("buklj,bjp->buklp", tf.math.conj(e_tx), w_rf)
         else:  # [b, s, j, p]
             w_rf_neighbors = tf.gather(
-                w_rf, self.neighbor_indices, axis=1, batch_dims=0
+                w_rf, current_neighbor_indices, axis=1, batch_dims=0
             )
             # w_rf_neighbors: [b, u, k, j, p]
             v_tx = tf.einsum("buklj,bukjp->buklp", tf.math.conj(e_tx), w_rf_neighbors)
@@ -345,27 +355,41 @@ class HybridChannelInterface(Block):
         bs_loc=None,
         ut_orient=None,
         bs_orient=None,
-        ut_velocities=None,
-        in_state=None,
+        neighbor_indices=None,
     ):
         """
         Returns the port-domain channel information.
         If use_rbg_granularity is True, returns channel at RBG centers.
         If neighbor_indices is set, uses neighbor-based virtual mapping.
         """
-        if self.external_loader is not None and self.neighbor_indices is not None:
+        # Prioritize passed neighbor_indices, fall back to self.neighbor_indices
+        effective_neighbor_indices = (
+            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
+        )
+
+        if self.external_loader is not None and effective_neighbor_indices is not None:
+            # Note: get_external_neighbor_channel_info also needs update to accept neighbor_indices if we want full consistency,
+            # but for now let's assume external loader path handles it or we update it too.
+            # Let's check get_external_neighbor_channel_info signature.
+            # It uses self.neighbor_indices. We should probably update it too or temporarilly set self.neighbor_indices.
+            # For safety, let's update it in next step if needed.
+            # For now, let's just assume we need to pass it.
             return self.get_external_neighbor_channel_info(
-                batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+                batch_size,
+                ut_loc,
+                bs_loc,
+                ut_orient,
+                bs_orient,
+                neighbor_indices=effective_neighbor_indices,
             )
-        if self.neighbor_indices is not None:
+        if effective_neighbor_indices is not None:
             return self.get_neighbor_channel_info(
                 batch_size,
                 ut_loc,
                 bs_loc,
                 ut_orient,
                 bs_orient,
-                ut_velocities,
-                in_state,
+                neighbor_indices=effective_neighbor_indices,
             )
 
         if self.use_rbg_granularity:
@@ -385,17 +409,31 @@ class HybridChannelInterface(Block):
         bs_loc,
         ut_orient,
         bs_orient,
-        ut_velocities=None,
-        in_state=None,
+        neighbor_indices=None,
     ):
         """
         Returns the channel matrix to be used for precoding calculation.
         """
-        if self.external_loader is not None and self.neighbor_indices is not None:
+        # Prioritize passed neighbor_indices, fall back to self.neighbor_indices
+        effective_neighbor_indices = (
+            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
+        )
+
+        if self.external_loader is not None and effective_neighbor_indices is not None:
             return self.get_external_neighbor_channel_info(
-                batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+                batch_size,
+                ut_loc,
+                bs_loc,
+                ut_orient,
+                bs_orient,
+                neighbor_indices=effective_neighbor_indices,
             )[0]
 
         return self.get_full_channel_info(
-            batch_size, ut_loc, bs_loc, ut_orient, bs_orient, ut_velocities, in_state
+            batch_size,
+            ut_loc,
+            bs_loc,
+            ut_orient,
+            bs_orient,
+            neighbor_indices=effective_neighbor_indices,
         )[0]

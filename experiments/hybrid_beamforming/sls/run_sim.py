@@ -12,9 +12,6 @@ from experiments.hybrid_beamforming.sls.simulator import (
     HybridSystemSimulator,
 )
 from experiments.hybrid_beamforming.sls.my_configs import HybridSLSConfig
-from libs.my_configs import ResourceGridConfig
-from sionna.phy.channel.tr38901 import PanelArray
-from sionna.phy.ofdm import ResourceGrid
 import csv
 
 
@@ -30,7 +27,7 @@ def run_test():
 
     # 5. Run Simulation
     print(
-        f"シミュレーションを開始します... (Batch Size: {config.batch_size}, Slots: {config.num_slots}, UTs/Sector: {config.num_ut_per_sector})"
+        f"シミュレーションを開始します... (Batch Size: {config.batch_size}, Drops: {config.num_ut_drops}, UTs/Sector: {config.num_ut_per_sector})"
     )
 
     # Enable XLA for potential speedup if available, but for debugging eager might be safer
@@ -39,7 +36,7 @@ def run_test():
     # Run
     # Returns a dictionary of Tensors
     # configのtx_powerを使用
-    history = sim(config.num_slots, config.bs_max_power_dbm)
+    history = sim(config.num_ut_drops, config.bs_max_power_dbm)
 
     print("シミュレーション完了。")
     print("History keys:", history.keys())

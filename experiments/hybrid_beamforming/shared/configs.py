@@ -17,17 +17,6 @@ class HybridSimulationCommonConfig:
     # Resource Grid Common Parameters
     rbg_size_rb: int = 6  # Definition of one Resource Block Group (Subband)
 
-    # Resource Grid Configuration (Data Class)
-    resource_grid: ResourceGridConfig = field(
-        default_factory=lambda: ResourceGridConfig(
-            num_ofdm_symbols=14,
-            fft_size=72,
-            subcarrier_spacing=30e3,
-            num_tx=1,
-            pilot_ofdm_symbol_indices=[2, 11],
-        )
-    )
-
     mcs_table: int = 2
     use_transform_precoding_mcs_table: bool = False
     transform_precoding_pi2bpsk: bool = False
@@ -61,13 +50,6 @@ class HybridSimulationCommonConfig:
     )  # Total Digital Ports (RF Chains) for Hybrid BF
 
     def __init__(self):
-        # self.resource_grid = ResourceGridConfig(
-        #     num_ofdm_symbols=14,
-        #     fft_size=72,
-        #     subcarrier_spacing=self.subcarrier_spacing / 1e3,
-        #     pilot_ofdm_symbol_indices=[2, 11],
-        # )
-
         self.mcs_decoder = lambda mcs: decode_mcs_index(
             mcs,
             table_index=self.mcs_table,

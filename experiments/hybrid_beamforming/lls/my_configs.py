@@ -34,8 +34,7 @@ class HybridLLSConfig(HybridSimulationCommonConfig):
     # rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 132 + 6, 6))
     rb_counts: List[int] = field(default_factory=lambda: [6, 66, 132])
     granularities: List[Union[int, str]] = field(
-        # default_factory=lambda: ["Narrowband", "Subband", "Wideband"]
-        default_factory=lambda: ["Subband", "Wideband"]
+        default_factory=lambda: ["Narrowband", "Subband", "Wideband"]
     )
 
     # Physics Parameters (Inherited)

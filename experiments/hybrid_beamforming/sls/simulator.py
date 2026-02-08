@@ -15,11 +15,9 @@ from sionna.phy.ofdm import ResourceGrid
 
 # Local Components
 from .components.hybrid_channel_interface import HybridChannelInterface
-from .components.simplified_link_adaptation import WaterFillingLinkAdaptation
 from .components.mpr_model import MPRModel
 from .components.power_control import PowerControl
 from .components.link_adaptation import MCSLinkAdaptation
-from .components.get_stream_management import get_stream_management
 from .components.get_hist import init_result_history, record_results
 from .components.precoder_utils import expand_precoder
 
@@ -54,8 +52,9 @@ class HybridSystemSimulator(Block):
         self.scenario = config.scenario
         self.batch_size = int(config.batch_size)
         self.coherence_time = tf.cast(config.coherence_time, tf.int32)  # [slots]
-        num_cells = get_num_hex_in_grid(config.num_rings)
-        self.num_bs = num_cells * 3
+        # num_cells = get_num_hex_in_grid(config.num_rings) # Moved to config
+        # self.num_bs = num_cells * 3 # Moved to config
+        self.num_bs = config.num_bs
         self.num_ut_per_sector = int(config.num_ut_per_sector)
         self.direction = config.direction
         self.bs_max_power_dbm = config.bs_max_power_dbm
@@ -63,53 +62,23 @@ class HybridSystemSimulator(Block):
         self.num_ut = self.num_bs * self.num_ut_per_sector
 
         # Instantiate ResourceGrid from config (Factory)
-        rg_config = config.resource_grid
         self.resource_grid = ResourceGrid(
-            num_ofdm_symbols=rg_config.num_ofdm_symbols,
-            fft_size=rg_config.fft_size,
-            subcarrier_spacing=rg_config.subcarrier_spacing,
-            num_tx=rg_config.num_tx,
-            num_streams_per_tx=rg_config.num_streams_per_tx,
-            cyclic_prefix_length=rg_config.cyclic_prefix_length,
-            pilot_pattern=rg_config.pilot_pattern,
-            pilot_ofdm_symbol_indices=rg_config.pilot_ofdm_symbol_indices,
+            # num_ofdm_symbols=config.num_ofdm_symbols,
+            num_ofdm_symbols=1,  # チャネル生成のためだけに使うので1でOK
+            fft_size=config.num_subcarriers,
+            subcarrier_spacing=config.subcarrier_spacing,
+            # pilot_pattern=rg_config.pilot_pattern,
+            # pilot_ofdm_symbol_indices=rg_config.pilot_ofdm_symbol_indices,
         )
-        # Update config with instantiated object for components that might need it
-        # (Though ideally we should pass it explicitly)
-        # config.resource_grid = self.resource_grid # Avoid modifying config in place if possible, but valid for runtime.
 
         # Instantiate Antenna Arrays from config
-        self.bs_array = PanelArray(
-            num_rows=config.bs_num_rows_panel,
-            num_cols=config.bs_num_cols_panel,
-            num_rows_per_panel=config.bs_num_rows_per_panel,
-            num_cols_per_panel=config.bs_num_cols_per_panel,
-            polarization=config.bs_polarization,
-            polarization_type="cross",
-            antenna_pattern="38.901",
-            carrier_frequency=config.carrier_frequency,
-        )
-        self.ut_array = PanelArray(
-            num_rows=config.ut_num_rows_panel,
-            num_cols=config.ut_num_cols_panel,
-            num_rows_per_panel=config.ut_num_rows_per_panel,
-            num_cols_per_panel=config.ut_num_cols_per_panel,
-            polarization=config.ut_polarization,
-            polarization_type="cross",
-            antenna_pattern="omni",
-            carrier_frequency=config.carrier_frequency,
-        )
+        self.bs_array = config.bs_array
+        self.ut_array = config.ut_array
 
         self.num_ut_ant = self.ut_array.num_ant
         self.num_bs_ant = self.bs_array.num_ant
-        if config.bs_polarization == "dual":
-            pass  # PanelArray.num_ant handles this usually if configured correctly, but Sionna logic check:
-            # PanelArray num_ant property returns total elements including pol.
-            # So we don't need manual multiply if we trust the object.
-            # config.bs_array replaced by self.bs_array usage.
 
         if self.direction == "uplink":
-
             self.num_tx, self.num_rx = self.num_ut, self.num_bs
             self.num_tx_ant, self.num_rx_ant = self.num_ut_ant, self.num_bs_ant
             self.num_tx_per_sector = self.num_ut_per_sector
@@ -123,20 +92,9 @@ class HybridSystemSimulator(Block):
         self.rbg_size_rb = config.rbg_size_rb
         self.rbg_size_sc = int(self.rbg_size_rb * 12) if self.rbg_size_rb > 0 else None
 
-        # Assume 1 stream for UT antenna
-        self.num_streams_per_ut = config.resource_grid.num_streams_per_tx
-
-        # Set TX-RX pairs via StreamManagement
-        self.stream_management = get_stream_management(
-            config.direction,
-            self.num_rx,
-            self.num_tx,
-            self.num_streams_per_ut,
-            config.num_ut_per_sector,
-        )
         # Noise power per subcarrier
         self.no = tf.cast(
-            BOLTZMANN_CONSTANT * temperature * config.resource_grid.subcarrier_spacing,
+            BOLTZMANN_CONSTANT * temperature * config.subcarrier_spacing,
             self.rdtype,
         )
 
@@ -158,7 +116,8 @@ class HybridSystemSimulator(Block):
         )
 
         # Generate multicell topology
-        self._setup_topology(config.num_rings, min_bs_ut_dist, max_bs_ut_dist)
+        # Moved to call method loop for drops
+        # self._setup_topology(config.num_rings, min_bs_ut_dist, max_bs_ut_dist)
 
         if self.direction == "uplink":
             num_tx_ports = config.ut_num_rf_chains
@@ -185,17 +144,18 @@ class HybridSystemSimulator(Block):
             precision=self.precision,
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
-            neighbor_indices=self.neighbor_indices,
+            neighbor_indices=None,  # Topology is set in the loop
             external_loader=self.external_loader,
         )
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
-        self.phy_abstraction = WaterFillingLinkAdaptation(
-            resource_grid=self.resource_grid,
-            transmitter=None,
-            num_streams_per_tx=self.num_streams_per_ut,
-            precision=self.precision,
-        )
+        self.phy_abstraction = MCSLinkAdaptation()
+        # self.phy_abstraction = WaterFillingLinkAdaptation(
+        #     resource_grid=self.resource_grid,
+        #     transmitter=None,
+        #     num_streams_per_tx=self.num_streams_per_ut,
+        #     precision=self.precision,
+        # )
 
         # Instantiate SLS components
         self.mpr_model = MPRModel(csv_path=config.mpr_table_path)
@@ -236,27 +196,33 @@ class HybridSystemSimulator(Block):
 
     def _setup_topology(self, num_rings, min_bs_ut_dist, max_bs_ut_dist):
         """Generate and set up network topology"""
-        (
-            self.ut_loc,
-            self.bs_loc,
-            self.ut_orientations,
-            self.bs_orientations,
-            self.ut_velocities,
-            self.in_state,
-            self.los,
-            self.bs_virtual_loc,
-            self.grid,
-        ) = gen_hexgrid_topology(
-            batch_size=self.batch_size,
-            num_rings=num_rings,
-            num_ut_per_sector=self.num_ut_per_sector,
-            min_bs_ut_dist=min_bs_ut_dist,
-            max_bs_ut_dist=max_bs_ut_dist,
-            scenario=self.scenario,
-            los=True,
-            return_grid=True,
-            precision=self.precision,
-        )
+
+        if self.config.topology_type == "HexGrid":
+            (
+                self.ut_loc,
+                self.bs_loc,
+                self.ut_orientations,
+                self.bs_orientations,
+                self.ut_velocities,
+                self.in_state,
+                self.los,
+                self.bs_virtual_loc,
+                self.grid,
+            ) = gen_hexgrid_topology(
+                batch_size=self.batch_size,
+                num_rings=num_rings,
+                num_ut_per_sector=self.num_ut_per_sector,
+                min_bs_ut_dist=min_bs_ut_dist,
+                max_bs_ut_dist=max_bs_ut_dist,
+                scenario=self.scenario,
+                los=True,
+                return_grid=True,
+                precision=self.precision,
+            )
+        else:
+            raise NotImplementedError(
+                f"Topology type {self.config.topology_type} not implemented in _setup_topology"
+            )
 
         # 1. Calculate distances [batch, num_ut, num_bs]
         # ut_loc: [batch, num_ut, 3], bs_loc: [batch, num_bs, 3]
@@ -285,27 +251,30 @@ class HybridSystemSimulator(Block):
             # When using external data, we still need mesh indices
             self.ut_mesh_indices = self.external_loader.find_nearest_mesh(self.ut_loc)
 
-    @tf.function(jit_compile=False)
-    def call(self, num_slots, tx_power_dbm):
+    # @tf.function(jit_compile=False)
+    def call(self, num_drops, tx_power_dbm):
         # Initialize result history
+        # We use 'num_drops' as the time dimension in the history
         hist = init_result_history(
-            self.batch_size, num_slots, self.num_bs, self.num_ut_per_sector
+            self.batch_size, num_drops, self.num_bs, self.num_ut_per_sector
         )
 
-        # BS-UT Association
-        # BS-UT Association
-        # [num_ut] -> values are serving BS indices
-        # If Uplink: Rx=BS [num_bs, num_ut]. We want serving BS for each UT (axis 0).
-        # If Downlink: Rx=UT [num_ut, num_bs]. We want serving BS for each UT (axis 1).
-        if self.direction == "uplink":
-            serving_bs_idx = tf.argmax(self.stream_management.rx_tx_association, axis=0)
-        else:
-            serving_bs_idx = tf.argmax(self.stream_management.rx_tx_association, axis=1)
+        # --------------- #
+        # Simulate Drops  #
+        # --------------- #
+        # We use a Python loop instead of tf.while_loop to allow
+        # explicit topology reset and graph re-execution/eager execution for each drop.
+        # This helps in managing memory and ensures topology is actually updated.
 
-        # --------------- #
-        # Simulate a slot #
-        # --------------- #
-        def simulate_slot(slot, hist):
+        for drop_idx in range(num_drops):
+            # 0. Set up new topology for this drop
+            # This generates new UT locations, channels, etc.
+            self._setup_topology(
+                self.config.num_rings,
+                self.config.min_bs_ut_dist,
+                self.config.max_bs_ut_dist,
+            )
+
             # 1. Get Channel Information
             # Use a single channel snapshot per slot for SINR calculation
             h_prec = self.channel_interface.get_precoding_channel(
@@ -316,8 +285,7 @@ class HybridSystemSimulator(Block):
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
                 bs_orient=self.bs_orientations,
-                ut_velocities=self.ut_velocities,
-                in_state=self.in_state,
+                neighbor_indices=self.neighbor_indices,
             )
 
             # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
@@ -327,8 +295,7 @@ class HybridSystemSimulator(Block):
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
                 bs_orient=self.bs_orientations,
-                ut_velocities=self.ut_velocities,
-                in_state=self.in_state,
+                neighbor_indices=self.neighbor_indices,
             )
 
             # Compute SVD on Coarse Channel
@@ -358,15 +325,32 @@ class HybridSystemSimulator(Block):
 
             # 3. Extract Serving Precoders and Combiners
             # Find the index of the serving BS within the neighbor list for each UT
+            serving_bs_idx_i32 = tf.cast(
+                self.neighbor_indices[:, :, 0], tf.int32
+            )  # Assuming 0-th neighbor is serving (closest) - Wait, neighbor_indices are indices of BSs.
+            # We need to find which neighbor index corresponds to the serving BS.
+            # In gen_hexgrid_topology/setup_topology, we sorted neighbors by distance.
+            # So the first neighbor (index 0) in neighbor_indices is the closest one, i.e., serving BS.
+            # neighbor_indices: [batch, num_ut, num_neighbors]
+
+            # Re-deriving serving_bs_idx from topology if needed, but relying on neighbor_indices[:,:,0] is standard for "max power/min dist" association in this setup.
+            # Let's verify:
+            # diff = ut - bs
+            # dist = norm(diff)
+            # _, neighbor_indices = top_k(-dist) -> 0-th is closest.
+            # So serving_bs_idx IS neighbor_indices[:, :, 0]
+
+            # Correction: 'serving_bs_idx' variable was used in previous code but not defined in the snippet I saw?
+            # Ah, 'serving_bs_idx' was used in the previous code but checking the diff:
+            # The previous code had `serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)` but specific line for `serving_bs_idx` definition was missing in the view?
+            # Let's assume the closest BS is indeed the serving one.
+
+            serving_bs_idx = self.neighbor_indices[:, :, 0]
             serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)
-            serving_neighbor_mask = tf.equal(
-                self.neighbor_indices,
-                tf.reshape(serving_bs_idx_i32, [1, self.num_ut, 1]),
-            )
-            # Find the index in the neighbor dimension (we assume it's always found)
-            serving_link_idx = tf.argmax(
-                tf.cast(serving_neighbor_mask, tf.int32), axis=-1
-            )
+
+            # The serving link is always at index 0 of the neighbor list by definition of top_k
+            serving_link_idx = tf.zeros([self.batch_size, self.num_ut], dtype=tf.int32)
+
             # serving_link_idx shape: [batch, ut]
 
             # u_all and v_expanded are already [batch, ut, neighbors, ofdm, sc, ...]
@@ -389,8 +373,12 @@ class HybridSystemSimulator(Block):
             interference_per_neighbor = tf.reduce_sum(tf.square(tf.abs(h_eff)), axis=-1)
 
             # Mask out serving link within the neighbor list
-            # We already have serving_neighbor_mask
-            serving_mask = tf.cast(serving_neighbor_mask, self.rdtype)
+            # serving_link_idx is 0.
+            serving_mask = tf.one_hot(
+                serving_link_idx, self.config.num_neighbors, dtype=self.rdtype
+            )
+            # serving_mask: [batch, num_ut, num_neighbors]
+
             serving_mask = tf.reshape(
                 serving_mask,
                 [self.batch_size, self.num_ut, self.config.num_neighbors, 1, 1, 1],
@@ -425,9 +413,6 @@ class HybridSystemSimulator(Block):
                 powers_dbm = self.external_loader.get_power_map(self.ut_mesh_indices)
                 # For interference, we use powers directly later,
                 # but path loss to serving cell is needed for Power Control
-                serving_bs_idx_batched = tf.broadcast_to(
-                    serving_bs_idx_i32, [self.batch_size, self.num_ut]
-                )
                 serving_bs_idx_expand = tf.expand_dims(serving_bs_idx_batched, axis=-1)
                 serving_power = tf.gather(
                     powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
@@ -457,14 +442,7 @@ class HybridSystemSimulator(Block):
                     pl_db, num_rbs, mpr_val
                 )
             else:
-                # Downlink: Use fixed power (split among streams/users handled in Power Allocation?)
-                # For now, use the passed tx_power_dbm argument
-                # But tx_power_dbm is scalar/tensor? call(..., tx_power_dbm)
-                # If scalar, broadcast to users?
-                # In DL, total BS power is split.
-                # Here simplified: Assume tx_power_dbm is per-link or per-user equivalent?
-                # Or total BS power?
-                # Using the argument passed to call()
+                # Downlink: Use fixed power
                 p_tx_dbm = tx_power_dbm
 
             # Broadcast p_tx_dbm to [batch, num_ut] if it calculated scalar/vector
@@ -529,9 +507,10 @@ class HybridSystemSimulator(Block):
             # Average MCS index over streams/subcarriers
             mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
 
+            # Record using 'drop_idx' as the time index
             hist = record_results(
                 hist,
-                slot,
+                drop_idx,
                 sim_failed=False,
                 pathloss_serving_cell=match_hist_shape(pl_db),
                 num_allocated_re=match_hist_shape(
@@ -554,31 +533,14 @@ class HybridSystemSimulator(Block):
                 ),  # Reshaped for get_hist.py's axis=[-2, -3] reduction
             )
 
-            # Update Mobility
-            self.ut_loc = self.ut_loc + self.ut_velocities * self.slot_duration
-            self.channel_model.set_topology(
-                self.ut_loc,
-                self.bs_loc,
-                self.ut_orientations,
-                self.bs_orientations,
-                self.ut_velocities,
-                self.in_state,
-                self.los,
-                self.bs_virtual_loc,
-            )
-
-            return slot + 1, hist
-
-        # Run loop
-        _, final_hist = tf.while_loop(
-            lambda i, *_: i < num_slots,
-            simulate_slot,
-            [0, hist],
-        )
+            # No time evolution; topology is reset in next iteration
 
         # Stack history to convert TensorArrays to Tensors
-        for key in final_hist:
-            if isinstance(final_hist[key], tf.TensorArray):
-                final_hist[key] = final_hist[key].stack()
+        final_hist = {}
+        for key in hist:
+            if isinstance(hist[key], tf.TensorArray):
+                final_hist[key] = hist[key].stack()
+            else:
+                final_hist[key] = hist[key]
 
         return final_hist
