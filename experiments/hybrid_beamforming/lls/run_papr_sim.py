@@ -93,7 +93,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         try:
             model = PUSCHCommunicationModel(
                 carrier_frequency=config.carrier_frequency,
-                subcarrier_spacing=config.subcarrier_spacing,
+                subcarrier_spacing=config.resource_grid.subcarrier_spacing,
                 num_tx_ant=num_tx,
                 num_rx_ant=num_tx,
                 num_layers=sc["rank"],

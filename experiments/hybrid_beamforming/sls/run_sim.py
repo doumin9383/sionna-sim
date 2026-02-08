@@ -31,14 +31,20 @@ def run_test():
         num_neighbors=4,
     )
 
-    # Resource Grid Config (Custom for this run if needed, or use default)
+    # Resource Grid Config (From config)
+    rg_config = config.resource_grid
     rg = ResourceGrid(
-        num_ofdm_symbols=1,
-        fft_size=24,
-        subcarrier_spacing=config.subcarrier_spacing,
-        num_tx=1,
-        num_streams_per_tx=1,
-        cyclic_prefix_length=6,
+        num_ofdm_symbols=rg_config.num_ofdm_symbols,
+        fft_size=rg_config.fft_size,
+        subcarrier_spacing=rg_config.subcarrier_spacing,
+        num_tx=rg_config.num_tx,
+        # In Sionna SLS, usually num_tx in ResourceGrid matches the number of streams or transmitters depending on usage.
+        # But here we are setting up the system.
+        # Let's keep num_tx=1 for the grid definition unless specific needs arise.
+        num_streams_per_tx=rg_config.num_streams_per_tx,
+        cyclic_prefix_length=rg_config.cyclic_prefix_length,
+        pilot_pattern="kronecker",  # Defaulting to kronecker if not in config or explicitly needed
+        pilot_ofdm_symbol_indices=rg_config.pilot_ofdm_symbol_indices,
     )
     config.resource_grid = rg
 

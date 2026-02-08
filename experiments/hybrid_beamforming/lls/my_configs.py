@@ -1,7 +1,11 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Any, Dict, Union
 from libs.my_configs import ResourceGridConfig, PlanarArrayConfig
-from experiments.hybrid_beamforming.shared.configs import HybridSimulationCommonConfig
+from experiments.hybrid_beamforming.shared.configs import (
+    HybridSimulationCommonConfig,
+    SYSTEM_MCS_INDICES,
+    SYSTEM_WAVEFORMS,
+)
 
 import numpy as np
 
@@ -17,13 +21,10 @@ class HybridLLSConfig(HybridSimulationCommonConfig):
 
     # Sweep Parameters
     modulations: Dict[str, int] = field(
-        default_factory=lambda: {"QPSK": 2, "16QAM": 11, "64QAM": 20, "256QAM": 28}
+        default_factory=lambda: SYSTEM_MCS_INDICES.copy()
     )
     waveforms: List[Dict[str, Any]] = field(
-        default_factory=lambda: [
-            {"name": "CP-OFDM", "is_dft_s": False},
-            {"name": "DFT-s-OFDM", "is_dft_s": True},
-        ]
+        default_factory=lambda: SYSTEM_WAVEFORMS.copy()
     )
     ranks: List[int] = field(default_factory=lambda: [1, 2, 4])
     # rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 66 + 6, 6))

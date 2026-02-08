@@ -34,14 +34,8 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     ut_max_power_dbm: float = 23.0
 
     # Resource Grid (Inherited from HybridSimulationCommonConfig)
-    # resource_grid: ResourceGridConfig = field(
-    #     default_factory=lambda: ResourceGridConfig(
-    #         num_ofdm_symbols=14,
-    #         fft_size=64,
-    #         subcarrier_spacing=30e3,
-    #         cyclic_prefix_length=6,
-    #     )
-    # )
+    # Resource Grid (Inherited from HybridSimulationCommonConfig)
+    # resource_grid field is available.
 
     # Antenna Arrays
     bs_array: Any = None  # sionna.phy.channel.tr38901.PanelArray

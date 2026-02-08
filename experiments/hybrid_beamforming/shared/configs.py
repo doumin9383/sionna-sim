@@ -33,13 +33,40 @@ class HybridSimulationCommonConfig:
         n = self.ut_num_rows * self.ut_num_cols
         return n * 2 if self.ut_polarization == "dual" else n
 
-    # Resource Grid Default
-    # 共通のグリッド設定があればここに
-    # resource_grid: ResourceGridConfig = field(
-    #     default_factory=lambda: ResourceGridConfig(
-    #         num_ofdm_symbols=14,
-    #         fft_size=64,
-    #         subcarrier_spacing=30e3,
-    #         cyclic_prefix_length=6,
-    #     )
-    # )
+    # ResourceGrid Default
+    resource_grid: ResourceGridConfig = field(
+        default_factory=lambda: ResourceGridConfig(
+            num_ofdm_symbols=14,
+            fft_size=64,
+            subcarrier_spacing=30e3,
+            cyclic_prefix_length=6,
+            pilot_ofdm_symbol_indices=[2, 11],
+        )
+    )
+
+
+# Common Constants / Enums for consistency across LLS/SLS
+SYSTEM_MODULATIONS: Dict[str, int] = {
+    "QPSK": 2,
+    "16QAM": 4,
+    "64QAM": 6,
+    "256QAM": 8,
+}
+# Note: Value is bits per symbol. Sionna's mcs_index mapping is separate,
+# but usually we map name -> mcs_index or name -> num_bits.
+# In LLS config, it was mapping Name -> MCS Index (e.g. "QPSK": 2).
+# Let's align with that usage directly or provide a mapping.
+# The original LLS config used indices: {"QPSK": 2, "16QAM": 11, ...} -> These act as MCS indices.
+# So we should define standard MCS indices for these modulations.
+
+SYSTEM_MCS_INDICES: Dict[str, int] = {
+    "QPSK": 2,
+    "16QAM": 11,
+    "64QAM": 20,
+    "256QAM": 28,
+}
+
+SYSTEM_WAVEFORMS: List[Dict[str, Any]] = [
+    {"name": "CP-OFDM", "is_dft_s": False},
+    {"name": "DFT-s-OFDM", "is_dft_s": True},
+]
