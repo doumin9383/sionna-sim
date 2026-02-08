@@ -110,12 +110,13 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
             papr_db_batch = model.compute_papr(x)
             papr_values.extend(papr_db_batch.numpy().flatten())
 
-        # Store for global comparison (Selective labels to avoid cluttered legend)
+        # Store for global comparison
         if sc["num_rb"] in representative_rb:
-            wave_mod_key = f"{sc['waveform']} ({sc['modulation']}) {gran_str}"
-            if wave_mod_key not in all_papr_data:
-                all_papr_data[wave_mod_key] = []
-            all_papr_data[wave_mod_key].extend(papr_values)
+            # Use a structured key to allow parsing later: Waveform|Modulation|Rank|num_rb|Granularity
+            data_key = f"{sc['waveform']}|{sc['modulation']}|{sc['rank']}|{sc['num_rb']}|{sc['granularity']}"
+            if data_key not in all_papr_data:
+                all_papr_data[data_key] = []
+            all_papr_data[data_key].extend(papr_values)
 
         # Compute and Plot individual CCDF (Selective)
         papr_sorted = np.sort(papr_values)
@@ -150,6 +151,11 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
     df = pd.DataFrame(results)
     df.to_csv(output_file, index=False)
     print(f"Simulation Complete. Results saved to {output_file}")
+
+    # Save raw data to .npz
+    npz_file = output_file.replace(".csv", ".npz")
+    np.savez_compressed(npz_file, **all_papr_data)
+    print(f"Raw PAPR data saved to {npz_file}")
 
 
 def plot_individual_waveform(x, scenario_id, results_dir):
@@ -221,22 +227,152 @@ def plot_individual_ccdf(papr_sorted, scenario_id, results_dir):
 def plot_summary_ccdf(all_papr_data, results_dir):
     """Saves a summary CCDF plot with all modulations compared."""
     import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    from matplotlib.lines import Line2D
 
     plt.switch_backend("Agg")
 
+    # Try to set Japanese font
+    # Common Japanese fonts on Linux
+    font_candidates = [
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "IPAGothic",
+        "IPAexGothic",
+        "TakaoGothic",
+        "VL Gothic",
+    ]
+    found_font = None
+    for f in font_candidates:
+        try:
+            # Check if font is available
+            f_prop = fm.FontProperties(fname=fm.findfont(f))
+            if f_prop.get_name():
+                plt.rcParams["font.family"] = f
+                found_font = f
+                break
+        except:
+            continue
+
+    if found_font:
+        print(f"Using Japanese font: {found_font}")
+    else:
+        print("Warning: No Japanese font found. Labels may not display correctly.")
+
     plt.figure(figsize=(12, 8))
-    for label, values in all_papr_data.items():
-        values = np.sort(values)
+
+    # Styling definitions
+    rank_colors = {
+        1: "#1f77b4",  # Blue
+        2: "#ff7f0e",  # Orange
+        4: "#2ca02c",  # Green
+        8: "#d62728",  # Red
+    }
+
+    gran_styles = {
+        "Wideband": "-",  # Solid
+        "Subband": "--",  # Dashed
+        "Narrowband": ":",  # Dotted
+    }
+    # Fallback for integer granularity if used
+
+    mod_markers = {
+        "QPSK": "o",
+        "16QAM": "^",
+        "64QAM": "s",
+        "256QAM": "D",
+    }
+
+    # Sorting keys for consistent plotting order
+    sorted_keys = sorted(all_papr_data.keys())
+
+    for key in sorted_keys:
+        values = np.sort(all_papr_data[key])
+
+        # Parse key: Waveform|Modulation|Rank|num_rb|Granularity
+        parts = key.split("|")
+        # waveform = parts[0]
+        modulation = parts[1]
+        rank = int(parts[2])
+        # num_rb = parts[3]
+        granularity = parts[4]  # String "Wideband", "Subband", etc. or int
+
+        # Determine styles
+        color = rank_colors.get(rank, "black")
+
+        ls = gran_styles.get(str(granularity), "-")
+        # specific check if granularity is "G...RB" string from previous logic or raw value
+        # In this updated code we passed raw values in key
+        # If it was an integer in config (e.g. 2, 4), handle it
+        if granularity.isdigit():
+            # If it's a number (RBG size), usually treat as Subband-like or separate style?
+            # For now, let's treat numbers as dashed
+            ls = "--"
+
+        marker = mod_markers.get(modulation, "x")
+
         ccdf = 1.0 - np.arange(len(values)) / float(len(values))
-        plt.semilogy(values, ccdf, label=label, lw=2)
+
+        # Plot line
+        plt.semilogy(
+            values,
+            ccdf,
+            color=color,
+            linestyle=ls,
+            linewidth=2,
+            marker=marker,
+            markevery=0.1,  # Show marker every 10% of points to avoid clutter
+            markersize=6,
+            label=f"{modulation} R{rank} {granularity}",  # internal label, not used for custom legend
+        )
 
     plt.grid(True, which="both", ls="-", alpha=0.5)
     plt.xlabel("PAPR [dB]")
-    plt.ylabel("CCDF (Prob > PAPR)")
-    plt.title("PAPR CCDF Summary Comparison")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.ylabel("CCDF (確率 > PAPR)")
+    plt.title("PAPR CCDF サマリ比較")
+
     plt.ylim(1e-3, 1)
     plt.xlim(0, 15)
+
+    # --- Custom Legend ---
+    # Rank Legend
+    rank_handles = [
+        Line2D([0], [0], color=c, lw=2, label=f"Rank {r}")
+        for r, c in rank_colors.items()
+    ]
+    rank_legend = plt.legend(
+        handles=rank_handles,
+        title="Rank",
+        loc="upper right",
+        bbox_to_anchor=(1.15, 1.0),
+    )
+    plt.gca().add_artist(rank_legend)
+
+    # Granularity Legend
+    gran_handles = [
+        Line2D([0], [0], color="gray", linestyle=ls, lw=2, label=g)
+        for g, ls in gran_styles.items()
+    ]
+    gran_legend = plt.legend(
+        handles=gran_handles,
+        title="Granularity",
+        loc="upper right",
+        bbox_to_anchor=(1.15, 0.8),
+    )
+    plt.gca().add_artist(gran_legend)
+
+    # Modulation Legend
+    mod_handles = [
+        Line2D([0], [0], color="gray", marker=m, linestyle="None", label=mod)
+        for mod, m in mod_markers.items()
+    ]
+    mod_legend = plt.legend(
+        handles=mod_handles,
+        title="Modulation",
+        loc="upper right",
+        bbox_to_anchor=(1.15, 0.6),
+    )
+
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, "papr_ccdf_summary.png"))
     plt.close()
