@@ -351,22 +351,8 @@ class HybridSystemSimulator(Block):
                 self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
 
             # 3. Get Precoding Channel (Effective Channel)
-            # Use a single channel snapshot per slot for SINR calculation
-            h_prec = self.channel_interface.get_precoding_channel(
-                self.precoding_granularity,
-                self.rbg_size_sc,
-                batch_size=self.batch_size,
-                ut_loc=self.ut_loc,
-                bs_loc=self.bs_loc,
-                ut_orient=self.ut_orientations,
-                bs_orient=self.bs_orientations,
-                neighbor_indices=self.neighbor_indices,
-                ut_velocities=self.ut_velocities,
-                in_state=self.in_state,
-            )
-
             # Get Full Channel for Interference/SINR Calc
-            h, _, u_all, _ = self.channel_interface.get_full_channel_info(
+            h, s_all, u_all, v_all = self.channel_interface.get_full_channel_info(
                 self.batch_size,
                 ut_loc=self.ut_loc,
                 bs_loc=self.bs_loc,
