@@ -488,4 +488,27 @@ class HybridChannelInterface(Block):
             # h shape: [Batch, U, Neighbors, Time, SC, RxP, TxP]
             h = tf.reduce_mean(h, axis=4, keepdims=True)
 
+        elif granularity == "Subband":
+            # Average over RBGs
+            if not self.use_rbg_granularity:
+                # h shape: [Batch, U, Neighbors, Time, SC, RxP, TxP]
+                # Reshape SC -> [Num_RBGs, RBG_Size]
+                # Since tensor is high-dim, we can't easily reshape just one axis in middle without transposing or using shape manipulation.
+                # But we can assume SC is axis 4
+                shape = tf.shape(h)
+                num_sc = shape[4]
+                # Calculate number of RBGs
+                num_rbgs = num_sc // rbg_size_sc
+
+                # We need to reshape to [Batch, U, Neighbors, Time, Num_RBGs, RBG_Size, RxP, TxP]
+                # Then reduce mean over axis 5
+
+                new_shape = tf.concat(
+                    [shape[:4], [num_rbgs, rbg_size_sc], shape[5:]], axis=0
+                )
+
+                h_reshaped = tf.reshape(h, new_shape)
+                h = tf.reduce_mean(h_reshaped, axis=5)
+                # h is now [Batch, U, Neighbors, Time, Num_RBGs, RxP, TxP]
+
         return h

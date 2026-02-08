@@ -47,6 +47,10 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
         16  # For spatial masking: num BS per UT to calculate channel for
     )
 
+    # Beam Management
+    beambook_oversampling_factor: int = 1
+    beam_selection_method: str = "subpanel_sweep"  # "subpanel_sweep"
+
     num_rb = 66
     num_subcarriers = num_rb * 12
 

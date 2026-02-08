@@ -20,6 +20,7 @@ from .components.power_control import PowerControl
 from .components.link_adaptation import MCSLinkAdaptation
 from .components.get_hist import init_result_history, record_results
 from .components.precoder_utils import expand_precoder
+from .components.beam_management import BeamSelector
 
 # Set random seed for reproducibility
 sionna.phy.config.seed = 42
@@ -156,6 +157,17 @@ class HybridSystemSimulator(Block):
         self.power_control = PowerControl(p_power_class=config.ut_max_power_dbm)
         self.mcs_adapter = MCSLinkAdaptation()
 
+        # Instantiate Beam Manager
+        self.beam_selector = BeamSelector(
+            num_rows_per_panel=config.bs_num_rows_per_panel,
+            num_cols_per_panel=config.bs_num_cols_per_panel,
+            num_panels_v=config.bs_num_rows_panel,
+            num_panels_h=config.bs_num_cols_panel,
+            polarization=config.bs_polarization,
+            oversampling_factor=config.beambook_oversampling_factor,
+            dtype=self.rdtype,  # Use simulation precision
+        )
+
     def _setup_channel_model(
         self,
         scenario,
@@ -270,11 +282,10 @@ class HybridSystemSimulator(Block):
             )
 
             # 1. Get Channel Information
-            # Use a single channel snapshot per slot for SINR calculation
-            h_prec = self.channel_interface.get_precoding_channel(
-                self.precoding_granularity,
-                self.rbg_size_sc,
+            # Get Element-Domain Channel for Beam Selection
+            h_elem_bs = self.channel_interface.get_element_channel_for_beam_selection(
                 batch_size=self.batch_size,
+                rbg_size_sc=1,  # Use center subcarrier or averaged for beam selection
                 ut_loc=self.ut_loc,
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
@@ -282,11 +293,77 @@ class HybridSystemSimulator(Block):
                 neighbor_indices=self.neighbor_indices,
                 ut_velocities=self.ut_velocities,
                 in_state=self.in_state,
+            )[
+                0
+            ]  # get_element returns (h, s, u, v) from SVD call inside? No, I defined it to return h_elem?
+            # Wait, get_element_channel_for_beam_selection implementation:
+            # It returns "return h, s, u, v" because it copies logic from get_full_channel_info/calls svd?
+            # In my previous edit Step 57:
+            # s, u, v = tf.linalg.svd(h)
+            # return h, s, u, v
+            # So I should take index [0].
+
+            # 2. Select Analog Beams (BS Side)
+            # BS Beam Selection
+            w_rf_bs = self.beam_selector.select_bs_beam(h_elem_bs)
+
+            # UE Analog Beam: Identity (Full Digital or Fixed)
+            # We need to construct Identity matrix for UE [num_ut_ant, num_ut_chains]
+            # Since num_ut_chains might equal num_ut_ant, it's just eye.
+            # a_rf: [Batch, U, RxAnt, RxPort] or [RxAnt, RxPort] broadcasting
+            # Let's use simple eye.
+            # self.ut_array.num_ant
+            # config.ut_num_rf_chains
+
+            # We assume a_rf is fixed for now (Omni/Identity)
+            a_rf_ue = tf.eye(
+                self.num_rx_ant,
+                num_columns=self.channel_interface.hybrid_channel.num_rx_ports,
+                dtype=tf.complex64,
             )
 
-            # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
-            h, _, u_all, _ = self.channel_interface.get_full_channel_info(
-                self.batch_size,
+            # If direction is Uplink: Tx=UT, Rx=BS.
+            # w_rf corresponds to Tx, a_rf corresponds to Rx.
+            if self.direction == "uplink":
+                # BS is Rx. BS applies W_RF as A_RF.
+                # W_RF from selector is [Batch, Tx, Ant, Port]. Wait, selector was designed for BS logic (Tx or Rx?)
+                # Codebook is generic. Selector `select_bs_beam` naming suggests BS.
+                # If BS is Rx, we select Rx beams.
+                # `select_bs_beam` returns vectors.
+                # We should use them as a_rf.
+                # But `HybridChannelInterface.set_analog_weights(w_rf, a_rf)` expects:
+                # w_rf: Tx weights
+                # a_rf: Rx weights
+
+                # BS is Rx. So w_rf_bs should be assigned to 'a_rf'.
+                # UE is Tx. Identity.
+
+                # Check shapes.
+                # w_rf_bs shape: [Batch, U, TotalAnt, NumPorts] (as per beam_management.py construction)
+                # It is constructed per USER (Serving Beam).
+                # But in Uplink, BS receives from user.
+                # BS Rx Beam should be directed to User.
+                # So [Batch, U, BS_Ant, BS_Port] is correct "Per User Receiver Beamforming".
+
+                # HybridOFDMChannel.apply_weights expects:
+                # a_rf: [num_rx_ant, num_rx_ports] or [Batch, U, RxAnt, RxPort]
+                # Yes, it supports per-user weights.
+
+                self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
+
+            else:
+                # Downlink: Tx=BS, Rx=UT.
+                # BS is Tx.
+                # w_rf_bs is used as w_rf.
+                # UE is Rx. Identity.
+                self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
+
+            # 3. Get Precoding Channel (Effective Channel)
+            # Use a single channel snapshot per slot for SINR calculation
+            h_prec = self.channel_interface.get_precoding_channel(
+                self.precoding_granularity,
+                self.rbg_size_sc,
+                batch_size=self.batch_size,
                 ut_loc=self.ut_loc,
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
@@ -303,16 +380,19 @@ class HybridSystemSimulator(Block):
             # v_prec: [batch, num_ut, num_bs, ofdm, num_blocks, tx_ports, tx_ports]
             # We need to expand dim -3 (num_blocks) to num_sc
 
-            # Determine effective target dimensions based on granularity mode
+            # Determine effective target dimensions
             if self.config.use_rbg_granularity:
-                # In RBG mode, the "effective" full bandwidth is just the number of RBGs
-                # h shape: [batch, ut, bs, ofdm, freq, ...]
+                # RBGモードの場合、h の周波数軸はすでに RBG 数になっている
                 eff_total_subcarriers = h.shape[4]
-                eff_rbg_size_sc = 1  # 1-to-1 mapping
+                eff_rbg_size_sc = 1
             else:
-                # Full band mode
+                # RBモード（RB単位）
                 eff_total_subcarriers = self.resource_grid.num_effective_subcarriers
                 eff_rbg_size_sc = self.rbg_size_sc
+
+            # v_prec: [batch, num_ut, num_bs, ofdm, num_blocks, tx_ports, tx_ports]
+            # ユーザー指摘によりRank 1制限を撤廃し、全ストリーム(レイヤー)を使用する
+            # v_prec は SVD の結果 [..., tx, k] (k=min(tx,rx))
 
             v_expanded = expand_precoder(
                 v_prec,
@@ -321,79 +401,71 @@ class HybridSystemSimulator(Block):
                 rbg_size_sc=eff_rbg_size_sc,
             )
 
-            # 3. Extract Serving Precoders and Combiners
-            # Find the index of the serving BS within the neighbor list for each UT
-            serving_bs_idx_i32 = tf.cast(
-                self.neighbor_indices[:, :, 0], tf.int32
-            )  # Assuming 0-th neighbor is serving (closest) - Wait, neighbor_indices are indices of BSs.
-            # We need to find which neighbor index corresponds to the serving BS.
-            # In gen_hexgrid_topology/setup_topology, we sorted neighbors by distance.
-            # So the first neighbor (index 0) in neighbor_indices is the closest one, i.e., serving BS.
-            # neighbor_indices: [batch, num_ut, num_neighbors]
-
-            # Re-deriving serving_bs_idx from topology if needed, but relying on neighbor_indices[:,:,0] is standard for "max power/min dist" association in this setup.
-            # Let's verify:
-            # diff = ut - bs
-            # dist = norm(diff)
-            # _, neighbor_indices = top_k(-dist) -> 0-th is closest.
-            # So serving_bs_idx IS neighbor_indices[:, :, 0]
-
-            # Correction: 'serving_bs_idx' variable was used in previous code but not defined in the snippet I saw?
-            # Ah, 'serving_bs_idx' was used in the previous code but checking the diff:
-            # The previous code had `serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)` but specific line for `serving_bs_idx` definition was missing in the view?
-            # Let's assume the closest BS is indeed the serving one.
-
-            serving_bs_idx = self.neighbor_indices[:, :, 0]
-            serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)
-
+            # 3. Serving Link 抽出
             # The serving link is always at index 0 of the neighbor list by definition of top_k
             serving_link_idx = tf.zeros([self.batch_size, self.num_ut], dtype=tf.int32)
 
-            # serving_link_idx shape: [batch, ut]
+            # u_prec: [batch, num_ut, num_bs, ofdm, num_blocks, rx_ports, rx_streams (min(rx,tx))]
+            u_expanded = expand_precoder(
+                u_prec,
+                total_subcarriers=eff_total_subcarriers,
+                granularity_type=self.precoding_granularity,
+                rbg_size_sc=eff_rbg_size_sc,
+            )
 
-            # u_all and v_expanded are already [batch, ut, neighbors, ofdm, sc, ...]
-            u_serv = tf.gather(u_all, serving_link_idx, axis=2, batch_dims=2)
-            # v_serv: Serving BS precoder.
-            # Note: v_expanded also has neighbor dimension if derived from h_prec.
-            v_serv = tf.gather(v_expanded, serving_link_idx, axis=2, batch_dims=2)
+            # 3. Serving Link 抽出
+            # The serving link is always at index 0 of the neighbor list by definition of top_k
+            serving_link_idx = tf.zeros([self.batch_size, self.num_ut], dtype=tf.int32)
 
-            # 4. Calculate Interference
-            # neighbor_precoders: use the expanded ones
-            neighbor_precoders = v_expanded
+            u_serv = tf.gather(u_expanded, serving_link_idx, axis=2, batch_dims=2)
+            # v_serv calculation is not strictly needed for interference, but v_expanded contains it.
 
-            # a. UT i's combiner applied to all neighbor links: H_u = U_i^H * H_ij
+            # 4. 干渉計算 (Downlink 想定の効率化)
+            # h: [batch, ut, bs_neighbor, ofdm, sc, rx_ant, tx_ant]
+            # v_expanded (neighbor_precoders): [batch, ut, bs_neighbor, ofdm, sc, tx_ant, 1]
+
+            # UT i の受信ビームフォーマーをチャネルに適用
+            # h_u: [batch, ut, bs_neighbor, ofdm, sc, 1, tx_ant]
             h_u = tf.einsum("buosrp,bujosrt->bujospt", tf.math.conj(u_serv), h)
 
-            # b. Neighbor BS's precoder applied: H_eff = H_u * V_j
-            h_eff = tf.einsum("bujospt,bujostq->bujospq", h_u, neighbor_precoders)
+            # 他局のプリコーダーとの結合
+            # h_eff: [batch, ut, bs_neighbor, ofdm, sc, 1, 1]
+            h_eff = tf.einsum("bujospt,bujostq->bujospq", h_u, v_expanded)
 
-            # c. Interference summation
-            interference_per_neighbor = tf.reduce_sum(tf.square(tf.abs(h_eff)), axis=-1)
+            # パワー計算
+            # h_eff: [batch, ut, bs_neighbor, ofdm, sc, rx_streams, tx_streams]
+            # 電力そのもの: [batch, ut, bs_neighbor, ofdm, sc, rx_streams, tx_streams]
+            power_tensor = tf.square(tf.abs(h_eff))
 
-            # Mask out serving link within the neighbor list
-            # serving_link_idx is 0.
-            serving_mask = tf.one_hot(
-                serving_link_idx, self.config.num_neighbors, dtype=self.rdtype
-            )
-            # serving_mask: [batch, num_ut, num_neighbors]
+            # -------------------------------------------------------
+            # 信号成分 (Serving Link: Neighbor index 0)
+            # -------------------------------------------------------
+            # Serving Link の h_eff は、理想的には対角行列（SVDによる直交化）に近い
+            # 信号成分 = 対角成分 |h_ii|^2
+            # power_tensor[:, :, 0, ...] -> [batch, ut, ofdm, sc, rx_streams, tx_streams]
+            serving_power_matrix = power_tensor[:, :, 0, :, :, :, :]
+            s_power = tf.linalg.diag_part(
+                serving_power_matrix
+            )  # [batch, ut, ofdm, sc, streams]
 
-            serving_mask = tf.reshape(
-                serving_mask,
-                [self.batch_size, self.num_ut, self.config.num_neighbors, 1, 1, 1],
-            )
+            # -------------------------------------------------------
+            # 干渉成分 (Interfering Links: Neighbor index > 0)
+            # -------------------------------------------------------
+            # 干渉リンクからは、全送信ストリームの電力が雑音として加算される
+            # neighbor index 1以降を合計
+            # interference_power_matrix: [batch, ut, neighbor-1, ofdm, sc, rx_streams, tx_streams]
+            interference_power_matrix = power_tensor[:, :, 1:, :, :, :, :]
 
-            interference_total = tf.reduce_sum(
-                interference_per_neighbor * (1.0 - serving_mask), axis=2
-            )
+            # Reduce sum over neighbors (axis 2) and tx_streams (axis -1)
+            # Result: [batch, ut, ofdm, sc, rx_streams]
+            interference_total = tf.reduce_sum(interference_power_matrix, axis=[2, -1])
 
             # Effective Noise per stream: N0 + Interference
             noise_plus_interference = self.no + interference_total
 
-            # Calculate Effective Channel Gains (s_serv) from h_eff
-            # h_eff_serv: [batch, ut, ofdm, sc, stream, stream]
-            h_eff_serv = tf.gather(h_eff, serving_link_idx, axis=2, batch_dims=2)
-            # Take diagonal (signal power on streams)
-            s_serv = tf.abs(tf.linalg.diag_part(h_eff_serv))
+            # For Power Control: Identify Serving BS
+            serving_bs_idx = self.neighbor_indices[:, :, 0]
+            serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)
 
             # 4. Power Control & Link Adaptation
             # a. Calculate Path Loss (Simple Euclidean distance based approximation for PC)
@@ -458,22 +530,25 @@ class HybridSystemSimulator(Block):
                 total_power, [self.batch_size, self.num_ut, 1, 1, 1]
             )
 
-            # d. Physics Abstraction (Simple Equal Power Allocation -> SINR)
-            # self.phy_abstraction was removed as it lacked the call method.
-            # Calculate Power per stream
-            num_streams = tf.shape(s_serv)[-1]
+            # d. Physics Abstraction (Equal Power Allocation across streams -> SINR)
+            # num_streams is dynamic based on channel rank (SVD)
+            num_streams = tf.shape(s_power)[-1]
             p_alloc = total_power_expanded / tf.cast(num_streams, self.rdtype)
 
             # Calculate SINR: P * |h|^2 / (N0 + I)
-            # s_serv is the channel gain magnitude
-            sinr = (p_alloc * tf.square(s_serv)) / noise_plus_interference
+            # s_power is signal power (equivalent to |h|^2)
+            # sinr: [batch, ut, ofdm, sc, streams]
+            sinr = (p_alloc * s_power) / noise_plus_interference
 
             # e. MCS Selection & Throughput
             # MCS Adapter expects SINR in dB
             sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
 
-            # Effective SINR for reporting (Average over subcarriers/streams)
-            sinr_eff_avg = tf.reduce_mean(sinr, axis=[-1, -2])
+            # Effective SINR for reporting
+            # Average over subcarriers and streams for logging, but use per-stream for throughput
+            sinr_eff_avg = tf.reduce_mean(
+                sinr, axis=[-1, -2, -3]
+            )  # avg over ofdm, sc, streams
 
             # Use Discrete MCS Table Lookup
             # Returns Spectral Efficiency (bits/symbol) including BLER penalty
