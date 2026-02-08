@@ -15,10 +15,10 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     """System Level Simulation Configuration for experiments/hybrid_beamforming/sls"""
 
     # Simulation Control
-    batch_size: int = 1
+    batch_size: int = 8  # Production: 8 (adjusted for 4GB VRAM)
     num_rings: int = 1
-    num_ut_per_sector: int = 1
-    num_slots: int = 1
+    num_ut_per_sector: int = 4  # Production: 4 (Debug: 1)
+    num_slots: int = 20  # Production: 20 (Debug: 1)
     precoding_granularity: str = "Narrowband"  # "Narrowband", "Subband", "Wideband"
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
     num_neighbors: int = (
@@ -34,12 +34,13 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     ut_max_power_dbm: float = 23.0
 
     # Resource Grid (Inherited from HybridSimulationCommonConfig)
-    # Resource Grid (Inherited from HybridSimulationCommonConfig)
     # resource_grid field is available.
 
     # Antenna Arrays
-    bs_array: Any = None  # sionna.phy.channel.tr38901.PanelArray
-    ut_array: Any = None  # sionna.phy.channel.tr38901.PanelArray
+    # bs_array and ut_array are created inside the simulator based on config parameters.
+    # We do not store the object instances here to avoid serialization issues and keep config pure data.
+    # bs_array: Any = None
+    # ut_array: Any = None
 
     # Scenario
     scenario: str = "umi"  # "umi", "uma", "rma"

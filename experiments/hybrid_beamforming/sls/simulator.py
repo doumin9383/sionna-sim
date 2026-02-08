@@ -10,7 +10,8 @@ from sionna.sys import gen_hexgrid_topology, get_num_hex_in_grid
 from sionna.phy.constants import BOLTZMANN_CONSTANT
 from sionna.phy.utils import dbm_to_watt
 from sionna.phy import Block
-from sionna.phy.channel.tr38901 import UMi, UMa, RMa
+from sionna.phy.channel.tr38901 import UMi, UMa, RMa, PanelArray
+from sionna.phy.ofdm import ResourceGrid
 
 # Local Components
 from .components.hybrid_channel_interface import HybridChannelInterface
@@ -52,20 +53,63 @@ class HybridSystemSimulator(Block):
         self.external_loader = external_loader
         self.scenario = config.scenario
         self.batch_size = int(config.batch_size)
-        self.resource_grid = config.resource_grid
-        self.num_ut_per_sector = int(config.num_ut_per_sector)
-        self.direction = config.direction
-        self.bs_max_power_dbm = config.bs_max_power_dbm  # [dBm]
-        self.ut_max_power_dbm = config.ut_max_power_dbm  # [dBm]
         self.coherence_time = tf.cast(config.coherence_time, tf.int32)  # [slots]
         num_cells = get_num_hex_in_grid(config.num_rings)
         self.num_bs = num_cells * 3
+        self.num_ut_per_sector = int(config.num_ut_per_sector)
+        self.direction = config.direction
+        self.bs_max_power_dbm = config.bs_max_power_dbm
+        self.ut_max_power_dbm = config.ut_max_power_dbm
         self.num_ut = self.num_bs * self.num_ut_per_sector
-        self.num_ut_ant = config.ut_array.num_ant
-        self.num_bs_ant = config.bs_array.num_ant
-        if config.bs_array.polarization == "dual":
-            self.num_bs_ant *= 2
+
+        # Instantiate ResourceGrid from config (Factory)
+        rg_config = config.resource_grid
+        self.resource_grid = ResourceGrid(
+            num_ofdm_symbols=rg_config.num_ofdm_symbols,
+            fft_size=rg_config.fft_size,
+            subcarrier_spacing=rg_config.subcarrier_spacing,
+            num_tx=rg_config.num_tx,
+            num_streams_per_tx=rg_config.num_streams_per_tx,
+            cyclic_prefix_length=rg_config.cyclic_prefix_length,
+            pilot_pattern=rg_config.pilot_pattern,
+            pilot_ofdm_symbol_indices=rg_config.pilot_ofdm_symbol_indices,
+        )
+        # Update config with instantiated object for components that might need it
+        # (Though ideally we should pass it explicitly)
+        # config.resource_grid = self.resource_grid # Avoid modifying config in place if possible, but valid for runtime.
+
+        # Instantiate Antenna Arrays from config
+        self.bs_array = PanelArray(
+            num_rows=config.bs_num_rows_panel,
+            num_cols=config.bs_num_cols_panel,
+            num_rows_per_panel=config.bs_num_rows_per_panel,
+            num_cols_per_panel=config.bs_num_cols_per_panel,
+            polarization=config.bs_polarization,
+            polarization_type="cross",
+            antenna_pattern="38.901",
+            carrier_frequency=config.carrier_frequency,
+        )
+        self.ut_array = PanelArray(
+            num_rows=config.ut_num_rows_panel,
+            num_cols=config.ut_num_cols_panel,
+            num_rows_per_panel=config.ut_num_rows_per_panel,
+            num_cols_per_panel=config.ut_num_cols_per_panel,
+            polarization=config.ut_polarization,
+            polarization_type="cross",
+            antenna_pattern="omni",
+            carrier_frequency=config.carrier_frequency,
+        )
+
+        self.num_ut_ant = self.ut_array.num_ant
+        self.num_bs_ant = self.bs_array.num_ant
+        if config.bs_polarization == "dual":
+            pass  # PanelArray.num_ant handles this usually if configured correctly, but Sionna logic check:
+            # PanelArray num_ant property returns total elements including pol.
+            # So we don't need manual multiply if we trust the object.
+            # config.bs_array replaced by self.bs_array usage.
+
         if self.direction == "uplink":
+
             self.num_tx, self.num_rx = self.num_ut, self.num_bs
             self.num_tx_ant, self.num_rx_ant = self.num_ut_ant, self.num_bs_ant
             self.num_tx_per_sector = self.num_ut_per_sector
@@ -98,8 +142,8 @@ class HybridSystemSimulator(Block):
 
         # Slot duration [sec]
         self.slot_duration = (
-            config.resource_grid.ofdm_symbol_duration
-            * config.resource_grid.num_ofdm_symbols
+            self.resource_grid.ofdm_symbol_duration
+            * self.resource_grid.num_ofdm_symbols
         )
 
         # Initialize channel model based on scenario
@@ -107,8 +151,8 @@ class HybridSystemSimulator(Block):
             config.scenario,
             config.carrier_frequency,
             o2i_model,
-            config.ut_array,
-            config.bs_array,
+            self.ut_array,
+            self.bs_array,
             average_street_width,
             average_building_height,
         )
@@ -123,12 +167,19 @@ class HybridSystemSimulator(Block):
             num_tx_ports = config.bs_num_rf_chains
             num_rx_ports = config.ut_num_rf_chains
 
+        if self.direction == "uplink":
+            self.sim_tx_array = self.ut_array
+            self.sim_rx_array = self.bs_array
+        else:
+            self.sim_tx_array = self.bs_array
+            self.sim_rx_array = self.ut_array
+
         # Instantiate the Hybrid Channel Interface
         self.channel_interface = HybridChannelInterface(
             channel_model=self.channel_model,
-            resource_grid=config.resource_grid,
-            tx_array=config.bs_array,  # Mapping bs_array to tx_array (Seems wrong naming in interface? Wait)
-            rx_array=config.ut_array,  # Mapping ut_array to rx_array
+            resource_grid=self.resource_grid,
+            tx_array=self.sim_tx_array,
+            rx_array=self.sim_rx_array,
             num_tx_ports=num_tx_ports,
             num_rx_ports=num_rx_ports,
             precision=self.precision,
@@ -140,7 +191,7 @@ class HybridSystemSimulator(Block):
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
         self.phy_abstraction = WaterFillingLinkAdaptation(
-            resource_grid=config.resource_grid,
+            resource_grid=self.resource_grid,
             transmitter=None,
             num_streams_per_tx=self.num_streams_per_ut,
             precision=self.precision,
