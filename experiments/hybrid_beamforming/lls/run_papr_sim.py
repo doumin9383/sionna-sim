@@ -63,7 +63,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
     print(f"Starting PAPR Simulation with {len(scenarios)} scenarios...")
 
     # For large sweeps, reduce batches if needed
-    min_total_samples = 10000
+    min_total_samples = config.min_total_samples
     # Calculate required batches to meet minimum samples
     required_batches = int(np.ceil(min_total_samples / batch_size))
     # Use the larger of config.num_batches or required_batches
