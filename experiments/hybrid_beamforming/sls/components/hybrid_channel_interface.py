@@ -55,7 +55,15 @@ class HybridChannelInterface(Block):
         self.hybrid_channel.set_analog_weights(w_rf, a_rf)
 
     def get_neighbor_channel_info(
-        self, batch_size, ut_loc, bs_loc, ut_orient, bs_orient, neighbor_indices=None
+        self,
+        batch_size,
+        ut_loc,
+        bs_loc,
+        ut_orient,
+        bs_orient,
+        neighbor_indices=None,
+        ut_velocities=None,
+        in_state=None,
     ):
         """
         Generates channel only for the specified neighbors using virtual topology mapping.
@@ -68,8 +76,8 @@ class HybridChannelInterface(Block):
                 "neighbor_indices must be provided either in init or in method call."
             )
         # Batch processing for UTs to avoid OOM
-        # Process UTs in small batches (e.g., 10)
-        batch_size_ut = 10
+        # Process UTs in small batches (e.g., 1)
+        batch_size_ut = 1
         h_chunks = []
 
         # We process all UTs
@@ -100,21 +108,36 @@ class HybridChannelInterface(Block):
             # Ideally `get_neighbor_channel_info` should receive them or we extract from model.
             # But `ut_loc` etc are passed as args.
 
-            # Let's check `channel_model` properties for current state
-            # SystemLevelChannel wraps vector scenario in `_scenario`
-            if hasattr(self.channel_model, "indoor"):
-                in_state_full = self.channel_model.indoor
+            # Prepare additional states
+            if ut_velocities is not None:
+                ut_vel_full = ut_velocities
+            elif hasattr(self.channel_model, "ut_velocities"):
                 ut_vel_full = self.channel_model.ut_velocities
-            else:
-                # Fallback for Sionna < 0.19 or internal structure
-                in_state_full = self.channel_model._scenario.indoor
+            elif hasattr(self.channel_model, "_scenario") and hasattr(
+                self.channel_model._scenario, "ut_velocities"
+            ):
                 ut_vel_full = self.channel_model._scenario.ut_velocities
+            else:
+                # Default to zeros if not found [batch, num_ut, 3]
+                ut_vel_full = tf.zeros_like(ut_loc)
+
+            if in_state is not None:
+                in_state_full = in_state
+            elif hasattr(self.channel_model, "indoor"):
+                in_state_full = self.channel_model.indoor
+            elif hasattr(self.channel_model, "_scenario") and hasattr(
+                self.channel_model._scenario, "indoor"
+            ):
+                in_state_full = self.channel_model._scenario.indoor
+            else:
+                # Default to false (outdoor) [batch, num_ut]
+                in_state_full = tf.zeros(ut_loc.shape[:2], dtype=tf.bool)
 
             in_state_batch = in_state_full[:, start_ut:end_ut]
             ut_vel_batch = ut_vel_full[:, start_ut:end_ut, :]
 
             # neighbor_indices for this batch: [batch, current_batch_size, num_neighbors]
-            neighbor_indices_batch = self.neighbor_indices[:, start_ut:end_ut, :]
+            neighbor_indices_batch = current_neighbor_indices[:, start_ut:end_ut, :]
 
             # 1. Map physical positions/orientations to virtual BSs for this batch
             # bs_loc: [batch, num_bs, 3]
@@ -356,6 +379,8 @@ class HybridChannelInterface(Block):
         ut_orient=None,
         bs_orient=None,
         neighbor_indices=None,
+        ut_velocities=None,
+        in_state=None,
     ):
         """
         Returns the port-domain channel information.
@@ -390,6 +415,8 @@ class HybridChannelInterface(Block):
                 ut_orient,
                 bs_orient,
                 neighbor_indices=effective_neighbor_indices,
+                ut_velocities=ut_velocities,
+                in_state=in_state,
             )
 
         if self.use_rbg_granularity:

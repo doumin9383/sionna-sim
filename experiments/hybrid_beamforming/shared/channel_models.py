@@ -207,6 +207,24 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         num_ofdm_symbols = self._resource_grid.num_ofdm_symbols
         sampling_frequency = 1.0 / self._resource_grid.ofdm_symbol_duration
 
+        # --- DEBUG OOM ---
+        try:
+            n_tx = self._channel_model.num_tx
+            n_rx = self._channel_model.num_rx
+            n_tx_ant = self._channel_model.num_tx_ant
+            n_rx_ant = self._channel_model.num_rx_ant
+            # Estimation of complex128 consumption:
+            # Paths usually: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_clusters, num_rays]
+            # But 'a' shape is [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_clusters (or paths), num_time_steps]
+            # UMi/UMa usually result in 20-30 paths.
+            # print(f"[DEBUG-OOM] Generating Paths. Tx: {n_tx}, Rx: {n_rx}, TxAnt: {n_tx_ant}, RxAnt: {n_rx_ant}")
+            tf.print(
+                f"[DEBUG-OOM] Generating Paths. Tx: {n_tx}, Rx: {n_rx}, TxAnt: {n_tx_ant}, RxAnt: {n_rx_ant}"
+            )
+        except Exception as e:
+            print(f"[DEBUG-OOM] Stats error: {e}")
+        # -----------------
+
         a, tau = self._channel_model(num_ofdm_symbols, sampling_frequency)
         return a, tau
 

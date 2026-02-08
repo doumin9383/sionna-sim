@@ -21,6 +21,10 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     num_rings: int = 1
     topology_type: str = "HexGrid"  # "HexGrid", "Custom", etc.
     num_ut_per_sector: int = 1  # Production: 4
+    min_bs_ut_dist: float = 10.0  # Min distance between BS and UT
+    max_bs_ut_dist: Optional[float] = (
+        None  # Max distance, None means infinite/cell edge
+    )
 
     @property
     def num_bs(self):
