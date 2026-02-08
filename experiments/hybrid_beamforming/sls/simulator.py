@@ -211,7 +211,9 @@ class HybridSystemSimulator(Block):
     @tf.function(jit_compile=False)
     def call(self, num_slots, tx_power_dbm):
         # Initialize result history
-        throughput_history = tf.TensorArray(dtype=self.rdtype, size=num_slots)
+        hist = init_result_history(
+            self.batch_size, num_slots, self.num_bs, self.num_ut_per_sector
+        )
 
         # BS-UT Association
         # [num_ut] -> values are serving BS indices
@@ -220,7 +222,7 @@ class HybridSystemSimulator(Block):
         # --------------- #
         # Simulate a slot #
         # --------------- #
-        def simulate_slot(slot, throughput_history):
+        def simulate_slot(slot, hist):
             # 1. Get Full Channel Information (For Interference/Evaluation)
             # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
             h, _, u_all, _ = self.channel_interface.get_full_channel_info(
@@ -299,7 +301,9 @@ class HybridSystemSimulator(Block):
             # ut_loc: [batch, num_ut, 3]
             # serving_bs_idx: [batch, num_ut]
             # bs_loc: [batch, num_bs, 3]
-            serving_bs_loc = tf.gather(self.bs_loc, serving_bs_idx, batch_dims=1)
+            serving_bs_loc = tf.gather(
+                self.bs_loc, serving_bs_idx_batched, batch_dims=1
+            )
             dist = tf.norm(self.ut_loc - serving_bs_loc, axis=-1)  # [batch, num_ut]
 
             # Simple UMi Path Loss Model for 3.5GHz (Placeholder)
@@ -343,34 +347,31 @@ class HybridSystemSimulator(Block):
             # Reshape/Broadcast for broadcasting: [batch, num_ut, 1, 1, 1]
             if len(total_power.shape) == 0:  # Scalar
                 total_power = tf.broadcast_to(
-                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
+                    total_power, [self.batch_size, self.num_ut]
                 )
-            elif len(total_power.shape) == 2:  # [batch, num_ut]
-                total_power = tf.reshape(
-                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
-                )
-            elif len(total_power.shape) == 3:  # [batch, num_ut, 1]
-                total_power = tf.reshape(
-                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
-                )
-            else:
-                # Attempt to broadcast/reshape if dimensions allow, safeguard
-                total_power = tf.reshape(
-                    total_power, [self.batch_size, self.num_ut, 1, 1, 1]
-                )
+
+            # Ensure shape is [batch, num_ut, 1, 1, 1] for waterfilling
+            total_power_expanded = tf.reshape(
+                total_power, [self.batch_size, self.num_ut, 1, 1, 1]
+            )
 
             # d. Physics Abstraction (Water Filling -> SINR)
             p_alloc, sinr = self.phy_abstraction.call(
-                s_serv, noise_plus_interference, total_power
+                s_serv, noise_plus_interference, total_power_expanded
             )
 
             # e. MCS Selection & Throughput
             # MCS Adapter expects SINR in dB
             sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
 
+            # Effective SINR for reporting (Average over subcarriers/streams)
+            sinr_eff_avg = tf.reduce_mean(sinr, axis=[-1, -2])
+
             # Use Discrete MCS Table Lookup
             # Returns Spectral Efficiency (bits/symbol) including BLER penalty
-            capacity_per_re = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+            capacity_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(
+                sinr_db
+            )
 
             # If using RBG granularity, each point represents rbg_size_sc subcarriers
             if self.config.use_rbg_granularity:
@@ -380,8 +381,71 @@ class HybridSystemSimulator(Block):
 
             throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
 
-            # Store and Update
-            throughput_history = throughput_history.write(slot, throughput_per_user)
+            # --- Record Results ---
+            # Prepare metrics for recording
+            # Reshape/Cast as needed to match get_hist expectations
+            # history keys: [batch, num_bs, num_ut_per_sector]
+            # Current variables are [batch, num_ut] where num_ut = num_bs * num_ut_per_sector
+            # We need to reshape [batch, num_ut] -> [batch, num_bs, num_ut_per_sector]
+
+            def match_hist_shape(tensor):
+                # tensor: [batch, num_ut]
+                return tf.reshape(
+                    tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector]
+                )
+
+            # Average MCS index over streams/subcarriers if vectorized return is [..., streams]
+            # mcs_idx from get_throughput_vectorized has shape of sinr_db: [batch, num_ut, streams/rbg]
+            # We want one MCS per user (or per stream?). history['mcs_index'] is [batch, num_bs, ut_per_sector] i.e. per user.
+            # Take mode or mean? MCS is int. Let's take Mean for now or Max.
+            # Or if sinr_db was already per user?
+            # sinr_db passed was:
+            # sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
+            # sinr comes from waterfilling: [batch, num_ut, 1, 1, num_streams] (broadcasted from total_power)
+            # Wait, phy_abstraction.call returns p_alloc, sinr.
+            # p_alloc [..., num_streams], sinr [..., num_streams]
+            # so sinr_db is [batch, num_ut, 1, 1, num_streams] (squeezed?)
+            # Actually let's check shapes in simulator.
+            # total_power_expanded: [batch, num_ut, 1, 1, 1]
+            # noise: [batch, num_ut, 1, 1, streams] (broadcast) -> Actually noise is scalar/tensor?
+            # noise_plus_interference was [batch, num_ut]. NO.
+            # noise_plus_interference = self.no + interference_total
+            # interference_total: [batch, num_ut, 1, 1, streams] (reduced over BS interferences)
+            # So sinr has stream dim.
+            # mcs_idx will have stream dim.
+            # We can log the average MCS or max MCS? Or just Stream 0?
+            # Let's take the mean MCS (casted to float for logging).
+            mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
+
+            hist = record_results(
+                hist,
+                slot,
+                sim_failed=False,
+                pathloss_serving_cell=match_hist_shape(pl_db),
+                num_allocated_re=match_hist_shape(
+                    tf.fill(
+                        [self.batch_size, self.num_ut],
+                        float(self.resource_grid.num_effective_subcarriers),
+                    )
+                ),  # Placeholder
+                tx_power_per_ut=match_hist_shape(total_power),
+                num_decoded_bits=match_hist_shape(
+                    throughput_per_user
+                ),  # Using throughput as bits count approx for now
+                mcs_index=match_hist_shape(mcs_idx_avg),
+                harq_feedback=match_hist_shape(
+                    tf.zeros([self.batch_size, self.num_ut])
+                ),  # Placeholder
+                olla_offset=match_hist_shape(
+                    tf.zeros([self.batch_size, self.num_ut])
+                ),  # Placeholder
+                sinr_eff=match_hist_shape(sinr_eff_avg),
+                pf_metric=match_hist_shape(tf.zeros([self.batch_size, self.num_ut]))[
+                    ..., tf.newaxis, tf.newaxis
+                ],  # Placeholder with [..., 1, 1] for reduction compatibility
+            )
+
+            # Update Mobility
             self.ut_loc = self.ut_loc + self.ut_velocities * self.slot_duration
             self.channel_model.set_topology(
                 self.ut_loc,
@@ -394,13 +458,18 @@ class HybridSystemSimulator(Block):
                 self.bs_virtual_loc,
             )
 
-            return slot + 1, throughput_history
+            return slot + 1, hist
 
         # Run loop
-        _, final_history = tf.while_loop(
+        _, final_hist = tf.while_loop(
             lambda i, *_: i < num_slots,
             simulate_slot,
-            [0, throughput_history],
+            [0, hist],
         )
 
-        return final_history.stack()
+        # Stack history to convert TensorArrays to Tensors
+        for key in final_hist:
+            if isinstance(final_hist[key], tf.TensorArray):
+                final_hist[key] = final_hist[key].stack()
+
+        return final_hist

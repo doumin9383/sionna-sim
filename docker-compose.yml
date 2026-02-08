@@ -1,0 +1,21 @@
+services:
+  sionna:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sionna-custom:latest
+    container_name: sionna-worker
+    command: tail -f /dev/null
+    working_dir: /mnt/nas_data/sionna-sim
+    volumes:
+      - /mnt/nas_data:/mnt/nas_data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    network_mode: host
+    restart: unless-stopped

@@ -4,7 +4,7 @@ import tensorflow as tf
 
 # --- Add project root to path ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, "../../"))
+project_root = os.path.abspath(os.path.join(current_dir, "../../../"))
 sys.path.append(project_root)
 
 # Import Local Components
@@ -15,6 +15,7 @@ from experiments.hybrid_beamforming.sls.my_configs import HybridSLSConfig
 from libs.my_configs import ResourceGridConfig
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid
+import csv
 
 
 def run_test():
@@ -96,33 +97,53 @@ def run_test():
     # Note: simulator.py loops internally.
     # To see progress, we might need to modify simulator.py or just trust it returns quickly.
     # With num_slots=1, it should be fast.
+    # Run
+    # Returns a dictionary of Tensors
     history = sim(num_slots, tx_power_dbm)
 
     print("Simulation completed.")
-    print("History shape:", history.shape)
+    print("History keys:", history.keys())
 
-    # Save results to a file for inspection
-    avg_tput = tf.reduce_mean(history, axis=[1, -1]).numpy()
-    print("Average Metric per slot:", avg_tput)
+    # Save results to a pickle file for comprehensive analysis
+    import pickle
 
+    os.makedirs(config.output_dir, exist_ok=True)
+    history_path = os.path.join(config.output_dir, "history.pkl")
+
+    with open(history_path, "wb") as f:
+        pickle.dump(history, f)
+    print(f"Full history saved to {history_path}")
+
+    # Calculate Average Throughput for quick check
+    # num_decoded_bits: [slots, batch, bs, ut_per_sector]
+    if "num_decoded_bits" in history:
+        bits = history["num_decoded_bits"]
+        # Sum over users (axis 2, 3) and batch (axis 1) -> [slots]
+        # Or mean over users? Usually total network throughput
+        total_bits_per_slot = tf.reduce_sum(bits, axis=[1, 2, 3])
+        avg_tput_mbps = (
+            tf.reduce_mean(total_bits_per_slot) / 1e6 * (1.0 / sim.slot_duration)
+        )  # Approximate rate?
+        # Actually bits is per slot. Rate = bits / duration.
+        # But we stored "throughput_per_user" (bps) into num_decoded_bits in simulator.py
+        # So it is already rate (bps).
+        total_throughput_bps = tf.reduce_sum(bits, axis=[1, 2, 3])
+        avg_throughput_mbps = tf.reduce_mean(total_throughput_bps) / 1e6
+        print(f"Average Network Throughput: {avg_throughput_mbps:.2f} Mbps")
+
+    # Simple CSV export for legacy plotting compatibility
     try:
-        import csv
-
-        os.makedirs(config.output_dir, exist_ok=True)
         csv_path = os.path.join(config.output_dir, "simulation_results.csv")
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Slot", "Average_Throughput_bps"])
-            for i, val in enumerate(avg_tput):
+            # Writing total network throughput per slot
+            tput_vals = total_throughput_bps.numpy()
+            for i, val in enumerate(tput_vals):
                 writer.writerow([i, val])
-        print(f"Results saved to {csv_path}")
+        print(f"Summary CSV saved to {csv_path}")
     except Exception as e:
-        print(f"Failed to save results: {e}")
-
-    print("Simulation completed.")
-    print("History shape:", history.shape)
-    avg_tput = tf.reduce_mean(history, axis=[1, -1]).numpy()  # Average over users
-    print("Average Metric per slot:", avg_tput)
+        print(f"Failed to save summary CSV: {e}")
 
 
 if __name__ == "__main__":

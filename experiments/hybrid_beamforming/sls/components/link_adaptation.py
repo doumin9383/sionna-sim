@@ -77,8 +77,8 @@ class MCSLinkAdaptation:
             sinr_db (tf.Tensor): Effective SINR in dB.
 
         Returns:
-            tf.Tensor: Spectral Efficiency (bits/symbol) * CodeRate * (1-BLER).
-                       Essentially Throughput per Resource Element (bits/RE).
+            throughput (tf.Tensor): Throughput per Resource Element (bits/RE).
+            selected_mcs (tf.Tensor): Selected MCS Index.
         """
         # Convert table to constants
         # req_sinr: [NumMCS]
@@ -90,27 +90,32 @@ class MCSLinkAdaptation:
             [row[1] * (row[2] / 1024.0) for row in self.mcs_table], dtype=sinr_db.dtype
         )
 
+        # MCS Indices
+        mcs_indices = tf.range(len(self.mcs_table), dtype=tf.int32)
+
         # Expand dims for broadcasting
         # sinr_db shape: [..., 1] or [..., M]
-        # req_sinr shape: [N]
-        # We want to compare [..., 1] vs [N]
-
-        # Add a last dimension to sinr_db if needed?
-        # Typically sinr_db comes from simulator as [batch, num_ut, num_streams]
-        sinr_expanded = tf.expand_dims(sinr_db, -1)  # [..., 1]
+        sinr_expanded = tf.expand_dims(sinr_db, -1)
 
         # Compare: sinr >= req ?
         # Result: [..., NumMCS] boolean
         supported = sinr_expanded >= req_sinr
 
         # Get SE for supported MCS
-        # [..., NumMCS]
         # Use se where supported, else 0
         se_masked = tf.where(supported, se, tf.zeros_like(se))
 
+        # Get indices for supported MCS
+        # Use index where supported, else -1
+        indices_masked = tf.where(supported, mcs_indices, -1)
+
         # Get Max SE over available MCS
-        # [...,]
         selected_se = tf.reduce_max(se_masked, axis=-1)
 
+        # Get Max Index over available MCS
+        selected_mcs = tf.reduce_max(indices_masked, axis=-1)
+
         # Throughput = SE * (1 - BLER_target)
-        return selected_se * (1.0 - self.target_bler)
+        throughput = selected_se * (1.0 - self.target_bler)
+
+        return throughput, selected_mcs
