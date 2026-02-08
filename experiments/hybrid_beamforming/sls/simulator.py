@@ -128,7 +128,7 @@ class HybridSystemSimulator(Block):
         )
 
         # Instantiate SLS components
-        self.mpr_model = MPRModel()
+        self.mpr_model = MPRModel(csv_path=config.mpr_table_path)
         self.power_control = PowerControl(p_power_class=config.ut_max_power_dbm)
         self.mcs_adapter = MCSLinkAdaptation()
 

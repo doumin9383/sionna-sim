@@ -1,6 +1,7 @@
 import tensorflow as tf
 import numpy as np
 from sionna.phy.nr import calculate_tb_size
+from experiments.hybrid_beamforming.shared.tables import NR_MCS_TABLE_1
 
 
 class MCSLinkAdaptation:
@@ -14,37 +15,7 @@ class MCSLinkAdaptation:
         # Table 5.1.3.1-1: MCS index table 1 for PUSCH
         # Columns: [MCS Index, Modulation Order, Target Code Rate (x1024), Required SINR (dB)]
         # Approximate required SINR for BLER=10%
-        self.mcs_table = [
-            [0, 2, 120, -6.0],
-            [1, 2, 157, -4.0],
-            [2, 2, 193, -2.0],
-            [3, 2, 251, -0.0],
-            [4, 2, 308, 2.0],
-            [5, 2, 379, 4.0],
-            [6, 2, 449, 6.0],
-            [7, 2, 526, 8.0],
-            [8, 2, 602, 10.0],
-            [9, 2, 679, 12.0],
-            [10, 4, 340, 13.0],
-            [11, 4, 378, 14.0],
-            [12, 4, 434, 15.0],
-            [13, 4, 490, 16.0],
-            [14, 4, 553, 17.0],
-            [15, 4, 616, 18.0],
-            [16, 4, 658, 19.0],
-            [17, 6, 438, 19.5],
-            [18, 6, 466, 20.0],
-            [19, 6, 517, 21.0],
-            [20, 6, 567, 22.0],
-            [21, 6, 616, 23.0],
-            [22, 6, 666, 24.0],
-            [23, 6, 719, 25.0],
-            [24, 6, 772, 26.0],
-            [25, 6, 822, 27.0],
-            [26, 6, 873, 28.0],
-            [27, 6, 910, 29.0],
-            [28, 6, 948, 30.0],
-        ]
+        self.mcs_table = NR_MCS_TABLE_1
 
     def select_mcs(self, sinr_db):
         """

@@ -44,9 +44,9 @@ if os.path.exists(history_path):
     plt.xlabel("Effective SINR [dB]")
 
     plt.tight_layout()
-    plt.savefig(
-        "/home/sh-fukue/Documents/Developments/sionna-sim/experiments/sls_end2end_hybrid_beam/results/summary_plot.png"
-    )
-    print("\nSummary plot saved to results/summary_plot.png")
+    save_path = "experiments/hybrid_beamforming/sls/results/summary_plot.png"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    print(f"\nSummary plot saved to {save_path}")
 else:
     print(f"Error: {history_path} not found.")

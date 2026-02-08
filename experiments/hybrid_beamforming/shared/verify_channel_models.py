@@ -2,10 +2,10 @@ import tensorflow as tf
 from sionna.phy.ofdm import ResourceGrid
 from sionna.phy.mimo import StreamManagement
 from sionna.phy.channel.tr38901 import PanelArray
-from experiments.sls_end2end_hybrid_beam.components.channel_models import (
+from experiments.hybrid_beamforming.shared.channel_models import (
     RBGChannelModel,
-    ChunkedGenerateTimeChannel,
-    GenerateHybridBeamformingOFDMChannel,
+    ChunkedTimeChannel,
+    HybridOFDMChannel,
 )
 
 
@@ -63,7 +63,7 @@ def test_chunked_time_channel(channel_model):
     num_time_samples = 1000
     l_min, l_max = -6, 20
 
-    time_channel = ChunkedGenerateTimeChannel(
+    time_channel = ChunkedTimeChannel(
         channel_model=channel_model,
         bandwidth=bandwidth,
         num_time_samples=num_time_samples,
@@ -90,7 +90,7 @@ def test_hybrid_ofdm_channel(channel_model, bs_array, ut_array):
     num_tx_ports = 4
     num_rx_ports = 2
 
-    hybrid_channel = GenerateHybridBeamformingOFDMChannel(
+    hybrid_channel = HybridOFDMChannel(
         channel_model=channel_model,
         resource_grid=rg,
         tx_array=bs_array,

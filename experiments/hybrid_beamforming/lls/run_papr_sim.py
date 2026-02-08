@@ -14,13 +14,13 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from experiments.sls_end2end_hybrid_beam.my_configs import LLSSweepConfig
-from experiments.sls_end2end_hybrid_beam.components.pusch_model import (
+from experiments.hybrid_beamforming.lls.my_configs import HybridLLSConfig
+from experiments.hybrid_beamforming.lls.components.pusch_model import (
     PUSCHCommunicationModel,
 )
 
 
-def run_papr_simulation(config: LLSSweepConfig = LLSSweepConfig()):
+def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
 
     output_file = config.output_file
     # Ensure results directory exists

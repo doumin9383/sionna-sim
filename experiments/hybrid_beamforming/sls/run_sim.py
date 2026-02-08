@@ -8,10 +8,10 @@ project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 sys.path.append(project_root)
 
 # Import Local Components
-from experiments.sls_end2end_hybrid_beam.simulator import (
+from experiments.hybrid_beamforming.sls.simulator import (
     HybridSystemSimulator,
 )
-from experiments.sls_end2end_hybrid_beam.my_configs import HybridSLSConfig
+from experiments.hybrid_beamforming.sls.my_configs import HybridSLSConfig
 from libs.my_configs import ResourceGridConfig
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid

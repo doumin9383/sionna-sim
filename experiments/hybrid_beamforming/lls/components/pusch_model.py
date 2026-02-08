@@ -5,7 +5,9 @@
 import tensorflow as tf
 from sionna.phy.nr import PUSCHConfig, PUSCHReceiver, CarrierConfig
 from .pusch_transmitter_wrapper import HybridPUSCHTransmitter
-from .channel_models import GeneratHybridBeamformingTimeChannel
+from experiments.hybrid_beamforming.shared.channel_models import (
+    GeneratHybridBeamformingTimeChannel,
+)
 
 # from sionna.channel import ApplyTimeChannel # Check if available, or usetf.nn.convolution
 from sionna.phy.channel import ApplyTimeChannel

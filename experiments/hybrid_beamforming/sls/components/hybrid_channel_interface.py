@@ -1,6 +1,6 @@
 import tensorflow as tf
 from sionna.phy import Block
-from .channel_models import HybridOFDMChannel
+from experiments.hybrid_beamforming.shared.channel_models import HybridOFDMChannel
 
 
 class HybridChannelInterface(Block):
