@@ -243,12 +243,23 @@ class HybridSystemSimulator(Block):
             # Expand v_prec to Full Bandwidth
             # v_prec: [batch, num_ut, num_bs, ofdm, num_blocks, tx_ports, tx_ports]
             # We need to expand dim -3 (num_blocks) to num_sc
-            total_subcarriers = self.resource_grid.num_effective_subcarriers
+
+            # Determine effective target dimensions based on granularity mode
+            if self.config.use_rbg_granularity:
+                # In RBG mode, the "effective" full bandwidth is just the number of RBGs
+                # h shape: [batch, ut, bs, ofdm, freq, ...]
+                eff_total_subcarriers = h.shape[4]
+                eff_rbg_size_sc = 1  # 1-to-1 mapping
+            else:
+                # Full band mode
+                eff_total_subcarriers = self.resource_grid.num_effective_subcarriers
+                eff_rbg_size_sc = self.rbg_size_sc
+
             v_expanded = expand_precoder(
                 v_prec,
-                total_subcarriers=total_subcarriers,
+                total_subcarriers=eff_total_subcarriers,
                 granularity_type=self.precoding_granularity,
-                rbg_size_sc=self.rbg_size_sc,
+                rbg_size_sc=eff_rbg_size_sc,
             )
 
             # 3. Extract Serving Precoders and Combiners

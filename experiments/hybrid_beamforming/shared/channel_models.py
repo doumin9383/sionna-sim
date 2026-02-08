@@ -224,10 +224,14 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         # Shape: [num_rbgs]
         # Example: rbg_size=16. Indices: 8, 24, 40...
         num_subcarriers = self._resource_grid.fft_size
-        num_rbgs = num_subcarriers // rbg_size
+        num_rbgs = tf.maximum(num_subcarriers // rbg_size, 1)
 
         # Calculate indices of RBG centers
-        rbg_indices = tf.range(num_rbgs) * rbg_size + (rbg_size // 2)
+        # If num_rbgs is 1 because of fallback, we take the center of the available band
+        if num_subcarriers < rbg_size:
+            rbg_indices = tf.constant([num_subcarriers // 2], dtype=tf.int32)
+        else:
+            rbg_indices = tf.range(num_rbgs) * rbg_size + (rbg_size // 2)
 
         # Gather frequencies at these indices
         rbg_freqs = tf.gather(self._all_frequencies, rbg_indices)
@@ -341,9 +345,13 @@ class HybridOFDMChannel(ChunkedOFDMChannel):
         """
         Return the port-domain channel.
         """
-        # 1. Get physical channel (Element domain) - calling parent
-        # Note: standard GenerateOFDMChannel returns [b, r, u, t, v, o, s]
-        h_elem = super().__call__(batch_size)
+        if self.use_rbg_granularity:
+            # get_rbg_channel already applies weights
+            return self.get_rbg_channel(batch_size, self.rbg_size)
+
+        # 1. Get physical channel (Element domain) - calling grandparent directly to avoid ChunkedOFDMChannel logic
+        # wrapping back to get_rbg_channel if we called super().__call__
+        h_elem = GenerateOFDMChannel.__call__(self, batch_size)
 
         # 2. Apply Analog Beamforming
         h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
