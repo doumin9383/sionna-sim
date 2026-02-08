@@ -85,6 +85,9 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         Applies frequency-selective precoding to the resource grid.
         x_rg shape: [batch, num_layers, num_ofdm_symbols, num_subcarriers]
         """
+        if len(x_rg.shape) == 5 and x_rg.shape[1] == 1:
+            x_rg = tf.squeeze(x_rg, axis=1)
+
         batch_size = tf.shape(x_rg)[0]
         num_layers = self._num_layers
         num_symbols = tf.shape(x_rg)[2]
@@ -162,11 +165,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         Transform precoding in NR is applied per OFDM symbol.
         """
         # M_sc is the number of subcarriers per OFDM symbol allocated for this PUSCH
-        # num_subcarriers is total length, num_resource_symbols is the grid size
-        M_sc = self.resource_grid.num_resource_symbols
-        # Note: In standard Sionna, it's easier to get this from resource_grid.num_subcarriers
-        # but that is for the whole FFT. We need the data-carrying subcarriers.
-        # For simplicity in this wrapper, we use the property from resource_grid.
+        # num_subcarriers is total length. We need the data-carrying subcarriers.
         M_sc = (
             self.resource_grid.num_effective_subcarriers
             // self.resource_grid.num_ofdm_symbols

@@ -3,10 +3,16 @@ import sys
 import gc
 import tensorflow as tf
 import numpy as np
+
+# Add project root to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 from experiments.hybrid_beamforming.lls.components.pusch_transmitter_wrapper import (
     HybridPUSCHTransmitter,
 )
-from sionna.phy.nr import PUSCHConfig
+from sionna.phy.nr import PUSCHConfig, CarrierConfig
 
 
 def verify_vram_capacity():
@@ -33,12 +39,15 @@ def verify_vram_capacity():
     # Actually, let's use a very heavy case to test limits
     num_rb = 106  # 40MHz
 
+    carrier_config = CarrierConfig()
+    carrier_config.subcarrier_spacing = subcarrier_spacing / 1e3  # Sionna expects kHz
+    carrier_config.carrier_frequency = carrier_frequency
+    carrier_config.n_size_grid = num_rb
+
     pusch_config = PUSCHConfig(
-        carrier_frequency=carrier_frequency,
-        subcarrier_spacing=subcarrier_spacing,
+        carrier=carrier_config,
         num_antenna_ports=num_layers,
         num_layers=num_layers,
-        bandwidth=40e6,  # roughly 106 RBs
     )
 
     # Test batch sizes

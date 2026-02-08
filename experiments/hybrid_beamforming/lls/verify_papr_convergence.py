@@ -4,6 +4,12 @@ import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
+# Add project root to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 from experiments.hybrid_beamforming.lls.components.pusch_model import (
     PUSCHCommunicationModel,
 )
