@@ -36,7 +36,7 @@ class HybridChannelInterface(Block):
             rx_array=rx_array,
             num_tx_ports=num_tx_ports,
             num_rx_ports=num_rx_ports,
-            normalize_channel=True,  # Ensure consistent normalization
+            normalize_channel=False,  # Disable normalization for SLS (Pathloss required)
             use_rbg_granularity=use_rbg_granularity,
             rbg_size=rbg_size_sc,
         )

@@ -123,6 +123,8 @@ class HybridSystemSimulator(Block):
             num_tx_ports=config.bs_array.num_ant,
             num_rx_ports=config.ut_array.num_ant,
             precision=self.precision,
+            use_rbg_granularity=config.use_rbg_granularity,
+            rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
         )
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
@@ -369,6 +371,12 @@ class HybridSystemSimulator(Block):
             # Use Discrete MCS Table Lookup
             # Returns Spectral Efficiency (bits/symbol) including BLER penalty
             capacity_per_re = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+
+            # If using RBG granularity, each point represents rbg_size_sc subcarriers
+            if self.config.use_rbg_granularity:
+                # Scale capacity by the size of the RBG
+                rbg_scale = tf.cast(self.rbg_size_sc, self.rdtype)
+                capacity_per_re = capacity_per_re * rbg_scale
 
             throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
 
