@@ -285,7 +285,7 @@ class HybridSystemSimulator(Block):
             # Get Element-Domain Channel for Beam Selection
             h_elem_bs = self.channel_interface.get_element_channel_for_beam_selection(
                 batch_size=self.batch_size,
-                rbg_size_sc=1,  # Use center subcarrier or averaged for beam selection
+                rbg_size_sc=self.rbg_size_sc,
                 ut_loc=self.ut_loc,
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
@@ -305,57 +305,49 @@ class HybridSystemSimulator(Block):
 
             # 2. Select Analog Beams (BS Side)
             # BS Beam Selection
-            w_rf_bs = self.beam_selector.select_bs_beam(h_elem_bs)
+            # 2. Select Analog Beams (BS Side)
+            # BS Beam Selection
+            # w_rf_selected: [Batch, U, TotalAnt, SubPorts(2)]
+            w_rf_selected = self.beam_selector(h_elem_bs)
 
-            # UE Analog Beam: Identity (Full Digital or Fixed)
-            # We need to construct Identity matrix for UE [num_ut_ant, num_ut_chains]
-            # Since num_ut_chains might equal num_ut_ant, it's just eye.
-            # a_rf: [Batch, U, RxAnt, RxPort] or [RxAnt, RxPort] broadcasting
-            # Let's use simple eye.
-            # self.ut_array.num_ant
-            # config.ut_num_rf_chains
-
-            # We assume a_rf is fixed for now (Omni/Identity)
-            a_rf_ue = tf.eye(
-                self.num_rx_ant,
-                num_columns=self.channel_interface.hybrid_channel.num_rx_ports,
-                dtype=tf.complex64,
+            # Reshape to [Batch, TotalAnt, U * SubPorts] -> Mapping Users/Pols to RF Chains
+            # Transpose to [Batch, TotalAnt, U, SubPorts]
+            w_rf_transposed = tf.transpose(w_rf_selected, perm=[0, 2, 1, 3])
+            # Reshape to [Batch, TotalAnt, U*SubPorts]
+            # w_rf_flat: [Batch, TotalAnt, Candidates]
+            w_rf_flat = tf.reshape(
+                w_rf_transposed, [self.batch_size, self.num_bs_ant, -1]
             )
 
-            # If direction is Uplink: Tx=UT, Rx=BS.
-            # w_rf corresponds to Tx, a_rf corresponds to Rx.
+            # Match number of RF chains (BS Ports)
             if self.direction == "uplink":
-                # BS is Rx. BS applies W_RF as A_RF.
-                # W_RF from selector is [Batch, Tx, Ant, Port]. Wait, selector was designed for BS logic (Tx or Rx?)
-                # Codebook is generic. Selector `select_bs_beam` naming suggests BS.
-                # If BS is Rx, we select Rx beams.
-                # `select_bs_beam` returns vectors.
-                # We should use them as a_rf.
-                # But `HybridChannelInterface.set_analog_weights(w_rf, a_rf)` expects:
-                # w_rf: Tx weights
-                # a_rf: Rx weights
-
-                # BS is Rx. So w_rf_bs should be assigned to 'a_rf'.
-                # UE is Tx. Identity.
-
-                # Check shapes.
-                # w_rf_bs shape: [Batch, U, TotalAnt, NumPorts] (as per beam_management.py construction)
-                # It is constructed per USER (Serving Beam).
-                # But in Uplink, BS receives from user.
-                # BS Rx Beam should be directed to User.
-                # So [Batch, U, BS_Ant, BS_Port] is correct "Per User Receiver Beamforming".
-
-                # HybridOFDMChannel.apply_weights expects:
-                # a_rf: [num_rx_ant, num_rx_ports] or [Batch, U, RxAnt, RxPort]
-                # Yes, it supports per-user weights.
-
-                self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
-
+                target_ports = self.channel_interface.hybrid_channel.num_rx_ports
             else:
-                # Downlink: Tx=BS, Rx=UT.
-                # BS is Tx.
-                # w_rf_bs is used as w_rf.
-                # UE is Rx. Identity.
+                target_ports = self.channel_interface.hybrid_channel.num_tx_ports
+
+            num_candidates = tf.shape(w_rf_flat)[-1]
+
+            if num_candidates >= target_ports:
+                w_rf_bs = w_rf_flat[..., :target_ports]
+            else:
+                padding = tf.zeros(
+                    [self.batch_size, self.num_bs_ant, target_ports - num_candidates],
+                    dtype=w_rf_flat.dtype,
+                )
+                w_rf_bs = tf.concat([w_rf_flat, padding], axis=-1)
+
+            # UE Analog Beam: Identity (Full Digital or Fixed)
+            if self.direction == "uplink":
+                ue_ports = self.channel_interface.hybrid_channel.num_tx_ports
+            else:
+                ue_ports = self.channel_interface.hybrid_channel.num_rx_ports
+
+            a_rf_ue = tf.eye(self.num_ut_ant, num_columns=ue_ports, dtype=tf.complex64)
+
+            # Apply weights
+            if self.direction == "uplink":
+                self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
+            else:
                 self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
 
             # 3. Get Precoding Channel (Effective Channel)
@@ -364,6 +356,18 @@ class HybridSystemSimulator(Block):
                 self.precoding_granularity,
                 self.rbg_size_sc,
                 batch_size=self.batch_size,
+                ut_loc=self.ut_loc,
+                bs_loc=self.bs_loc,
+                ut_orient=self.ut_orientations,
+                bs_orient=self.bs_orientations,
+                neighbor_indices=self.neighbor_indices,
+                ut_velocities=self.ut_velocities,
+                in_state=self.in_state,
+            )
+
+            # Get Full Channel for Interference/SINR Calc
+            h, _, u_all, _ = self.channel_interface.get_full_channel_info(
+                self.batch_size,
                 ut_loc=self.ut_loc,
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,

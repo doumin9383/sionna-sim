@@ -139,23 +139,23 @@ class BeamSelector(Block):
     4. Construct full W_RF by applying the selected beam weight to all sub-panels.
     """
 
-    def __init__(self, bs_array_config, oversampling_factor=1, dtype=tf.complex64):
+    def __init__(
+        self,
+        num_rows_per_panel,
+        num_cols_per_panel,
+        num_panels_v,
+        num_panels_h,
+        polarization,
+        oversampling_factor=1,
+        dtype=tf.complex64,
+    ):
         super().__init__(dtype=dtype)
 
-        self.bs_config = (
-            bs_array_config  # Expecting PanelArray instance or compatible config
-        )
-
-        # Extract sub-panel dimensions
-        # Assuming PanelArray structure:
-        # num_rows_per_panel, num_cols_per_panel are the dimensions of ONE panel.
-        # num_rows, num_cols are NUMBER of panels.
-
-        self.rows_per_panel = self.bs_config.num_rows_per_panel
-        self.cols_per_panel = self.bs_config.num_cols_per_panel
-        self.num_panels_v = self.bs_config.num_rows
-        self.num_panels_h = self.bs_config.num_cols
-        self.polarization = self.bs_config.polarization
+        self.rows_per_panel = num_rows_per_panel
+        self.cols_per_panel = num_cols_per_panel
+        self.num_panels_v = num_panels_v
+        self.num_panels_h = num_panels_h
+        self.polarization = polarization
 
         self.ant_per_panel = self.rows_per_panel * self.cols_per_panel
         if self.polarization in ["dual", "cross"]:
@@ -200,7 +200,7 @@ class BeamSelector(Block):
 
         return h_elem
 
-    def select_bs_beam(self, h_elem):
+    def call(self, h_elem):
         """
         Selects best beam for each user/link based on h_elem.
 

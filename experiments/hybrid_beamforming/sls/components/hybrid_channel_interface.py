@@ -64,6 +64,8 @@ class HybridChannelInterface(Block):
         neighbor_indices=None,
         ut_velocities=None,
         in_state=None,
+        return_element_channel=False,
+        rbg_size_sc=1,
     ):
         """
         Generates channel only for the specified neighbors using virtual topology mapping.
@@ -171,7 +173,15 @@ class HybridChannelInterface(Block):
             # However, we only care about the diagonal blocks (UT i <-> Neighbors of UT i)
             # But Sionna generates full mesh.
             # Batch size = 10 -> 10 * 80 = 800 links. Much smaller than 150 * 1200 = 180,000.
-            h_port_flat = self.hybrid_channel(batch_size)
+            if return_element_channel:
+                # Element Domain Channel (No Analog Weights)
+                # Use get_element_rbg_channel explicitly
+                h_port_flat = self.hybrid_channel.get_element_rbg_channel(
+                    batch_size, rbg_size=rbg_size_sc
+                )
+            else:
+                # Port Domain Channel (With Analog Weights)
+                h_port_flat = self.hybrid_channel(batch_size)
 
             # 4. Extract active links
             # h_port_flat shape depends on direction.
@@ -230,8 +240,50 @@ class HybridChannelInterface(Block):
         # Target: 0, 1, 2, 5, 6, 3, 4
         h_neighbor = tf.transpose(h_neighbor, perm=[0, 1, 2, 5, 6, 3, 4])
 
+        if return_element_channel:
+            return h_neighbor
+
         s, u, v = tf.linalg.svd(h_neighbor)
         return h_neighbor, s, u, v
+
+    def get_element_channel_for_beam_selection(
+        self,
+        batch_size,
+        ut_loc,
+        bs_loc,
+        ut_orient,
+        bs_orient,
+        neighbor_indices=None,
+        ut_velocities=None,
+        in_state=None,
+        rbg_size_sc=1,
+    ):
+        """
+        Get element-domain channel for beam selection, handling topology and neighbors.
+        """
+        effective_neighbor_indices = (
+            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
+        )
+
+        # Check external loader (Not implemented for beam selection yet)
+        if self.external_loader is not None:
+            raise NotImplementedError(
+                "Beam selection with external loader not yet implemented."
+            )
+
+        # Re-use get_neighbor_channel_info with flag
+        return self.get_neighbor_channel_info(
+            batch_size,
+            ut_loc,
+            bs_loc,
+            ut_orient,
+            bs_orient,
+            neighbor_indices=effective_neighbor_indices,
+            ut_velocities=ut_velocities,
+            in_state=in_state,
+            return_element_channel=True,
+            rbg_size_sc=rbg_size_sc,
+        )
 
     def _get_steering_vector(self, array, theta, phi):
         """

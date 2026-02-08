@@ -345,13 +345,17 @@ class HybridOFDMChannel(ChunkedOFDMChannel):
         """
         Return the port-domain channel.
         """
+        # 1. Get physical channel (Element domain)
         if self.use_rbg_granularity:
-            # get_rbg_channel already applies weights
-            return self.get_rbg_channel(batch_size, self.rbg_size)
-
-        # 1. Get physical channel (Element domain) - calling grandparent directly to avoid ChunkedOFDMChannel logic
-        # wrapping back to get_rbg_channel if we called super().__call__
-        h_elem = GenerateOFDMChannel.__call__(self, batch_size)
+            # Get RBG-sampled element channel
+            h_elem = super().get_rbg_channel(batch_size, self.rbg_size)
+        else:
+            # Get full element channel
+            # calling grandparent directly to avoid ChunkedOFDMChannel logic wrapping if needed?
+            # Actually ChunkedOFDMChannel.__call__ calls super().__call__ (GenerateOFDMChannel) which calls _model.
+            # But parent ChunkedOFDMChannel.__call__ has `if use_rbg: return get_rbg`.
+            # So we can call GenerateOFDMChannel.__call__(self, batch_size) explicitly to be safe
+            h_elem = GenerateOFDMChannel.__call__(self, batch_size)
 
         # 2. Apply Analog Beamforming
         h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
