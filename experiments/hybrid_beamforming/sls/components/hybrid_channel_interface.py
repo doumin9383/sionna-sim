@@ -42,12 +42,36 @@ class HybridChannelInterface(Block):
     def get_full_channel_info(self, batch_size):
         """
         Returns full SVD results and the underlying port channel.
+        For backwards compatibility/standard usage.
         """
         h_port = self.hybrid_channel(batch_size)
         # Permute: [batch, num_rx, num_tx, num_ofdm, num_sc, num_rx_ports, num_tx_ports]
-        h_permutes = tf.transpose(h_port, perm=[0, 1, 3, 5, 6, 2, 4])
-        s, u, v = tf.linalg.svd(h_permutes)
-        return h_permutes, s, u, v
+        h_permuted = tf.transpose(h_port, perm=[0, 1, 3, 5, 6, 2, 4])
+        s, u, v = tf.linalg.svd(h_permuted)
+        return h_permuted, s, u, v
+
+    def get_precoding_channel(self, batch_size, granularity, rbg_size_sc=None):
+        """
+        Get channel specifically for precoding calculation.
+        """
+        if granularity == "Wideband":
+            # Treat as 1 huge RBG covering everything
+            # Sionna's get_rbg_channel likely needs the size.
+            total_sc = self.resource_grid.num_effective_subcarriers
+            h_port = self.hybrid_channel.get_rbg_channel(batch_size, rbg_size=total_sc)
+        elif granularity == "Subband":
+            if rbg_size_sc is None:
+                raise ValueError("rbg_size_sc required for Subband")
+            h_port = self.hybrid_channel.get_rbg_channel(
+                batch_size, rbg_size=rbg_size_sc
+            )
+        else:  # Narrowband
+            h_port = self.hybrid_channel(batch_size)
+
+        # Permute to standard shape for precoding [batch, num_rx, num_tx, num_ofdm, num_freq_blocks, num_rx_ports, num_tx_ports]
+        h_permuted = tf.transpose(h_port, perm=[0, 1, 3, 5, 6, 2, 4])
+
+        return h_permuted
 
     def call(self, batch_size):
         return self.get_full_channel_info(batch_size)

@@ -20,6 +20,7 @@ from .components.power_control import PowerControl
 from .components.link_adaptation import MCSLinkAdaptation
 from .components.get_stream_management import get_stream_management
 from .components.get_hist import init_result_history, record_results
+from .components.precoder_utils import expand_precoder
 
 # Set random seed for reproducibility
 sionna.phy.config.seed = 42
@@ -70,6 +71,11 @@ class HybridSystemSimulator(Block):
             self.num_tx, self.num_rx = self.num_bs, self.num_ut
             self.num_tx_ant, self.num_rx_ant = self.num_bs_ant, self.num_ut_ant
             self.num_tx_per_sector = 1
+
+        # Precoding Granularity Settings
+        self.precoding_granularity = config.precoding_granularity
+        self.rbg_size_rb = config.rbg_size_rb
+        self.rbg_size_sc = int(self.rbg_size_rb * 12) if self.rbg_size_rb > 0 else None
 
         # Assume 1 stream for UT antenna
         self.num_streams_per_ut = config.resource_grid.num_streams_per_tx
@@ -213,23 +219,46 @@ class HybridSystemSimulator(Block):
         # Simulate a slot #
         # --------------- #
         def simulate_slot(slot, throughput_history):
-            # 1. Get Full Channel Information (SVD results for all pairs)
+            # 1. Get Full Channel Information (For Interference/Evaluation)
             # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
-            h, s_all, u_all, v_all = self.channel_interface.get_full_channel_info(
+            h, _, u_all, _ = self.channel_interface.get_full_channel_info(
                 self.batch_size
             )
 
-            # 2. Extract Serving Precoders and Combiners
+            # 2. Get Precoding Channel (For Beamforming Calculation)
+            # h_prec: [batch, num_ut, num_bs, ofdm, num_blocks, rx_ports, tx_ports]
+            h_prec = self.channel_interface.get_precoding_channel(
+                self.batch_size,
+                granularity=self.precoding_granularity,
+                rbg_size_sc=self.rbg_size_sc,
+            )
+
+            # Compute SVD on Coarse Channel
+            s_prec, u_prec, v_prec = tf.linalg.svd(h_prec)
+
+            # Expand v_prec to Full Bandwidth
+            # v_prec: [batch, num_ut, num_bs, ofdm, num_blocks, tx_ports, tx_ports]
+            # We need to expand dim -3 (num_blocks) to num_sc
+            total_subcarriers = self.resource_grid.num_effective_subcarriers
+            v_expanded = expand_precoder(
+                v_prec,
+                total_subcarriers=total_subcarriers,
+                granularity_type=self.precoding_granularity,
+                rbg_size_sc=self.rbg_size_sc,
+            )
+
+            # 3. Extract Serving Precoders and Combiners
             serving_bs_idx_batched = tf.broadcast_to(
                 serving_bs_idx, [self.batch_size, self.num_ut]
             )
 
-            # Extract serving S, U, V [batch, num_ut, ofdm, sc, ...]
-            s_serv = tf.gather(s_all, serving_bs_idx_batched, axis=2, batch_dims=2)
+            # Extract serving U (Ideal) and V (Granular)
+            # u_serv: [batch, num_ut, ofdm, sc, rx_ports, rx_ports] (Full resolution)
+            # v_serv: [batch, num_ut, ofdm, sc, tx_ports, tx_ports] (Expanded granular)
             u_serv = tf.gather(u_all, serving_bs_idx_batched, axis=2, batch_dims=2)
-            v_serv = tf.gather(v_all, serving_bs_idx_batched, axis=2, batch_dims=2)
+            v_serv = tf.gather(v_expanded, serving_bs_idx_batched, axis=2, batch_dims=2)
 
-            # 3. Calculate Interference (The "Box" for future extensions)
+            # 4. Calculate Interference (The "Box" for future extensions)
             # BS_precoders: Assuming UT i is served by BS i (for num_ut_per_sector=1).
             bs_precoders = v_serv
 
@@ -255,6 +284,13 @@ class HybridSystemSimulator(Block):
 
             # Effective Noise per stream: N0 + Interference
             noise_plus_interference = self.no + interference_total
+
+            # Calculate Effective Channel Gains (s_serv) from h_eff
+            # This captures beamforming mismatch due to granularity
+            # h_eff: [batch, ut, bs, ofdm, sc, stream, stream] -> Gather serving BS
+            h_eff_serv = tf.gather(h_eff, serving_bs_idx_batched, axis=2, batch_dims=2)
+            # Take diagonal (signal power on streams)
+            s_serv = tf.abs(tf.linalg.diag_part(h_eff_serv))
 
             # 4. Power Control & Link Adaptation
             # a. Calculate Path Loss (Simple Euclidean distance based approximation for PC)

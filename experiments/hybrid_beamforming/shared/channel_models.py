@@ -332,6 +332,18 @@ class HybridOFDMChannel(ChunkedOFDMChannel):
 
         return h_port
 
+    def get_rbg_channel(self, batch_size, rbg_size, active_rbgs=None):
+        """
+        Get port-domain channel sampled at RBG granularity.
+        """
+        # 1. Get physical RBG channel (Element domain)
+        h_elem = super().get_rbg_channel(batch_size, rbg_size, active_rbgs)
+
+        # 2. Apply Analog Beamforming
+        h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
+
+        return h_port
+
 
 class GeneratHybridBeamformingTimeChannel(ChunkedTimeChannel):
     """
