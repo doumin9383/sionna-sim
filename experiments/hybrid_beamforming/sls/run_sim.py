@@ -50,10 +50,10 @@ def run_test():
 
     # BS Array from config
     bs_array = PanelArray(
-        num_rows=1,
-        num_cols=1,
-        num_rows_per_panel=config.bs_num_rows,
-        num_cols_per_panel=config.bs_num_cols,
+        num_rows=config.bs_num_rows_panel,
+        num_cols=config.bs_num_cols_panel,
+        num_rows_per_panel=config.bs_num_rows_per_panel,
+        num_cols_per_panel=config.bs_num_cols_per_panel,
         polarization=config.bs_polarization,
         polarization_type="cross",
         antenna_pattern="38.901",
@@ -61,10 +61,10 @@ def run_test():
     )
     # UT Array from config
     ut_array = PanelArray(
-        num_rows=1,
-        num_cols=1,
-        num_rows_per_panel=config.ut_num_rows,
-        num_cols_per_panel=config.ut_num_cols,
+        num_rows=config.ut_num_rows_panel,
+        num_cols=config.ut_num_cols_panel,
+        num_rows_per_panel=config.ut_num_rows_per_panel,
+        num_cols_per_panel=config.ut_num_cols_per_panel,
         polarization=config.ut_polarization,
         polarization_type="cross",
         antenna_pattern="omni",

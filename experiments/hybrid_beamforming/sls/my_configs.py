@@ -43,7 +43,6 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
 
     # Scenario
     scenario: str = "umi"  # "umi", "uma", "rma"
-    direction: str = "uplink"  # "uplink", "downlink"
 
     # Mobility/Link Adaptation
     coherence_time: int = 10  # slots

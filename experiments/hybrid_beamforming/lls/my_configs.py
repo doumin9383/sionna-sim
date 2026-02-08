@@ -14,9 +14,12 @@ import numpy as np
 class HybridLLSConfig(HybridSimulationCommonConfig):
     """Link Level Simulation Configuration for experiments/hybrid_beamforming/lls"""
 
+    def __post_init__(self):
+        super().__init__()
+
     # Simulation Control
-    batch_size: int = 100
-    num_batches: int = 10
+    batch_size: int = 1600
+    num_batches: int = 5
     min_total_samples: int = 10000
 
     # Sweep Parameters
@@ -28,9 +31,11 @@ class HybridLLSConfig(HybridSimulationCommonConfig):
     )
     ranks: List[int] = field(default_factory=lambda: [1, 2, 4])
     # rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 66 + 6, 6))
-    rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 132 + 6, 6))
+    # rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 132 + 6, 6))
+    rb_counts: List[int] = field(default_factory=lambda: [6, 66, 132])
     granularities: List[Union[int, str]] = field(
-        default_factory=lambda: ["Narrowband", "Subband", "Wideband"]
+        # default_factory=lambda: ["Narrowband", "Subband", "Wideband"]
+        default_factory=lambda: ["Subband", "Wideband"]
     )
 
     # Physics Parameters (Inherited)

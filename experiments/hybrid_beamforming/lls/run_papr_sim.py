@@ -71,7 +71,8 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
     )
 
     # Choose a representative RB count for CCFD summary plot (e.g., middle of the sweep)
-    representative_rb = config.rb_counts[len(config.rb_counts) // 2]
+    # representative_rb = config.rb_counts[len(config.rb_counts) // 2]
+    representative_rb = config.rb_counts
 
     for sc in tqdm(scenarios):
         # Scenario identifier for filenames
@@ -86,71 +87,60 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
             gran_str = "GWB"
         scenario_id = f"{sc['waveform']}_{sc['modulation']}_R{sc['rank']}_RB{sc['num_rb']}_{gran_str}"
 
-        # Instantiate Model
-        # Use antenna count from shared config, ensuring it's at least as large as the rank
-        num_tx = max(sc["rank"], config.num_ut_ant)
+        # try:
+        model = PUSCHCommunicationModel(
+            config=config,
+            num_layers=sc["rank"],
+            enable_transform_precoding=sc["transform_precoding"],
+            precoding_granularity=sc["granularity"],
+        )
 
-        try:
-            model = PUSCHCommunicationModel(
-                carrier_frequency=config.carrier_frequency,
-                subcarrier_spacing=config.resource_grid.subcarrier_spacing,
-                num_tx_ant=num_tx,
-                num_rx_ant=num_tx,
-                num_layers=sc["rank"],
-                num_rb=sc["num_rb"],
-                enable_transform_precoding=sc["transform_precoding"],
-                mcs_index=sc["mcs_index"],
-                precoding_granularity=sc["granularity"],
-                rbg_size_rb=config.rbg_size_rb,
-                papr_oversampling_factor=config.papr_oversampling_factor,
-            )
+        papr_values = []
 
-            papr_values = []
+        for i in range(current_num_batches):
+            # Generate signal
+            x = model.transmitter(batch_size)
 
-            for i in range(current_num_batches):
-                # Generate signal
-                x = model.transmitter(batch_size)
+            # Save a sample waveform (only for a subset to avoid flooding disk)
+            if i == 0 and sc["num_rb"] in representative_rb:
+                plot_individual_waveform(x, scenario_id, results_dir)
 
-                # Save a sample waveform (only for a subset to avoid flooding disk)
-                if i == 0 and sc["num_rb"] == representative_rb and sc["rank"] == 1:
-                    plot_individual_waveform(x, scenario_id, results_dir)
+            # Compute PAPR
+            papr_db_batch = model.compute_papr(x)
+            papr_values.extend(papr_db_batch.numpy().flatten())
 
-                # Compute PAPR
-                papr_db_batch = model.compute_papr(x)
-                papr_values.extend(papr_db_batch.numpy().flatten())
+        # Store for global comparison (Selective labels to avoid cluttered legend)
+        if sc["num_rb"] in representative_rb:
+            wave_mod_key = f"{sc['waveform']} ({sc['modulation']}) {gran_str}"
+            if wave_mod_key not in all_papr_data:
+                all_papr_data[wave_mod_key] = []
+            all_papr_data[wave_mod_key].extend(papr_values)
 
-            # Store for global comparison (Selective labels to avoid cluttered legend)
-            if sc["num_rb"] == representative_rb and sc["rank"] == 1:
-                wave_mod_key = f"{sc['waveform']} ({sc['modulation']}) {gran_str}"
-                if wave_mod_key not in all_papr_data:
-                    all_papr_data[wave_mod_key] = []
-                all_papr_data[wave_mod_key].extend(papr_values)
+        # Compute and Plot individual CCDF (Selective)
+        papr_sorted = np.sort(papr_values)
+        if sc["num_rb"] in representative_rb:
+            plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
 
-            # Compute and Plot individual CCDF (Selective)
-            papr_sorted = np.sort(papr_values)
-            if sc["num_rb"] == representative_rb:
-                plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
+        # Compute 99.9% CCDF
+        idx = int(0.999 * len(papr_sorted))
+        papr_999 = papr_sorted[idx]
 
-            # Compute 99.9% CCDF
-            idx = int(0.999 * len(papr_sorted))
-            papr_999 = papr_sorted[idx]
+        # Record result
+        res = sc.copy()
+        res["papr_db_99.9"] = papr_999
+        results.append(res)
 
-            # Record result
-            res = sc.copy()
-            res["papr_db_99.9"] = papr_999
-            results.append(res)
+        # --- Memory Management ---
+        # Important for large sweeps on limited VRAM
+        del model
+        tf.keras.backend.clear_session()
+        import gc
 
-            # --- Memory Management ---
-            # Important for large sweeps on limited VRAM
-            del model
-            tf.keras.backend.clear_session()
-            import gc
+        gc.collect()
 
-            gc.collect()
-
-        except Exception as e:
-            print(f"Error in scenario {sc}: {e}")
-            tf.keras.backend.clear_session()
+        # except Exception as e:
+        #     print(f"Error in scenario {sc}: {e}")
+        #     tf.keras.backend.clear_session()
 
     # Plot Comparison CCDF (Cleaned up)
     plot_summary_ccdf(all_papr_data, results_dir)

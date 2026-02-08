@@ -21,39 +21,28 @@ class PUSCHCommunicationModel(tf.keras.Model):
 
     def __init__(
         self,
-        carrier_frequency=3.5e9,
-        subcarrier_spacing=30e3,
-        num_tx_ant=4,
-        num_rx_ant=4,
-        num_layers=1,
-        num_rb=50,
-        domain="time",  # "time" or "freq"
-        enable_transform_precoding=False,
-        mcs_index=16,
-        precoding_granularity=None,  # None, "Wideband", or int (in RBs)
-        rbg_size_rb=6,
-        papr_oversampling_factor=4,
+        config,
+        num_layers,
+        enable_transform_precoding,
+        precoding_granularity,
+        domain="time",
     ):
         super().__init__()
 
         # 1. Configuration
-        carrier_config = CarrierConfig()
-        carrier_config.subcarrier_spacing = subcarrier_spacing / 1e3
-        carrier_config.carrier_frequency = carrier_frequency
-        carrier_config.n_size_grid = num_rb  # Set bandwidth by RB count
-
-        self.pusch_config = PUSCHConfig(carrier=carrier_config)
+        self.pusch_config = PUSCHConfig(
+            carrier=config.carrier_config, tb_config=config.tb_config
+        )
         self.pusch_config.output_domain = domain
 
         # Adjust config based on inputs
         # In Sionna NR, num_antenna_ports must match num_layers for PUSCHConfig
         # when using it to map layers to ports.
         # We will handle precoding (port to antenna) in our wrapper if needed.
-        self.pusch_config.num_antenna_ports = num_layers
+        self.pusch_config.num_antenna_ports = config.num_ut_ant
         self.pusch_config.num_layers = num_layers
-
-        # Modulation / MCS
-        self.pusch_config.mcs_index = mcs_index
+        self.pusch_config.precoding = "codebook"
+        self.pusch_config.tpmi = 1
 
         # Transform Precoding (DFT-s-OFDM)
         self.pusch_config.transform_precoding = False
@@ -64,15 +53,15 @@ class PUSCHCommunicationModel(tf.keras.Model):
             self.pusch_config,
             enable_transform_precoding=self.manual_transform_precoding,
             output_domain=domain,
-            num_tx_ant=num_tx_ant,
+            num_tx_ant=config.num_ut_ant,
             precoding_granularity=precoding_granularity,
-            rbg_size_rb=rbg_size_rb,
+            rbg_size_rb=config.rbg_size_rb,
         )
 
         # 4. Receiver
         self.receiver = PUSCHReceiver(self.transmitter)
 
-        self.papr_oversampling_factor = papr_oversampling_factor
+        self.papr_oversampling_factor = config.papr_oversampling_factor
 
     def call(self, batch_size=1):
         """
@@ -105,13 +94,18 @@ class PUSCHCommunicationModel(tf.keras.Model):
         """
         return self.transmitter(batch_size)
 
-    def compute_papr(self, x):
+    def compute_papr(self, x, exclude_dmrs=False):
         """
         Computes PAPR of time-domain signal x.
         Applies oversampling to get accurate Peak.
+
+        Args:
+            x: Time domain signal [batch, tx_ant, time_samples]
+            exclude_dmrs: If True, excludes time samples corresponding to DMRS symbols.
         """
         # x shape: [batch, tx_ant, time_samples]
 
+        # 1. Apply Oversampling (Global FFT interpolation)
         if self.papr_oversampling_factor > 1:
             # Oversampling via FFT -> Zero Pad -> IFFT
 
@@ -141,16 +135,75 @@ class PUSCHCommunicationModel(tf.keras.Model):
             x_oversampled = tf.signal.ifft(x_f_padded)
 
             # Scale adjustment? IFFT(Pad(FFT(x))) preserves energy/power?
-            # Parseval: Energy is sum(|x|^2).
-            # With padding, energy might change.
-            # We care about Ratio (Peak/Avg), so global scaling cancels out?
-            # Max power / Mean power.
-            # If we scale signal by K, both Peak and Mean scale by K^2. PAPR invariant.
-            # So scaling doesn't matter for PAPR.
+            # As noted before, scaling cancels out for PAPR.
 
             signal_for_papr = x_oversampled
+
+            # Update scaling factor for indices
+            scale_factor = self.papr_oversampling_factor
         else:
             signal_for_papr = x
+            scale_factor = 1
+
+        # 2. Exclude DMRS symbols if requested
+        if exclude_dmrs:
+            # Get DMRS indices
+            dmrs_indices = self.pusch_config.dmrs_symbol_indices
+
+            # Get Symbol Structure
+            rg = self.transmitter.resource_grid
+            fft_size = rg.fft_size
+            cp_len = rg.cyclic_prefix_length
+            num_symbols = rg.num_ofdm_symbols
+
+            # Handle cp_len (scalar or list)
+            # In Sionna ResourceGrid, it's typically int, but we handle list just in case
+            # if we can access checking it, but ResourceGrid forces int.
+            # However, let's assume it could be iterable if some custom config.
+            if isinstance(cp_len, int):
+                cp_lens = [cp_len] * num_symbols
+            else:
+                # Assume iterable
+                cp_lens = list(cp_len)
+
+            filtered_samples = []
+
+            current_idx = 0
+
+            # Iterate through symbols in the time domain
+            # We need to slice "signal_for_papr" which is scaled by 'scale_factor'
+            # The indices in original 'x' are:
+            # Symbol 0: [0 : fft + cp[0]]
+            # Symbol 1: [end_0 : end_0 + fft + cp[1]]
+            # etc.
+            # In 'signal_for_papr', these are multiplied by 'scale_factor'.
+
+            # We slice along the last axis (time)
+            # signal_for_papr shape: [batch, tx, time]
+
+            for i in range(num_symbols):
+                sym_len_orig = fft_size + cp_lens[i]
+                sym_len_over = sym_len_orig * scale_factor
+
+                start_idx = current_idx
+                end_idx = current_idx + sym_len_over
+
+                # Verify we don't exceed bounds (due to standard rounding?)
+                # integer math should be exact here if strict integer oversampling.
+
+                if i not in dmrs_indices:
+                    # Keep this symbol (Data)
+                    slice_data = signal_for_papr[..., start_idx:end_idx]
+                    filtered_samples.append(slice_data)
+
+                current_idx = end_idx
+
+            if not filtered_samples:
+                # Fallback if everything is DMRS (unlikely)
+                print("Warning: All symbols excluded as DMRS? Using full signal.")
+            else:
+                # Concatenate along time axis
+                signal_for_papr = tf.concat(filtered_samples, axis=-1)
 
         # Compute PAPR
         # Power

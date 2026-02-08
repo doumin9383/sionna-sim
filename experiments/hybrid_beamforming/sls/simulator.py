@@ -116,14 +116,21 @@ class HybridSystemSimulator(Block):
         # Generate multicell topology
         self._setup_topology(config.num_rings, min_bs_ut_dist, max_bs_ut_dist)
 
+        if self.direction == "uplink":
+            num_tx_ports = config.ut_num_rf_chains
+            num_rx_ports = config.bs_num_rf_chains
+        else:
+            num_tx_ports = config.bs_num_rf_chains
+            num_rx_ports = config.ut_num_rf_chains
+
         # Instantiate the Hybrid Channel Interface
         self.channel_interface = HybridChannelInterface(
             channel_model=self.channel_model,
             resource_grid=config.resource_grid,
-            tx_array=config.bs_array,  # Mapping bs_array to tx_array
+            tx_array=config.bs_array,  # Mapping bs_array to tx_array (Seems wrong naming in interface? Wait)
             rx_array=config.ut_array,  # Mapping ut_array to rx_array
-            num_tx_ports=config.bs_array.num_ant,
-            num_rx_ports=config.ut_array.num_ant,
+            num_tx_ports=num_tx_ports,
+            num_rx_ports=num_rx_ports,
             precision=self.precision,
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
