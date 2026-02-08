@@ -40,9 +40,6 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         is_dft_s = wf["is_dft_s"]
         for mod_name, mcs_idx in config.modulations.items():
             for rank in config.ranks:
-                # DFT-s-OFDM is usually Rank 1
-                if is_dft_s and rank > 1:
-                    continue
                 for num_rb in config.rb_counts:
                     for gran in config.granularities:
                         scenarios.append(

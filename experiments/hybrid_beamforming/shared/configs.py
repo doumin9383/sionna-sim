@@ -8,16 +8,16 @@ class HybridSimulationCommonConfig:
     """Common configuration for both SLS and LLS"""
 
     # RF/Frequency
-    carrier_frequency: float = 3.5e9
-    subcarrier_spacing: float = 30e3
+    carrier_frequency: float = 7e9
+    subcarrier_spacing: float = 60e3
 
     # Resource Grid Default
     # 共通のグリッド設定があればここに
-    resource_grid: ResourceGridConfig = field(
-        default_factory=lambda: ResourceGridConfig(
-            num_ofdm_symbols=14,
-            fft_size=64,
-            subcarrier_spacing=30e3,
-            cyclic_prefix_length=6,
-        )
-    )
+    # resource_grid: ResourceGridConfig = field(
+    #     default_factory=lambda: ResourceGridConfig(
+    #         num_ofdm_symbols=14,
+    #         fft_size=64,
+    #         subcarrier_spacing=30e3,
+    #         cyclic_prefix_length=6,
+    #     )
+    # )

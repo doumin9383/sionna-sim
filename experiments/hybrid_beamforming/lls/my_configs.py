@@ -3,6 +3,8 @@ from typing import List, Tuple, Optional, Any, Dict, Union
 from libs.my_configs import ResourceGridConfig, PlanarArrayConfig
 from experiments.hybrid_beamforming.shared.configs import HybridSimulationCommonConfig
 
+import numpy as np
+
 
 @dataclass
 class HybridLLSConfig(HybridSimulationCommonConfig):
@@ -11,6 +13,7 @@ class HybridLLSConfig(HybridSimulationCommonConfig):
     # Simulation Control
     batch_size: int = 100
     num_batches: int = 10
+    min_total_samples: int = 10000
 
     # Sweep Parameters
     modulations: Dict[str, int] = field(
@@ -23,9 +26,10 @@ class HybridLLSConfig(HybridSimulationCommonConfig):
         ]
     )
     ranks: List[int] = field(default_factory=lambda: [1, 2, 4])
-    rb_counts: List[int] = field(default_factory=lambda: [1, 20, 100])
+    # rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 66 + 6, 6))
+    rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 132 + 6, 6))
     granularities: List[Union[int, str]] = field(
-        default_factory=lambda: [2, "Wideband"]
+        default_factory=lambda: ["Narrowband", "Subband", "Wideband"]
     )
 
     # Physics Parameters (Inherited)

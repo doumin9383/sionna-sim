@@ -49,8 +49,8 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     ut_array: Any = None  # sionna.phy.channel.tr38901.PanelArray
 
     # Scenario
-    scenario: str = "uma"  # "umi", "uma", "rma"
-    direction: str = "downlink"  # "uplink", "downlink"
+    scenario: str = "umi"  # "umi", "uma", "rma"
+    direction: str = "uplink"  # "uplink", "downlink"
 
     # Mobility/Link Adaptation
     coherence_time: int = 10  # slots
