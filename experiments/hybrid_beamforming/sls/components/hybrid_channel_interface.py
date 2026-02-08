@@ -17,8 +17,6 @@ class HybridChannelInterface(Block):
         rx_array,
         num_tx_ports,
         num_rx_ports,
-        num_tx_ports,
-        num_rx_ports,
         precision=None,
         use_rbg_granularity=False,
         rbg_size_sc=1,
@@ -36,8 +34,6 @@ class HybridChannelInterface(Block):
             resource_grid=resource_grid,
             tx_array=tx_array,
             rx_array=rx_array,
-            num_tx_ports=num_tx_ports,
-            num_rx_ports=num_rx_ports,
             num_tx_ports=num_tx_ports,
             num_rx_ports=num_rx_ports,
             normalize_channel=True,  # Ensure consistent normalization
