@@ -125,6 +125,7 @@ class HybridSystemSimulator(Block):
             precision=self.precision,
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
+            neighbor_indices=self.neighbor_indices,
         )
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
@@ -196,7 +197,18 @@ class HybridSystemSimulator(Block):
             precision=self.precision,
         )
 
-        # Set topology in channel model
+        # 1. Calculate distances [batch, num_ut, num_bs]
+        # ut_loc: [batch, num_ut, 3], bs_loc: [batch, num_bs, 3]
+        diff = tf.expand_dims(self.ut_loc, axis=2) - tf.expand_dims(self.bs_loc, axis=1)
+        dist = tf.norm(diff, axis=-1)
+
+        # 2. Select top K neighbors based on distance
+        # Note: smallest distance = largest -dist
+        _, neighbor_indices = tf.math.top_k(-dist, k=self.config.num_neighbors)
+        # neighbor_indices shape: [batch, num_ut, num_neighbors]
+        self.neighbor_indices = neighbor_indices
+
+        # 3. Set topology in channel model
         self.channel_model.set_topology(
             self.ut_loc,
             self.bs_loc,
@@ -223,18 +235,25 @@ class HybridSystemSimulator(Block):
         # Simulate a slot #
         # --------------- #
         def simulate_slot(slot, hist):
-            # 1. Get Full Channel Information (For Interference/Evaluation)
-            # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
-            h, _, u_all, _ = self.channel_interface.get_full_channel_info(
-                self.batch_size
+            # 1. Get Channel Information
+            # Use a single channel snapshot per slot for SINR calculation
+            h_prec = self.channel_interface.get_precoding_channel(
+                self.precoding_granularity,
+                self.rbg_size_sc,
+                batch_size=self.batch_size,
+                ut_loc=self.ut_loc,
+                bs_loc=self.bs_loc,
+                ut_orient=self.ut_orientations,
+                bs_orient=self.bs_orientations,
             )
 
-            # 2. Get Precoding Channel (For Beamforming Calculation)
-            # h_prec: [batch, num_ut, num_bs, ofdm, num_blocks, rx_ports, tx_ports]
-            h_prec = self.channel_interface.get_precoding_channel(
+            # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
+            h, _, u_all, _ = self.channel_interface.get_full_channel_info(
                 self.batch_size,
-                granularity=self.precoding_granularity,
-                rbg_size_sc=self.rbg_size_sc,
+                ut_loc=self.ut_loc,
+                bs_loc=self.bs_loc,
+                ut_orient=self.ut_orientations,
+                bs_orient=self.bs_orientations,
             )
 
             # Compute SVD on Coarse Channel
@@ -263,57 +282,66 @@ class HybridSystemSimulator(Block):
             )
 
             # 3. Extract Serving Precoders and Combiners
-            serving_bs_idx_batched = tf.broadcast_to(
-                serving_bs_idx, [self.batch_size, self.num_ut]
+            # Find the index of the serving BS within the neighbor list for each UT
+            serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)
+            serving_neighbor_mask = tf.equal(
+                self.neighbor_indices,
+                tf.reshape(serving_bs_idx_i32, [1, self.num_ut, 1]),
             )
+            # Find the index in the neighbor dimension (we assume it's always found)
+            serving_link_idx = tf.argmax(
+                tf.cast(serving_neighbor_mask, tf.int32), axis=-1
+            )
+            # serving_link_idx shape: [batch, ut]
 
-            # Extract serving U (Ideal) and V (Granular)
-            # u_serv: [batch, num_ut, ofdm, sc, rx_ports, rx_ports] (Full resolution)
-            # v_serv: [batch, num_ut, ofdm, sc, tx_ports, tx_ports] (Expanded granular)
-            u_serv = tf.gather(u_all, serving_bs_idx_batched, axis=2, batch_dims=2)
-            v_serv = tf.gather(v_expanded, serving_bs_idx_batched, axis=2, batch_dims=2)
+            # u_all and v_expanded are already [batch, ut, neighbors, ofdm, sc, ...]
+            u_serv = tf.gather(u_all, serving_link_idx, axis=2, batch_dims=2)
+            # v_serv: Serving BS precoder.
+            # Note: v_expanded also has neighbor dimension if derived from h_prec.
+            v_serv = tf.gather(v_expanded, serving_link_idx, axis=2, batch_dims=2)
 
-            # 4. Calculate Interference (The "Box" for future extensions)
-            # BS_precoders: Assuming UT i is served by BS i (for num_ut_per_sector=1).
-            bs_precoders = v_serv
+            # 4. Calculate Interference
+            # neighbor_precoders: use the expanded ones
+            neighbor_precoders = v_expanded
 
-            # a. UT i's combiner applied to all BS links: H_u = U_i^H * H_ij
-            # [batch, ut, bs, ofdm, sc, streams, tx_p]
+            # a. UT i's combiner applied to all neighbor links: H_u = U_i^H * H_ij
             h_u = tf.einsum("buosrp,bujosrt->bujospt", tf.math.conj(u_serv), h)
 
-            # b. BS j's precoder applied: H_eff = H_u * V_j
-            # [batch, ut, bs, ofdm, sc, streams_i, streams_j]
-            h_eff = tf.einsum("bujospt,bjostq->bujospq", h_u, bs_precoders)
+            # b. Neighbor BS's precoder applied: H_eff = H_u * V_j
+            h_eff = tf.einsum("bujospt,bujostq->bujospq", h_u, neighbor_precoders)
 
             # c. Interference summation
-            # Interference power to user i: sum over j != serving_bs_idx[i] of |h_eff_ij|^2
-            interference_per_bs = tf.reduce_sum(tf.square(tf.abs(h_eff)), axis=-1)
+            interference_per_neighbor = tf.reduce_sum(tf.square(tf.abs(h_eff)), axis=-1)
 
-            # Mask out serving link
-            mask = tf.one_hot(serving_bs_idx, depth=self.num_bs)
-            mask = tf.reshape(mask, [1, self.num_ut, self.num_bs, 1, 1, 1])
+            # Mask out serving link within the neighbor list
+            # We already have serving_neighbor_mask
+            serving_mask = tf.cast(serving_neighbor_mask, self.rdtype)
+            serving_mask = tf.reshape(
+                serving_mask,
+                [self.batch_size, self.num_ut, self.config.num_neighbors, 1, 1, 1],
+            )
 
             interference_total = tf.reduce_sum(
-                interference_per_bs * (1.0 - mask), axis=2
+                interference_per_neighbor * (1.0 - serving_mask), axis=2
             )
 
             # Effective Noise per stream: N0 + Interference
             noise_plus_interference = self.no + interference_total
 
             # Calculate Effective Channel Gains (s_serv) from h_eff
-            # This captures beamforming mismatch due to granularity
-            # h_eff: [batch, ut, bs, ofdm, sc, stream, stream] -> Gather serving BS
-            h_eff_serv = tf.gather(h_eff, serving_bs_idx_batched, axis=2, batch_dims=2)
+            # h_eff_serv: [batch, ut, ofdm, sc, stream, stream]
+            h_eff_serv = tf.gather(h_eff, serving_link_idx, axis=2, batch_dims=2)
             # Take diagonal (signal power on streams)
             s_serv = tf.abs(tf.linalg.diag_part(h_eff_serv))
 
             # 4. Power Control & Link Adaptation
             # a. Calculate Path Loss (Simple Euclidean distance based approximation for PC)
-            # ut_loc: [batch, num_ut, 3]
-            # serving_bs_idx: [batch, num_ut]
-            # bs_loc: [batch, num_bs, 3]
+            # Find serving BS location
+            serving_bs_idx_batched = tf.broadcast_to(
+                serving_bs_idx_i32, [self.batch_size, self.num_ut]
+            )
             serving_bs_loc = tf.gather(
-                self.bs_loc, serving_bs_idx_batched, batch_dims=1
+                self.bs_loc, serving_bs_idx_batched, axis=1, batch_dims=1
             )
             dist = tf.norm(self.ut_loc - serving_bs_loc, axis=-1)  # [batch, num_ut]
 
@@ -400,7 +428,11 @@ class HybridSystemSimulator(Block):
             # We need to reshape [batch, num_ut] -> [batch, num_bs, num_ut_per_sector]
 
             def match_hist_shape(tensor):
-                # tensor: [batch, num_ut]
+                # tensor: [batch, num_ut, ...]
+                # Reduce extra dimensions (ofdm, sc, streams) by averaging
+                rank = tensor.shape.rank
+                if rank is not None and rank > 2:
+                    tensor = tf.reduce_mean(tensor, axis=list(range(2, rank)))
                 return tf.reshape(
                     tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector]
                 )

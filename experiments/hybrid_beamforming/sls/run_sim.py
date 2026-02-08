@@ -79,6 +79,7 @@ def run_test():
         scenario="uma",
         direction="downlink",
         coherence_time=10,
+        num_neighbors=4,  # Added as per instruction
     )
 
     # 4. Instantiate Simulator

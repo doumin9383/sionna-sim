@@ -1,10 +1,11 @@
 services:
   sionna:
-    image: nvcr.io/nvidia/tensorflow:24.10-tf2-py3
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: sionna-worker
-    # Auto-install libraries on startup
-    command: >
-      bash -c "pip install sionna matplotlib pandas scipy && tail -f /dev/null"
+    # No longer need pip install in command as it is in Dockerfile
+    command: tail -f /dev/null
     working_dir: /mnt/nas_data/sionna-sim
     volumes:
       - /mnt/nas_data:/mnt/nas_data
