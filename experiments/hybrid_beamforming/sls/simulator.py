@@ -149,13 +149,7 @@ class HybridSystemSimulator(Block):
         )
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
-        self.phy_abstraction = MCSLinkAdaptation()
-        # self.phy_abstraction = WaterFillingLinkAdaptation(
-        #     resource_grid=self.resource_grid,
-        #     transmitter=None,
-        #     num_streams_per_tx=self.num_streams_per_ut,
-        #     precision=self.precision,
-        # )
+        # self.phy_abstraction was removed. We calculate SINR directly in call().
 
         # Instantiate SLS components
         self.mpr_model = MPRModel(csv_path=config.mpr_table_path)
@@ -464,10 +458,15 @@ class HybridSystemSimulator(Block):
                 total_power, [self.batch_size, self.num_ut, 1, 1, 1]
             )
 
-            # d. Physics Abstraction (Water Filling -> SINR)
-            p_alloc, sinr = self.phy_abstraction.call(
-                s_serv, noise_plus_interference, total_power_expanded
-            )
+            # d. Physics Abstraction (Simple Equal Power Allocation -> SINR)
+            # self.phy_abstraction was removed as it lacked the call method.
+            # Calculate Power per stream
+            num_streams = tf.shape(s_serv)[-1]
+            p_alloc = total_power_expanded / tf.cast(num_streams, self.rdtype)
+
+            # Calculate SINR: P * |h|^2 / (N0 + I)
+            # s_serv is the channel gain magnitude
+            sinr = (p_alloc * tf.square(s_serv)) / noise_plus_interference
 
             # e. MCS Selection & Throughput
             # MCS Adapter expects SINR in dB

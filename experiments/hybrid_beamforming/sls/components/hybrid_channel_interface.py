@@ -223,6 +223,13 @@ class HybridChannelInterface(Block):
         # [Batch, Total_UT, Neighbors, RxP, TxP, S, C]
         h_neighbor = tf.concat(h_chunks, axis=1)
 
+        # Transpose to [Batch, Total_UT, Neighbors, S, C, RxP, TxP]
+        # to match simulator expectations [Batch, U, Neighbors, Time, SC, RxP, TxP]
+        # S=Time, C=Subcarrier (from Sionna GenerateOFDMChannel convention [..., Time, Subcarrier])
+        # Indices: 0=Batch, 1=U, 2=Neighbors, 3=RxP, 4=TxP, 5=Time, 6=SC
+        # Target: 0, 1, 2, 5, 6, 3, 4
+        h_neighbor = tf.transpose(h_neighbor, perm=[0, 1, 2, 5, 6, 3, 4])
+
         s, u, v = tf.linalg.svd(h_neighbor)
         return h_neighbor, s, u, v
 
@@ -465,7 +472,7 @@ class HybridChannelInterface(Block):
                 # So we can ignore passing them there for now unless needed.
             )[0]
 
-        return self.get_full_channel_info(
+        h = self.get_full_channel_info(
             batch_size,
             ut_loc,
             bs_loc,
@@ -475,3 +482,10 @@ class HybridChannelInterface(Block):
             ut_velocities=ut_velocities,
             in_state=in_state,
         )[0]
+
+        if granularity == "Wideband":
+            # Average over subcarriers (Axis 4 after transpose fix)
+            # h shape: [Batch, U, Neighbors, Time, SC, RxP, TxP]
+            h = tf.reduce_mean(h, axis=4, keepdims=True)
+
+        return h
