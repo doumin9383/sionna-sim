@@ -63,9 +63,15 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
     print(f"Starting PAPR Simulation with {len(scenarios)} scenarios...")
 
     # For large sweeps, reduce batches if needed
-    current_num_batches = num_batches
-    if len(scenarios) > 50:
-        current_num_batches = 5  # Faster sweep for large scenario count
+    min_total_samples = 10000
+    # Calculate required batches to meet minimum samples
+    required_batches = int(np.ceil(min_total_samples / batch_size))
+    # Use the larger of config.num_batches or required_batches
+    current_num_batches = max(num_batches, required_batches)
+
+    print(
+        f"Targeting {min_total_samples} samples. Batch size {batch_size} -> running {current_num_batches} batches."
+    )
 
     for sc in tqdm(scenarios):
         # Scenario identifier for filenames

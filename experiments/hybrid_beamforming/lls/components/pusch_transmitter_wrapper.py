@@ -91,7 +91,9 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         num_subcarriers = tf.shape(x_rg)[3]
 
         # Determine granularity in subcarriers
-        if (
+        if self.precoding_granularity == "Narrowband":
+            g_sc = 1
+        elif (
             self.precoding_granularity == "Wideband"
             or self.precoding_granularity is None
         ):
