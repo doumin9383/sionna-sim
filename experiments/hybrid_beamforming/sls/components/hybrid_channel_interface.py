@@ -142,11 +142,12 @@ class HybridChannelInterface(Block):
             # 1. Map physical positions/orientations to virtual BSs for this batch
             # bs_loc: [batch, num_bs, 3]
             # Gather BSs relevant to these UTs
+            # Use batch_dims=1 to gather per-batch-item
             bs_loc_mapped = tf.gather(
-                bs_loc, neighbor_indices_batch, axis=1, batch_dims=0
+                bs_loc, neighbor_indices_batch, axis=1, batch_dims=1
             )
             bs_orient_mapped = tf.gather(
-                bs_orient, neighbor_indices_batch, axis=1, batch_dims=0
+                bs_orient, neighbor_indices_batch, axis=1, batch_dims=1
             )
 
             # Flatten neighbors for channel model: [batch, current_batch_size * num_neighbors, 3]
@@ -437,6 +438,8 @@ class HybridChannelInterface(Block):
         ut_orient,
         bs_orient,
         neighbor_indices=None,
+        ut_velocities=None,
+        in_state=None,
     ):
         """
         Returns the channel matrix to be used for precoding calculation.
@@ -454,6 +457,12 @@ class HybridChannelInterface(Block):
                 ut_orient,
                 bs_orient,
                 neighbor_indices=effective_neighbor_indices,
+                # External loader might not use ut_velocities yet, but for consistency we should check if it needs update.
+                # get_external_neighbor_channel_info definition:
+                # def get_external_neighbor_channel_info(..., neighbor_indices=None):
+                # It does NOT accept ut_velocities in my previous update.
+                # But external loader (ray tracing) doesn't use velocities usually for paths, or it extracts from Zarr.
+                # So we can ignore passing them there for now unless needed.
             )[0]
 
         return self.get_full_channel_info(
@@ -463,4 +472,6 @@ class HybridChannelInterface(Block):
             ut_orient,
             bs_orient,
             neighbor_indices=effective_neighbor_indices,
+            ut_velocities=ut_velocities,
+            in_state=in_state,
         )[0]

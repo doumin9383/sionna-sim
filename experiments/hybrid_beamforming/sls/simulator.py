@@ -286,6 +286,8 @@ class HybridSystemSimulator(Block):
                 ut_orient=self.ut_orientations,
                 bs_orient=self.bs_orientations,
                 neighbor_indices=self.neighbor_indices,
+                ut_velocities=self.ut_velocities,
+                in_state=self.in_state,
             )
 
             # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
