@@ -21,6 +21,7 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     num_slots: int = 1
     precoding_granularity: str = "Narrowband"  # "Narrowband", "Subband", "Wideband"
     rbg_size_rb: int = 0  # if 0, ignored or auto-set
+    use_rbg_granularity: bool = False  # If True, calculate channel only at RBG centers
 
     # RF/Frequency (Inherited from HybridSimulationCommonConfig)
     # carrier_frequency: float = 3.5e9

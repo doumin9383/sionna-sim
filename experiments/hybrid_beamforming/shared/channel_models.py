@@ -165,7 +165,13 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
     """
 
     def __init__(
-        self, channel_model, resource_grid, normalize_channel=True, precision=None
+        self,
+        channel_model,
+        resource_grid,
+        normalize_channel=True,
+        precision=None,
+        use_rbg_granularity=False,
+        rbg_size=1,
     ):
         super().__init__(
             channel_model=channel_model,
@@ -175,12 +181,20 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         )
         self._channel_model = channel_model
         self._resource_grid = resource_grid
+        self.use_rbg_granularity = use_rbg_granularity
+        self.rbg_size = rbg_size
 
         # Pre-compute all frequencies and RBG centers
         self._all_frequencies = subcarrier_frequencies(
             resource_grid.fft_size, resource_grid.subcarrier_spacing
         )
         # TODO: Define RBG centers if we want strict sampling only at centers
+
+    def __call__(self, batch_size=None):
+        if self.use_rbg_granularity:
+            return self.get_rbg_channel(batch_size, self.rbg_size)
+        else:
+            return super().__call__(batch_size)
 
     def get_paths(self, batch_size=None):
         """
@@ -246,12 +260,16 @@ class HybridOFDMChannel(ChunkedOFDMChannel):
         num_rx_ports,
         normalize_channel=True,
         precision=None,
+        use_rbg_granularity=False,
+        rbg_size=1,
     ):
         super().__init__(
             channel_model=channel_model,
             resource_grid=resource_grid,
             normalize_channel=normalize_channel,
             precision=precision,
+            use_rbg_granularity=use_rbg_granularity,
+            rbg_size=rbg_size,
         )
 
         self.tx_array = tx_array

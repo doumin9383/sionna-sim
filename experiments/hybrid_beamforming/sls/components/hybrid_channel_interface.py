@@ -17,12 +17,18 @@ class HybridChannelInterface(Block):
         rx_array,
         num_tx_ports,
         num_rx_ports,
+        num_tx_ports,
+        num_rx_ports,
         precision=None,
+        use_rbg_granularity=False,
+        rbg_size_sc=1,
     ):
         super().__init__(precision=precision)
 
         self.channel_model = channel_model
         self.resource_grid = resource_grid
+        self.use_rbg_granularity = use_rbg_granularity
+        self.rbg_size_sc = rbg_size_sc
 
         # Instantiate the HybridOFDMChannel
         self.hybrid_channel = HybridOFDMChannel(
@@ -32,7 +38,11 @@ class HybridChannelInterface(Block):
             rx_array=rx_array,
             num_tx_ports=num_tx_ports,
             num_rx_ports=num_rx_ports,
+            num_tx_ports=num_tx_ports,
+            num_rx_ports=num_rx_ports,
             normalize_channel=True,  # Ensure consistent normalization
+            use_rbg_granularity=use_rbg_granularity,
+            rbg_size=rbg_size_sc,
         )
 
     def set_analog_weights(self, w_rf, a_rf):
@@ -42,10 +52,11 @@ class HybridChannelInterface(Block):
     def get_full_channel_info(self, batch_size):
         """
         Returns full SVD results and the underlying port channel.
-        For backwards compatibility/standard usage.
+        If use_rbg_granularity is True, returns channel at RBG centers.
         """
         h_port = self.hybrid_channel(batch_size)
         # Permute: [batch, num_rx, num_tx, num_ofdm, num_sc, num_rx_ports, num_tx_ports]
+        # Note: if use_rbg_granularity is True, num_sc will be num_rbgs
         h_permuted = tf.transpose(h_port, perm=[0, 1, 3, 5, 6, 2, 4])
         s, u, v = tf.linalg.svd(h_permuted)
         return h_permuted, s, u, v
