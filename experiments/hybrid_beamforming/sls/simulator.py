@@ -357,7 +357,10 @@ class HybridSystemSimulator(Block):
                 powers_dbm = self.external_loader.get_power_map(self.ut_mesh_indices)
                 # For interference, we use powers directly later,
                 # but path loss to serving cell is needed for Power Control
-                serving_bs_idx_expand = tf.expand_dims(serving_bs_idx_i32, axis=-1)
+                serving_bs_idx_batched = tf.broadcast_to(
+                    serving_bs_idx_i32, [self.batch_size, self.num_ut]
+                )
+                serving_bs_idx_expand = tf.expand_dims(serving_bs_idx_batched, axis=-1)
                 serving_power = tf.gather(
                     powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
                 )
@@ -450,31 +453,12 @@ class HybridSystemSimulator(Block):
                 rank = tensor.shape.rank
                 if rank is not None and rank > 2:
                     tensor = tf.reduce_mean(tensor, axis=list(range(2, rank)))
+
                 return tf.reshape(
                     tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector]
                 )
 
-            # Average MCS index over streams/subcarriers if vectorized return is [..., streams]
-            # mcs_idx from get_throughput_vectorized has shape of sinr_db: [batch, num_ut, streams/rbg]
-            # We want one MCS per user (or per stream?). history['mcs_index'] is [batch, num_bs, ut_per_sector] i.e. per user.
-            # Take mode or mean? MCS is int. Let's take Mean for now or Max.
-            # Or if sinr_db was already per user?
-            # sinr_db passed was:
-            # sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
-            # sinr comes from waterfilling: [batch, num_ut, 1, 1, num_streams] (broadcasted from total_power)
-            # Wait, phy_abstraction.call returns p_alloc, sinr.
-            # p_alloc [..., num_streams], sinr [..., num_streams]
-            # so sinr_db is [batch, num_ut, 1, 1, num_streams] (squeezed?)
-            # Actually let's check shapes in simulator.
-            # total_power_expanded: [batch, num_ut, 1, 1, 1]
-            # noise: [batch, num_ut, 1, 1, streams] (broadcast) -> Actually noise is scalar/tensor?
-            # noise_plus_interference was [batch, num_ut]. NO.
-            # noise_plus_interference = self.no + interference_total
-            # interference_total: [batch, num_ut, 1, 1, streams] (reduced over BS interferences)
-            # So sinr has stream dim.
-            # mcs_idx will have stream dim.
-            # We can log the average MCS or max MCS? Or just Stream 0?
-            # Let's take the mean MCS (casted to float for logging).
+            # Average MCS index over streams/subcarriers
             mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
 
             hist = record_results(
@@ -489,20 +473,17 @@ class HybridSystemSimulator(Block):
                     )
                 ),  # Placeholder
                 tx_power_per_ut=match_hist_shape(total_power),
-                num_decoded_bits=match_hist_shape(
-                    throughput_per_user
-                ),  # Using throughput as bits count approx for now
+                num_decoded_bits=match_hist_shape(throughput_per_user),
                 mcs_index=match_hist_shape(mcs_idx_avg),
                 harq_feedback=match_hist_shape(
                     tf.zeros([self.batch_size, self.num_ut])
-                ),  # Placeholder
-                olla_offset=match_hist_shape(
-                    tf.zeros([self.batch_size, self.num_ut])
-                ),  # Placeholder
+                ),
+                olla_offset=match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
                 sinr_eff=match_hist_shape(sinr_eff_avg),
-                pf_metric=match_hist_shape(tf.zeros([self.batch_size, self.num_ut]))[
-                    ..., tf.newaxis, tf.newaxis
-                ],  # Placeholder with [..., 1, 1] for reduction compatibility
+                pf_metric=tf.reshape(
+                    match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
+                    [self.batch_size, self.num_bs, 1, 1, self.num_ut_per_sector],
+                ),  # Reshaped for get_hist.py's axis=[-2, -3] reduction
             )
 
             # Update Mobility

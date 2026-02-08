@@ -37,6 +37,10 @@ ENV/
 
 # My Project junk
 results/
+data/matlab_dummy/
+*.log
+test_log.txt
+
 # Projects
 sionna/
 sionna-rt/

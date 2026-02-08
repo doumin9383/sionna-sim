@@ -78,6 +78,17 @@ def test_external_sim():
     print("Running simulation slot...")
     # num_slots=1, tx_power=30dBm
     sim(num_slots=1, tx_power_dbm=30.0)
+
+    # 5. Report Memory
+    try:
+        mem = tf.config.experimental.get_memory_info("GPU:0")
+        print(f"VRAM Usage (Peak): {mem['peak'] / 1024**2:.2f} MB")
+        print(f"VRAM Usage (Current): {mem['current'] / 1024**2:.2f} MB")
+    except:
+        print(
+            "Could not retrieve GPU memory info (maybe CPU run or unsupported TF version)"
+        )
+
     print("Phase 3 Verification: Simulation finished successfully!")
 
 

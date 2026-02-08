@@ -50,4 +50,4 @@ def create_dummy_data(output_dir, num_sectors=21, num_mesh=1000):
 
 if __name__ == "__main__":
     create_dummy_data("data/matlab_dummy")
-    print("Dummy MATLAB data created in data/matlab_dummy (21 sectors)")
+    print("Dummy MATLAB data created in data/matlab_dummy (21 sectors, with angles)")
