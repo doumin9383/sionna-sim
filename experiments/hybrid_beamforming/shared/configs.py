@@ -8,8 +8,11 @@ class HybridSimulationCommonConfig:
     """Common configuration for both SLS and LLS"""
 
     # RF/Frequency
-    carrier_frequency: float = 7e9
-    subcarrier_spacing: float = 60e3
+    carrier_frequency: float = 3.5e9
+    subcarrier_spacing: float = 30e3
+
+    # Resource Grid Common Parameters
+    rbg_size_rb: int = 6  # Definition of one Resource Block Group (Subband)
 
     # Resource Grid Default
     # 共通のグリッド設定があればここに

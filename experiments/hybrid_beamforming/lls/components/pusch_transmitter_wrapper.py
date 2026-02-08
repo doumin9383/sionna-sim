@@ -28,6 +28,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         output_domain="time",
         num_tx_ant=4,
         precoding_granularity=None,
+        rbg_size_rb=6,
         **kwargs,
     ):
         super().__init__(pusch_config, output_domain=output_domain, **kwargs)
@@ -36,6 +37,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
             num_tx_ant, self._num_layers
         )  # Ensure enough antennas for layers
         self.precoding_granularity = precoding_granularity
+        self.rbg_size_rb = rbg_size_rb
 
     def call(self, batch_size=1):
         """
@@ -96,13 +98,20 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         # Determine granularity in subcarriers
         if self.precoding_granularity == "Narrowband":
             g_sc = 1
+        elif self.precoding_granularity == "Subband":
+            # Use rbg_size_rb from config to match SLS behavior
+            g_sc = self.rbg_size_rb * 12
         elif (
             self.precoding_granularity == "Wideband"
             or self.precoding_granularity is None
         ):
             g_sc = num_subcarriers
         else:
-            g_sc = int(self.precoding_granularity) * 12  # Assume RB=12 subcarriers
+            try:
+                g_sc = int(self.precoding_granularity) * 12
+            except (ValueError, TypeError):
+                # Fallback to Wideband if parsing fails
+                g_sc = num_subcarriers
 
         num_blocks = (num_subcarriers + g_sc - 1) // g_sc
 

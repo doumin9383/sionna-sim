@@ -20,7 +20,6 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     num_ut_per_sector: int = 1
     num_slots: int = 1
     precoding_granularity: str = "Narrowband"  # "Narrowband", "Subband", "Wideband"
-    rbg_size_rb: int = 6  # User requested 6 RB = 1G
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
     num_neighbors: int = (
         16  # For spatial masking: num BS per UT to calculate channel for

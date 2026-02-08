@@ -70,12 +70,20 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         f"Targeting {min_total_samples} samples. Batch size {batch_size} -> running {current_num_batches} batches."
     )
 
+    # Choose a representative RB count for CCFD summary plot (e.g., middle of the sweep)
+    representative_rb = config.rb_counts[len(config.rb_counts) // 2]
+
     for sc in tqdm(scenarios):
         # Scenario identifier for filenames
         # Shorten ID to avoid too long filenames
-        gran_str = (
-            f"G{sc['granularity']}" if isinstance(sc["granularity"], int) else "GWB"
-        )
+        if isinstance(sc["granularity"], int):
+            gran_str = f"G{sc['granularity']}RB"
+        elif sc["granularity"] == "Narrowband":
+            gran_str = "GNB"
+        elif sc["granularity"] == "Subband":
+            gran_str = "GSB"
+        else:
+            gran_str = "GWB"
         scenario_id = f"{sc['waveform']}_{sc['modulation']}_R{sc['rank']}_RB{sc['num_rb']}_{gran_str}"
 
         # Instantiate Model
@@ -93,6 +101,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
                 enable_transform_precoding=sc["transform_precoding"],
                 mcs_index=sc["mcs_index"],
                 precoding_granularity=sc["granularity"],
+                rbg_size_rb=config.rbg_size_rb,
                 papr_oversampling_factor=config.papr_oversampling_factor,
             )
 
@@ -103,7 +112,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
                 x = model.transmitter(batch_size)
 
                 # Save a sample waveform (only for a subset to avoid flooding disk)
-                if i == 0 and sc["num_rb"] == 100 and sc["rank"] == 1:
+                if i == 0 and sc["num_rb"] == representative_rb and sc["rank"] == 1:
                     plot_individual_waveform(x, scenario_id, results_dir)
 
                 # Compute PAPR
@@ -111,15 +120,15 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
                 papr_values.extend(papr_db_batch.numpy().flatten())
 
             # Store for global comparison (Selective labels to avoid cluttered legend)
-            if sc["num_rb"] == 50 and sc["granularity"] == "Wideband":
-                wave_mod_key = f"{sc['waveform']} ({sc['modulation']}) R{sc['rank']}"
+            if sc["num_rb"] == representative_rb and sc["rank"] == 1:
+                wave_mod_key = f"{sc['waveform']} ({sc['modulation']}) {gran_str}"
                 if wave_mod_key not in all_papr_data:
                     all_papr_data[wave_mod_key] = []
                 all_papr_data[wave_mod_key].extend(papr_values)
 
             # Compute and Plot individual CCDF (Selective)
             papr_sorted = np.sort(papr_values)
-            if sc["num_rb"] == 100:
+            if sc["num_rb"] == representative_rb:
                 plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
 
             # Compute 99.9% CCDF

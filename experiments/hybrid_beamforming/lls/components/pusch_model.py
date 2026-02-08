@@ -31,6 +31,7 @@ class PUSCHCommunicationModel(tf.keras.Model):
         enable_transform_precoding=False,
         mcs_index=16,
         precoding_granularity=None,  # None, "Wideband", or int (in RBs)
+        rbg_size_rb=6,
         papr_oversampling_factor=4,
     ):
         super().__init__()
@@ -65,6 +66,7 @@ class PUSCHCommunicationModel(tf.keras.Model):
             output_domain=domain,
             num_tx_ant=num_tx_ant,
             precoding_granularity=precoding_granularity,
+            rbg_size_rb=rbg_size_rb,
         )
 
         # 4. Receiver
