@@ -97,7 +97,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
 
         # Determine granularity in subcarriers
         if self.precoding_granularity == "Narrowband":
-            g_sc = 1
+            g_sc = 12
         elif self.precoding_granularity == "Subband":
             # Use rbg_size_rb from config to match SLS behavior
             g_sc = self.rbg_size_rb * 12

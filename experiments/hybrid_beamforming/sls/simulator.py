@@ -316,6 +316,8 @@ class HybridSystemSimulator(Block):
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
                 bs_orient=self.bs_orientations,
+                ut_velocities=self.ut_velocities,
+                in_state=self.in_state,
             )
 
             # h: [batch, num_ut, num_bs, ofdm, sc, rx_ports, tx_ports]
@@ -325,6 +327,8 @@ class HybridSystemSimulator(Block):
                 bs_loc=self.bs_loc,
                 ut_orient=self.ut_orientations,
                 bs_orient=self.bs_orientations,
+                ut_velocities=self.ut_velocities,
+                in_state=self.in_state,
             )
 
             # Compute SVD on Coarse Channel

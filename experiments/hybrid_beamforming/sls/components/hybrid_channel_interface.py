@@ -55,7 +55,14 @@ class HybridChannelInterface(Block):
         self.hybrid_channel.set_analog_weights(w_rf, a_rf)
 
     def get_neighbor_channel_info(
-        self, batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+        self,
+        batch_size,
+        ut_loc,
+        bs_loc,
+        ut_orient,
+        bs_orient,
+        ut_velocities=None,
+        in_state=None,
     ):
         """
         Generates channel only for the specified neighbors using virtual topology mapping.
@@ -85,22 +92,20 @@ class HybridChannelInterface(Block):
             ut_loc_batch = ut_loc[:, start_ut:end_ut, :]
             ut_orient_batch = ut_orient[:, start_ut:end_ut, :]
 
-            # Additional states that need slicing if they exist in channel model
-            # in_state is usually [batch, num_ut]
-            # ut_velocities is [batch, num_ut, 3]
-            # We access them from channel_model properties if not passed explicitly,
-            # but set_topology expects arguments if we want to update them.
-            # Ideally `get_neighbor_channel_info` should receive them or we extract from model.
-            # But `ut_loc` etc are passed as args.
-
-            # Let's check `channel_model` properties for current state
-            # SystemLevelChannel wraps vector scenario in `_scenario`
-            if hasattr(self.channel_model, "indoor"):
+            # Use passed arguments or fallback to channel model state
+            # (Simulator should pass them now)
+            if in_state is not None:
+                in_state_full = in_state
+            elif hasattr(self.channel_model, "indoor"):
                 in_state_full = self.channel_model.indoor
+            else:
+                in_state_full = self.channel_model._scenario.indoor
+
+            if ut_velocities is not None:
+                ut_vel_full = ut_velocities
+            elif hasattr(self.channel_model, "ut_velocities"):
                 ut_vel_full = self.channel_model.ut_velocities
             else:
-                # Fallback for Sionna < 0.19 or internal structure
-                in_state_full = self.channel_model._scenario.indoor
                 ut_vel_full = self.channel_model._scenario.ut_velocities
 
             in_state_batch = in_state_full[:, start_ut:end_ut]
@@ -334,7 +339,14 @@ class HybridChannelInterface(Block):
         return h_neighbor, s, u, v
 
     def get_full_channel_info(
-        self, batch_size, ut_loc=None, bs_loc=None, ut_orient=None, bs_orient=None
+        self,
+        batch_size,
+        ut_loc=None,
+        bs_loc=None,
+        ut_orient=None,
+        bs_orient=None,
+        ut_velocities=None,
+        in_state=None,
     ):
         """
         Returns the port-domain channel information.
@@ -347,7 +359,13 @@ class HybridChannelInterface(Block):
             )
         if self.neighbor_indices is not None:
             return self.get_neighbor_channel_info(
-                batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+                batch_size,
+                ut_loc,
+                bs_loc,
+                ut_orient,
+                bs_orient,
+                ut_velocities,
+                in_state,
             )
 
         if self.use_rbg_granularity:
@@ -359,7 +377,16 @@ class HybridChannelInterface(Block):
         return h, s, u, v
 
     def get_precoding_channel(
-        self, granularity, rbg_size_sc, batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+        self,
+        granularity,
+        rbg_size_sc,
+        batch_size,
+        ut_loc,
+        bs_loc,
+        ut_orient,
+        bs_orient,
+        ut_velocities=None,
+        in_state=None,
     ):
         """
         Returns the channel matrix to be used for precoding calculation.
@@ -370,5 +397,5 @@ class HybridChannelInterface(Block):
             )[0]
 
         return self.get_full_channel_info(
-            batch_size, ut_loc, bs_loc, ut_orient, bs_orient
+            batch_size, ut_loc, bs_loc, ut_orient, bs_orient, ut_velocities, in_state
         )[0]
