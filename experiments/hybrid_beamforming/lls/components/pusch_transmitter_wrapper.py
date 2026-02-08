@@ -175,10 +175,7 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         """
         # M_sc is the number of subcarriers per OFDM symbol allocated for this PUSCH
         # num_subcarriers is total length. We need the data-carrying subcarriers.
-        M_sc = (
-            self.resource_grid.num_effective_subcarriers
-            // self.resource_grid.num_ofdm_symbols
-        )
+        M_sc = self.resource_grid.num_effective_subcarriers
 
         shape = x.shape
         total_len = shape[-1]

@@ -18,9 +18,9 @@ class HybridLLSConfig(HybridSimulationCommonConfig):
         super().__init__()
 
     # Simulation Control
-    batch_size: int = 1600
+    batch_size: int = 100
     num_batches: int = 5
-    min_total_samples: int = 10000
+    min_total_samples: int = 1000
 
     # Sweep Parameters
     modulations: Dict[str, int] = field(

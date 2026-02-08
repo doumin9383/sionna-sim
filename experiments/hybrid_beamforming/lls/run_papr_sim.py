@@ -93,6 +93,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
             num_layers=sc["rank"],
             enable_transform_precoding=sc["transform_precoding"],
             precoding_granularity=sc["granularity"],
+            num_rb=sc["num_rb"],
         )
 
         papr_values = []

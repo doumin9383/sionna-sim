@@ -25,6 +25,7 @@ class PUSCHCommunicationModel(tf.keras.Model):
         num_layers,
         enable_transform_precoding,
         precoding_granularity,
+        num_rb,
         domain="time",
     ):
         super().__init__()
@@ -43,6 +44,9 @@ class PUSCHCommunicationModel(tf.keras.Model):
         self.pusch_config.num_layers = num_layers
         self.pusch_config.precoding = "codebook"
         self.pusch_config.tpmi = 1
+
+        # Set Bandwidth Part size (controls FFT size and num_subcarriers)
+        self.pusch_config.n_size_bwp = num_rb
 
         # Transform Precoding (DFT-s-OFDM)
         self.pusch_config.transform_precoding = False
