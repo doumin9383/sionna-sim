@@ -19,68 +19,54 @@ import csv
 
 
 def run_test():
-    # 1. Configuration
-    carrier_frequency = 3.5e9
-
-    # BS: Single Panel 4x4, Cross-pol
-    bs_array = PanelArray(
-        num_rows=1,
-        num_cols=1,
-        num_rows_per_panel=4,
-        num_cols_per_panel=4,
-        polarization="dual",
-        polarization_type="cross",
-        antenna_pattern="38.901",
-        carrier_frequency=carrier_frequency,
-    )
-    # UT: Single Panel 1x1, Cross-pol
-    ut_array = PanelArray(
-        num_rows=1,
-        num_cols=1,
-        num_rows_per_panel=1,
-        num_cols_per_panel=1,
-        polarization="dual",
-        polarization_type="cross",
-        antenna_pattern="omni",
-        carrier_frequency=carrier_frequency,
-    )
-
-    # Resource Grid Config
-    rg_config = ResourceGridConfig(
-        num_ofdm_symbols=1,
-        fft_size=24,
-        subcarrier_spacing=30e3,
-        num_tx=1,
-        num_streams_per_tx=1,
-        cyclic_prefix_length=6,
-        pilot_pattern=None,
-    )
-    # Convert RG config to Sionna Object (Simulator needs the object for now)
-    rg = ResourceGrid(
-        num_ofdm_symbols=rg_config.num_ofdm_symbols,
-        fft_size=rg_config.fft_size,
-        subcarrier_spacing=rg_config.subcarrier_spacing,
-        num_tx=rg_config.num_tx,
-        num_streams_per_tx=rg_config.num_streams_per_tx,
-        cyclic_prefix_length=rg_config.cyclic_prefix_length,
-        pilot_pattern=rg_config.pilot_pattern,
-    )
-
     # Master Config
     config = HybridSLSConfig(
         batch_size=1,
         num_rings=1,
         num_ut_per_sector=1,
         num_slots=1,
-        carrier_frequency=carrier_frequency,
-        resource_grid=rg,
-        bs_array=bs_array,
-        ut_array=ut_array,
         scenario="uma",
         direction="downlink",
         coherence_time=10,
-        num_neighbors=4,  # Added as per instruction
+        num_neighbors=4,
     )
+
+    # Resource Grid Config (Custom for this run if needed, or use default)
+    rg = ResourceGrid(
+        num_ofdm_symbols=1,
+        fft_size=24,
+        subcarrier_spacing=config.subcarrier_spacing,
+        num_tx=1,
+        num_streams_per_tx=1,
+        cyclic_prefix_length=6,
+    )
+    config.resource_grid = rg
+
+    # BS Array from config
+    bs_array = PanelArray(
+        num_rows=1,
+        num_cols=1,
+        num_rows_per_panel=config.bs_num_rows,
+        num_cols_per_panel=config.bs_num_cols,
+        polarization=config.bs_polarization,
+        polarization_type="cross",
+        antenna_pattern="38.901",
+        carrier_frequency=config.carrier_frequency,
+    )
+    # UT Array from config
+    ut_array = PanelArray(
+        num_rows=1,
+        num_cols=1,
+        num_rows_per_panel=config.ut_num_rows,
+        num_cols_per_panel=config.ut_num_cols,
+        polarization=config.ut_polarization,
+        polarization_type="cross",
+        antenna_pattern="omni",
+        carrier_frequency=config.carrier_frequency,
+    )
+
+    config.bs_array = bs_array
+    config.ut_array = ut_array
 
     # 4. Instantiate Simulator
     sim = HybridSystemSimulator(config=config)

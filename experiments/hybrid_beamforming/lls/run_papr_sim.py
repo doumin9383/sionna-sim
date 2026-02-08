@@ -87,8 +87,8 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         scenario_id = f"{sc['waveform']}_{sc['modulation']}_R{sc['rank']}_RB{sc['num_rb']}_{gran_str}"
 
         # Instantiate Model
-        # Antennas: Use 8 as base or same as rank
-        num_tx = max(sc["rank"], 8)
+        # Use antenna count from shared config, ensuring it's at least as large as the rank
+        num_tx = max(sc["rank"], config.num_ut_ant)
 
         try:
             model = PUSCHCommunicationModel(
