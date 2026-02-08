@@ -207,51 +207,6 @@ class ChunkedOFDMChannel(GenerateOFDMChannel):
         num_ofdm_symbols = self._resource_grid.num_ofdm_symbols
         sampling_frequency = 1.0 / self._resource_grid.ofdm_symbol_duration
 
-        # --- DEBUG OOM ---
-        try:
-            n_tx = "Unknown"
-            n_rx = "Unknown"
-            n_tx_ant = "Unknown"
-            n_rx_ant = "Unknown"
-
-            # Check for _scenario in SystemLevelChannel (UMi, UMa, RMa)
-            scenario = getattr(self._channel_model, "_scenario", None)
-
-            if scenario:
-                direction = scenario.direction
-                if direction == "uplink":
-                    # In uplink: Tx=UT, Rx=BS
-                    n_tx = scenario.num_ut  # Tensor
-                    n_rx = scenario.num_bs  # Tensor
-                    # Arrays
-                    tx_arr = scenario.ut_array
-                    rx_arr = scenario.bs_array
-                else:  # downlink
-                    # In downlink: Tx=BS, Rx=UT
-                    n_tx = scenario.num_bs  # Tensor
-                    n_rx = scenario.num_ut  # Tensor
-                    # Arrays
-                    tx_arr = scenario.bs_array
-                    rx_arr = scenario.ut_array
-
-                n_tx_ant = tx_arr.num_ant
-                n_rx_ant = rx_arr.num_ant
-            else:
-                # Fallback for generic ChannelModel if they expose these attributes
-                n_tx = getattr(self._channel_model, "num_tx", "Unknown")
-                n_rx = getattr(self._channel_model, "num_rx", "Unknown")
-                n_tx_ant = getattr(self._channel_model, "num_tx_ant", "Unknown")
-                n_rx_ant = getattr(self._channel_model, "num_rx_ant", "Unknown")
-
-            # Estimation of complex128 consumption:
-            # Paths usually: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_clusters, num_rays]
-            tf.print(
-                f"[DEBUG-OOM] Generating Paths. Tx: {n_tx}, Rx: {n_rx}, TxAnt: {n_tx_ant}, RxAnt: {n_rx_ant}"
-            )
-        except Exception as e:
-            print(f"[DEBUG-OOM] Stats error: {e}")
-        # -----------------
-
         a, tau = self._channel_model(num_ofdm_symbols, sampling_frequency)
         return a, tau
 
