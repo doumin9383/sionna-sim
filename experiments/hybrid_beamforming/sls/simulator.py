@@ -293,8 +293,14 @@ class HybridSystemSimulator(Block):
         )
 
         # BS-UT Association
+        # BS-UT Association
         # [num_ut] -> values are serving BS indices
-        serving_bs_idx = tf.argmax(self.stream_management.rx_tx_association, axis=1)
+        # If Uplink: Rx=BS [num_bs, num_ut]. We want serving BS for each UT (axis 0).
+        # If Downlink: Rx=UT [num_ut, num_bs]. We want serving BS for each UT (axis 1).
+        if self.direction == "uplink":
+            serving_bs_idx = tf.argmax(self.stream_management.rx_tx_association, axis=0)
+        else:
+            serving_bs_idx = tf.argmax(self.stream_management.rx_tx_association, axis=1)
 
         # --------------- #
         # Simulate a slot #

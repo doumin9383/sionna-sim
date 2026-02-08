@@ -15,10 +15,10 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     """System Level Simulation Configuration for experiments/hybrid_beamforming/sls"""
 
     # Simulation Control
-    batch_size: int = 8  # Production: 8 (adjusted for 4GB VRAM)
+    batch_size: int = 1  # Debug: 1
     num_rings: int = 1
-    num_ut_per_sector: int = 4  # Production: 4 (Debug: 1)
-    num_slots: int = 20  # Production: 20 (Debug: 1)
+    num_ut_per_sector: int = 1  # Production: 4
+    num_slots: int = 2  # Debug: 2
     precoding_granularity: str = "Narrowband"  # "Narrowband", "Subband", "Wideband"
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
     num_neighbors: int = (

@@ -83,11 +83,33 @@ class HybridChannelInterface(Block):
         self.channel_model.set_topology(ut_loc, bs_loc, ut_orient, bs_orient)
 
         # 5. Extract active links
+        # 5. Extract active links
         h_list = []
+
+        # Check if Uplink (Rx=BS, Shape=[Batch, NumVirtualBS, NumUT, ...])
+        # or Downlink (Rx=UT, Shape=[Batch, NumUT, NumVirtualBS, ...])
+        # num_virtual_bs = num_ut * num_neighbors
+        is_uplink = h_port_flat.shape[1] == (num_ut * num_neighbors)
+
         for i in range(num_ut):
             start = i * num_neighbors
             end = (i + 1) * num_neighbors
-            h_list.append(h_port_flat[:, i, start:end])
+
+            if is_uplink:
+                # Uplink: [B, BS(Rx), RxP, UT(Tx), TxP, S, C]
+                # Slice BS=start:end, UT=i
+                # Result: [B, Neighbors, RxP, TxP, S, C]
+                chan_slice = h_port_flat[:, start:end, :, i, ...]
+            else:
+                # Downlink: [B, UT(Rx), RxP, BS(Tx), TxP, S, C]
+                # Slice UT=i, BS=start:end
+                # Result: [B, RxP, Neighbors, TxP, S, C]
+                chan_slice = h_port_flat[:, i, :, start:end, ...]
+                # Transpose to [B, Neighbors, RxP, TxP, S, C]
+                chan_slice = tf.transpose(chan_slice, [0, 2, 1, 3, 4, 5])
+
+            h_list.append(chan_slice)
+
         h_neighbor = tf.stack(h_list, axis=1)
 
         s, u, v = tf.linalg.svd(h_neighbor)
