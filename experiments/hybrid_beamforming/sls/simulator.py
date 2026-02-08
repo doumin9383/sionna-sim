@@ -363,56 +363,12 @@ class HybridSystemSimulator(Block):
                 in_state=self.in_state,
             )
 
-            # Compute SVD on Coarse Channel
-            s_prec, u_prec, v_prec = tf.linalg.svd(h_prec)
-
-            # Expand v_prec to Full Bandwidth
-            # v_prec: [batch, num_ut, num_bs, ofdm, num_blocks, tx_ports, tx_ports]
-            # We need to expand dim -3 (num_blocks) to num_sc
-
-            # Determine effective target dimensions
-            if self.config.use_rbg_granularity:
-                # RBGモードの場合、h の周波数軸はすでに RBG 数になっている
-                eff_total_subcarriers = h.shape[4]
-                eff_rbg_size_sc = 1
-            else:
-                # RBモード（RB単位）
-                eff_total_subcarriers = self.resource_grid.num_effective_subcarriers
-                eff_rbg_size_sc = self.rbg_size_sc
-
-            # v_prec: [batch, num_ut, num_bs, ofdm, num_blocks, tx_ports, tx_ports]
-            # ユーザー指摘によりRank 1制限を撤廃し、全ストリーム(レイヤー)を使用する
-            # v_prec は SVD の結果 [..., tx, k] (k=min(tx,rx))
-
-            v_expanded = expand_precoder(
-                v_prec,
-                total_subcarriers=eff_total_subcarriers,
-                granularity_type=self.precoding_granularity,
-                rbg_size_sc=eff_rbg_size_sc,
-            )
-
             # 3. Serving Link 抽出
             # The serving link is always at index 0 of the neighbor list by definition of top_k
+            # ネイバーセルのみ計算するんだからserveing linkは先に保存しておくべきでは...？
             serving_link_idx = tf.zeros([self.batch_size, self.num_ut], dtype=tf.int32)
 
-            # u_prec: [batch, num_ut, num_bs, ofdm, num_blocks, rx_ports, rx_streams (min(rx,tx))]
-            u_expanded = expand_precoder(
-                u_prec,
-                total_subcarriers=eff_total_subcarriers,
-                granularity_type=self.precoding_granularity,
-                rbg_size_sc=eff_rbg_size_sc,
-            )
-
-            # 3. Serving Link 抽出
-            # The serving link is always at index 0 of the neighbor list by definition of top_k
-            serving_link_idx = tf.zeros([self.batch_size, self.num_ut], dtype=tf.int32)
-
-            u_serv = tf.gather(u_expanded, serving_link_idx, axis=2, batch_dims=2)
-            # v_serv calculation is not strictly needed for interference, but v_expanded contains it.
-
-            # 4. 干渉計算 (Downlink 想定の効率化)
-            # h: [batch, ut, bs_neighbor, ofdm, sc, rx_ant, tx_ant]
-            # v_expanded (neighbor_precoders): [batch, ut, bs_neighbor, ofdm, sc, tx_ant, 1]
+            u_serv = tf.gather(u_all, serving_link_idx, axis=2, batch_dims=2)
 
             # UT i の受信ビームフォーマーをチャネルに適用
             # h_u: [batch, ut, bs_neighbor, ofdm, sc, 1, tx_ant]
@@ -420,7 +376,7 @@ class HybridSystemSimulator(Block):
 
             # 他局のプリコーダーとの結合
             # h_eff: [batch, ut, bs_neighbor, ofdm, sc, 1, 1]
-            h_eff = tf.einsum("bujospt,bujostq->bujospq", h_u, v_expanded)
+            h_eff = tf.einsum("bujospt,bujostq->bujospq", h_u, v_all)
 
             # パワー計算
             # h_eff: [batch, ut, bs_neighbor, ofdm, sc, rx_streams, tx_streams]
