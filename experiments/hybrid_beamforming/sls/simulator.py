@@ -44,10 +44,12 @@ class HybridSystemSimulator(Block):
         average_street_width=20.0,
         average_building_height=5.0,
         precision=None,
+        external_loader=None,
     ):
         super().__init__(precision=precision)
 
         self.config = config
+        self.external_loader = external_loader
         self.scenario = config.scenario
         self.batch_size = int(config.batch_size)
         self.resource_grid = config.resource_grid
@@ -126,6 +128,7 @@ class HybridSystemSimulator(Block):
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
             neighbor_indices=self.neighbor_indices,
+            external_loader=self.external_loader,
         )
 
         # Instantiate simplified link adaptation (Physics Abstraction for SINR)
@@ -209,16 +212,20 @@ class HybridSystemSimulator(Block):
         self.neighbor_indices = neighbor_indices
 
         # 3. Set topology in channel model
-        self.channel_model.set_topology(
-            self.ut_loc,
-            self.bs_loc,
-            self.ut_orientations,
-            self.bs_orientations,
-            self.ut_velocities,
-            self.in_state,
-            self.los,
-            self.bs_virtual_loc,
-        )
+        if self.external_loader is None:
+            self.channel_model.set_topology(
+                self.ut_loc,
+                self.bs_loc,
+                self.ut_orientations,
+                self.bs_orientations,
+                self.ut_velocities,
+                self.in_state,
+                self.los,
+                self.bs_virtual_loc,
+            )
+        else:
+            # When using external data, we still need mesh indices
+            self.ut_mesh_indices = self.external_loader.find_nearest_mesh(self.ut_loc)
 
     @tf.function(jit_compile=False)
     def call(self, num_slots, tx_power_dbm):
@@ -345,15 +352,25 @@ class HybridSystemSimulator(Block):
             )
             dist = tf.norm(self.ut_loc - serving_bs_loc, axis=-1)  # [batch, num_ut]
 
-            # Simple UMi Path Loss Model for 3.5GHz (Placeholder)
-            # PL = 28.0 + 22*log10(d) + 20*log10(fc)
-            fc_ghz = 3.5
-            dist_safe = tf.maximum(dist, 1.0)
-            pl_db = (
-                28.0
-                + 22.0 * tf.math.log(dist_safe) / tf.math.log(10.0)
-                + 20.0 * tf.math.log(fc_ghz) / tf.math.log(10.0)
-            )
+            # Simple UMi Path Loss Model for 3.5GHz (Placeholder or External)
+            if self.external_loader is not None:
+                powers_dbm = self.external_loader.get_power_map(self.ut_mesh_indices)
+                # For interference, we use powers directly later,
+                # but path loss to serving cell is needed for Power Control
+                serving_bs_idx_expand = tf.expand_dims(serving_bs_idx_i32, axis=-1)
+                serving_power = tf.gather(
+                    powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
+                )
+                serving_power = tf.squeeze(serving_power, axis=-1)
+                pl_db = self.config.bs_max_power_dbm - serving_power
+            else:
+                fc_ghz = 3.5
+                dist_safe = tf.maximum(dist, 1.0)
+                pl_db = (
+                    28.0
+                    + 22.0 * tf.math.log(dist_safe) / tf.math.log(10.0)
+                    + 20.0 * tf.math.log(fc_ghz) / tf.math.log(10.0)
+                )
 
             # b. Get MPR
             # Assuming "CP-OFDM" and Rank 1 for simplified PC

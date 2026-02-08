@@ -1,0 +1,39 @@
+2026-02-08 19:03:58.923947: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1770545041.712341  486489 gpu_device.cc:2020] Created device /job:localhost/replica:0/task:0/device:GPU:0 with 4517 MB memory:  -> device: 0, name: NVIDIA GeForce GTX 1660 Ti, pci bus id: 0000:2b:00.0, compute capability: 7.5
+I0000 00:00:1770545044.869347  486489 cuda_solvers.cc:175] Creating GpuSolver handles for stream 0x6387aff2e180
+Testing External Data SLS Pipeline...
+Loaded MPR table from experiments/hybrid_beamforming/lls/results/mpr_table.csv
+Running simulation slot...
+Traceback (most recent call last):
+  File "/home/sh-fukue/Documents/Developments/sionna-sim/experiments/hybrid_beamforming/sls/test_external_sls.py", line 83, in <module>
+    test_external_sim()
+  File "/home/sh-fukue/Documents/Developments/sionna-sim/experiments/hybrid_beamforming/sls/test_external_sls.py", line 78, in test_external_sim
+    sim(num_slots=1, tx_power_dbm=30.0)
+  File "/home/sh-fukue/Documents/Developments/sionna-sim/.venv/lib/python3.10/site-packages/sionna/phy/block.py", line 155, in __call__
+    return self.call(*args, **kwargs)
+  File "/home/sh-fukue/Documents/Developments/sionna-sim/.venv/lib/python3.10/site-packages/tensorflow/python/util/traceback_utils.py", line 153, in error_handler
+    raise e.with_traceback(filtered_tb) from None
+  File "/tmp/__autograph_generated_filelarnu0xt.py", line 165, in tf__call
+    (_, final_hist) = ag__.converted_call(ag__.ld(tf).while_loop, (ag__.autograph_artifact(lambda i, *_: ag__.ld(i) < ag__.ld(num_slots)), ag__.ld(simulate_slot), [0, ag__.ld(hist)]), None, fscope)
+  File "/tmp/__autograph_generated_filelarnu0xt.py", line 18, in simulate_slot
+    h_prec = ag__.converted_call(ag__.ld(self).channel_interface.get_precoding_channel, (ag__.ld(self).precoding_granularity, ag__.ld(self).rbg_size_sc), dict(batch_size=ag__.ld(self).batch_size, ut_loc=ag__.ld(self).ut_loc, bs_loc=ag__.ld(self).bs_loc, ut_orient=ag__.ld(self).ut_orientations, bs_orient=ag__.ld(self).bs_orientations), fscope_1)
+  File "/tmp/__autograph_generated_filez1_c7x9l.py", line 93, in tf__get_precoding_channel
+    ag__.if_stmt(ag__.ld(self).neighbor_indices is not None, if_body_3, else_body_3, get_state_3, set_state_3, ('do_return', 'retval_'), 2)
+  File "/tmp/__autograph_generated_filez1_c7x9l.py", line 23, in if_body_3
+    (h_neighbor, _, _, _) = ag__.converted_call(ag__.ld(self).get_neighbor_channel_info, (ag__.ld(batch_size), ag__.ld(ut_loc), ag__.ld(bs_loc), ag__.ld(ut_orient), ag__.ld(bs_orient)), None, fscope)
+  File "/tmp/__autograph_generated_file23gzadjf.py", line 39, in tf__get_neighbor_channel_info
+    h_neighbor = ag__.converted_call(ag__.ld(tf).stack, (ag__.ld(h_list),), dict(axis=1), fscope)
+ValueError: in user code:
+
+    File "/home/sh-fukue/Documents/Developments/sionna-sim/experiments/hybrid_beamforming/sls/simulator.py", line 243, in simulate_slot  *
+        h_prec = self.channel_interface.get_precoding_channel(
+    File "/home/sh-fukue/Documents/Developments/sionna-sim/experiments/hybrid_beamforming/sls/components/hybrid_channel_interface.py", line 243, in get_precoding_channel  *
+        h_neighbor, _, _, _ = self.get_neighbor_channel_info(
+    File "/home/sh-fukue/Documents/Developments/sionna-sim/experiments/hybrid_beamforming/sls/components/hybrid_channel_interface.py", line 93, in get_neighbor_channel_info  *
+        h_neighbor = tf.stack(h_list, axis=1)
+
+    ValueError: Dimension 1 in both shapes must be equal, but are 2 and 0. Shapes are [1,2,168,32,1,2] and [1,0,168,32,1,2].
+    	From merging shape 0 with other shapes. for '{{node while/stack_87}} = Pack[N=42, T=DT_COMPLEX64, axis=1](while/strided_slice_580, while/strided_slice_581, while/strided_slice_582, while/strided_slice_583, while/strided_slice_584, while/strided_slice_585, while/strided_slice_586, while/strided_slice_587, while/strided_slice_588, while/strided_slice_589, while/strided_slice_590, while/strided_slice_591, while/strided_slice_592, while/strided_slice_593, while/strided_slice_594, while/strided_slice_595, while/strided_slice_596, while/strided_slice_597, while/strided_slice_598, while/strided_slice_599, while/strided_slice_600, while/strided_slice_601, while/strided_slice_602, while/strided_slice_603, while/strided_slice_604, while/strided_slice_605, while/strided_slice_606, while/strided_slice_607, while/strided_slice_608, while/strided_slice_609, while/strided_slice_610, while/strided_slice_611, while/strided_slice_612, while/strided_slice_613, while/strided_slice_614, while/strided_slice_615, while/strided_slice_616, while/strided_slice_617, while/strided_slice_618, while/strided_slice_619, while/strided_slice_620, while/strided_slice_621)' with input shapes: [1,2,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2], [1,0,168,32,1,2].
+
