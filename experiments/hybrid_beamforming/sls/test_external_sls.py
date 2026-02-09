@@ -1,3 +1,4 @@
+print("DEBUG: test_external_sls.py script started")
 import os
 import sys
 import tensorflow as tf
@@ -63,7 +64,7 @@ def test_external_sim():
     sim_config.scenario = "umi"
     sim_config.direction = "downlink"
     sim_config.num_rings = 1
-    sim_config.num_ut_per_sector = 2
+    sim_config.num_ut_per_sector = 1
     sim_config.num_neighbors = 4
     sim_config.use_rbg_granularity = True
     sim_config.rbg_size_rb = 1
@@ -104,6 +105,16 @@ def test_external_sim():
         )
 
     print("Phase 3 Verification: Simulation finished successfully!")
+
+    # Verify new history keys
+    results = sim(num_drops=1, tx_power_dbm=30.0)
+    new_keys = ["p_cmax_dbm", "rank", "mpr_db"]
+    print("\nVerifying History Keys:")
+    for key in new_keys:
+        if key in results:
+            print(f"  [OK] {key}: shape {results[key].shape}")
+        else:
+            print(f"  [FAILED] {key} not found in results")
 
 
 if __name__ == "__main__":

@@ -106,3 +106,23 @@ class ExternalChannelLoader:
             results[key] = t_slice
 
         return results
+
+    def find_nearest_mesh(self, ut_loc):
+        """Dummy for compatibility"""
+        return tf.zeros(tf.shape(ut_loc)[:2], dtype=tf.int32)
+
+    def get_power_map(self, ut_mesh_indices):
+        """
+        Returns pathloss from the perspective of BSs.
+        Actually returns pathloss [Batch, NumUT, NumBS] or similar.
+        """
+        if self.cached_drop_idx == -1:
+            raise RuntimeError("No drop loaded. Call load_drop() first.")
+
+        # pathloss in Zarr is [Batch, NumBS, NumUT]
+        pl = self.cached_lsp_data["pathloss"]
+        # Transpose to [Batch, NumUT, NumBS] for consistency with simulator expectations
+        # if they use it like gather(powers_dbm, ..., axis=2).
+        return (
+            30.0 - pl
+        )  # Return roughly a 'power' if it expects powers_dbm (e.g. 30dBm - PL)

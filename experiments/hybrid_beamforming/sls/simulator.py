@@ -213,7 +213,13 @@ class HybridSystemSimulator(Block):
             self.ut_velocities = topo["ut_vel"]
             self.in_state = topo["in_state"]
             self.los = topo["los"]
-            self.serving_cell_id = topo["serving_cell_id"]
+
+            if "serving_cell_id" in topo:
+                self.serving_cell_id = topo["serving_cell_id"]
+            else:
+                self.serving_cell_id = None
+
+            self.ut_mesh_indices = self.external_loader.find_nearest_mesh(self.ut_loc)
 
             # BS Virtual Loc needs to be derived or loaded?
             # gen_hexgrid_topology returns it.
@@ -223,6 +229,13 @@ class HybridSystemSimulator(Block):
             # Usually bs_loc is enough for distance if no wrap-around logic is explicitly called later.
             # We'll set it to None or bs_loc for now.
             self.bs_virtual_loc = None
+
+            # Update counts to match external data
+            self.num_ut = tf.shape(self.ut_loc)[1]
+            self.num_bs = tf.shape(self.bs_loc)[1]
+            # num_ut_per_sector might be affected if we assume it's fixed,
+            # but usually for external data we treat it as 1 or adjust it.
+            # To be safe, let's keep consistency.
 
         elif self.config.topology_type == "HexGrid":
             (
@@ -246,6 +259,7 @@ class HybridSystemSimulator(Block):
                 return_grid=True,
                 precision=self.precision,
             )
+            self.serving_cell_id = None
         else:
             raise NotImplementedError(
                 f"Topology type {self.config.topology_type} not implemented in _setup_topology"
@@ -257,22 +271,33 @@ class HybridSystemSimulator(Block):
         dist = tf.norm(diff, axis=-1)
 
         # 2. Define Explicit Serving BS Association
-        # We enforce a strict mapping: UEs are associated with BSs sequentially.
-        # This matches the ID-based logic used in beamforming and resource allocation.
-        ut_ids = tf.range(self.num_ut)
-        serving_bs_ids_flat = ut_ids // self.num_ut_per_sector
+        if self.serving_cell_id is not None:
+            # Use external serving cell ID if available
+            # Ensure shape is [batch, num_ut]
+            self.serving_bs_ids = self.serving_cell_id
+        else:
+            # Fallback (HexGrid): We enforce a strict mapping: UEs are associated with BSs sequentially.
+            # This matches the ID-based logic used in beamforming and resource allocation.
+            ut_ids = tf.range(self.num_ut)
+            serving_bs_ids_flat = ut_ids // self.num_ut_per_sector
 
-        # Store as class member for use in other methods
-        self.serving_bs_ids = tf.broadcast_to(
-            serving_bs_ids_flat[None, :], [self.batch_size, self.num_ut]
-        )
+            # Store as class member for use in other methods
+            self.serving_bs_ids = tf.broadcast_to(
+                serving_bs_ids_flat[None, :], [self.batch_size, self.num_ut]
+            )
 
         # 3. Select Neighbors: Serving BS (Index 0) + Top K-1 Interferers
 
+        # get actual shapes from data
+        current_num_ut = tf.shape(dist)[1]
+        current_num_bs = tf.shape(dist)[2]
+
         # Create a mask for the serving BS
-        bs_range = tf.range(self.num_bs)
-        # [1, num_ut, num_bs]
-        is_serving = self.serving_bs_ids[:, :, None] == bs_range[None, None, :]
+        bs_range = tf.range(current_num_bs)
+        # [batch, num_ut, num_bs]
+        is_serving = (
+            self.serving_bs_ids[:, :current_num_ut, None] == bs_range[None, None, :]
+        )
 
         # Modify distance for sorting:
         # Assign a large negative 'distance' to the Serving BS so it is always selected first
@@ -350,20 +375,61 @@ class HybridSystemSimulator(Block):
             h_serv = h_elem_all[:, :, 0, 0, :, :, :]
 
             # 2. Select Analog Beams (BS Side)
-            # BS Beam Selection must be done per BS, considering its served UEs.
+            # h_serv channel is from UT to Serving BS (because neighbor_index=0 is serving BS)
+            # We need to restructure this into [Batch, Num_BS, Num_UT_Per_Sector, SC, RxA, TxA]
+            # using the serving_bs_ids map.
+
+            # Dimensions
+            B = self.batch_size
+            N_BS = self.num_bs
+            N_UT_Sec = self.num_ut_per_sector  # Should be 1 typically
+            N_UT_Total = self.num_ut
             # h_serv shape: [Batch, Total_UT, SC, RxA, TxA]
-            # Reshape based on actual number of Rx/Tx antennas in the channel model
-            h_bs = tf.reshape(
-                h_serv,
-                [
-                    self.batch_size,
-                    self.num_bs,
-                    self.num_ut_per_sector,
-                    -1,
-                    h_serv.shape[3],
-                    h_serv.shape[4],
-                ],
-            )
+            FFT = tf.shape(h_serv)[2]
+            RxA = tf.shape(h_serv)[3]
+            TxA = tf.shape(h_serv)[4]
+
+            # Construct indices for scatter update
+            # Indices: [b, ut_idx] -> [b, serving_bs_id, slot_id]
+
+            batch_indices = tf.range(B)[:, None]  # [B, 1]
+            batch_indices = tf.broadcast_to(
+                batch_indices, [B, N_UT_Total]
+            )  # [B, Num_UT]
+
+            bs_indices = tf.cast(self.serving_bs_ids, tf.int32)  # [B, Num_UT]
+
+            # Slot indices: For now, assume 1 UE per BS (slot 0).
+            # If complex scheduling is added later, this needs logic to handle multiple UEs per BS.
+            # We assume N_UT_Sec=1 and each BS is served by at most 1 UE for this logic (or last one overwrites via scatter?)
+            # scatter_nd sums duplicate updates. If we have 2 UEs on same BS and slot 0, they will sum up.
+            # For 1 BS - 1 UE topology, this is safe.
+            slot_indices = tf.zeros_like(bs_indices)
+
+            # Stack to create indices: [B*Num_UT, 3] -> (Batch, BS, Slot)
+            indices = tf.stack(
+                [batch_indices, bs_indices, slot_indices], axis=-1
+            )  # [B, Num_UT, 3]
+
+            # Prepare Updates (h_serv)
+            # h_serv: [Batch, Num_UT, SC, RxA, TxA] -> [Batch, Num_UT, Features]
+            # We treat (SC, RxA, TxA) as a block of features
+            h_serv_flat = tf.reshape(h_serv, [B, N_UT_Total, -1])
+
+            # Prepare Canvas (h_bs)
+            # Flattened feature dimension size
+            feature_dim = FFT * RxA * TxA
+            h_bs_shape = [B, N_BS, N_UT_Sec, feature_dim]
+
+            # Scatter
+            # Flatten indices to [B*Num_UT, 3] if needed? No, scatter_nd handles multidim indices if updates match.
+            # indices: [B, Num_UT, 3], updates: [B, Num_UT, Features] -> Output: [B, N_BS, N_UT_Sec, Features]
+            h_bs_flat = tf.scatter_nd(indices, h_serv_flat, h_bs_shape)
+
+            # Reshape back to detailed dimensions
+            h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, FFT, RxA, TxA])
+
+            # Note: scatter_nd fills unassigned slots with 0.
 
             if self.direction == "uplink":
                 # BS is Receiver: RxA = num_bs_ant, TxA = num_ut_ant
