@@ -256,9 +256,31 @@ class HybridSystemSimulator(Block):
         diff = tf.expand_dims(self.ut_loc, axis=2) - tf.expand_dims(self.bs_loc, axis=1)
         dist = tf.norm(diff, axis=-1)
 
-        # 2. Select top K neighbors based on distance
-        # Note: smallest distance = largest -dist
-        _, neighbor_indices = tf.math.top_k(-dist, k=self.config.num_neighbors)
+        # 2. Define Explicit Serving BS Association
+        # We enforce a strict mapping: UEs are associated with BSs sequentially.
+        # This matches the ID-based logic used in beamforming and resource allocation.
+        ut_ids = tf.range(self.num_ut)
+        serving_bs_ids_flat = ut_ids // self.num_ut_per_sector
+
+        # Store as class member for use in other methods
+        self.serving_bs_ids = tf.broadcast_to(
+            serving_bs_ids_flat[None, :], [self.batch_size, self.num_ut]
+        )
+
+        # 3. Select Neighbors: Serving BS (Index 0) + Top K-1 Interferers
+
+        # Create a mask for the serving BS
+        bs_range = tf.range(self.num_bs)
+        # [1, num_ut, num_bs]
+        is_serving = self.serving_bs_ids[:, :, None] == bs_range[None, None, :]
+
+        # Modify distance for sorting:
+        # Assign a large negative 'distance' to the Serving BS so it is always selected first
+        # by top_k(-dist) which prioritizes smallest distances (largest negative values).
+        dist_modified = tf.where(is_serving, -1.0e9, dist)
+
+        # Select neighbors
+        _, neighbor_indices = tf.math.top_k(-dist_modified, k=self.config.num_neighbors)
         # neighbor_indices shape: [batch, num_ut, num_neighbors]
         self.neighbor_indices = neighbor_indices
 
@@ -311,7 +333,7 @@ class HybridSystemSimulator(Block):
 
             # 1. Get Channel Information
             # Get Element-Domain Channel for Beam Selection
-            h_elem_bs = self.channel_interface.get_element_channel_for_beam_selection(
+            h_elem_all = self.channel_interface.get_element_channel_for_beam_selection(
                 batch_size=self.batch_size,
                 rbg_size_sc=self.rbg_size_sc,
                 ut_loc=self.ut_loc,
@@ -321,41 +343,59 @@ class HybridSystemSimulator(Block):
                 neighbor_indices=self.neighbor_indices,
                 ut_velocities=self.ut_velocities,
                 in_state=self.in_state,
-            )[0]
+            )
+            # Serving link channel extraction
+            # neighbor index 0 corresponds to serving link.
+            # h_elem_all shape: [Batch, Total_UT, Neighbors, Time(1), SC, RxA, TxA]
+            h_serv = h_elem_all[:, :, 0, 0, :, :, :]
 
             # 2. Select Analog Beams (BS Side)
-            # BS Beam Selection
-            # w_rf_selected: [B, U, TotalAnt, SubPorts(2)]
-            w_rf_selected = self.beam_selector(h_elem_bs, self.config.bs_array)
-
-            # Transpose to [Batch, NumTxAnt, U, NumTxPorts] (if that is the logic)
-            # Note: This logic assumes 1-to-1 mapping or simplified precoding.
-
-            # Reshape to [Batch, TotalAnt, U * SubPorts] -> Mapping Users/Pols to RF Chains
-            # Transpose to [Batch, TotalAnt, U, SubPorts]
-            w_rf_transposed = tf.transpose(w_rf_selected, perm=[0, 2, 1, 3])
-            # Reshape to [Batch, TotalAnt, U*SubPorts]
-            # w_rf_flat: [Batch, TotalAnt, Candidates]
-            w_rf_flat = tf.reshape(
-                w_rf_transposed, [self.batch_size, self.num_bs_ant, -1]
+            # BS Beam Selection must be done per BS, considering its served UEs.
+            # h_serv shape: [Batch, Total_UT, SC, RxA, TxA]
+            # Reshape based on actual number of Rx/Tx antennas in the channel model
+            h_bs = tf.reshape(
+                h_serv,
+                [
+                    self.batch_size,
+                    self.num_bs,
+                    self.num_ut_per_sector,
+                    -1,
+                    h_serv.shape[3],
+                    h_serv.shape[4],
+                ],
             )
 
-            # Match number of RF chains (BS Ports)
             if self.direction == "uplink":
-                target_ports = self.channel_interface.hybrid_channel.num_rx_ports
+                # BS is Receiver: RxA = num_bs_ant, TxA = num_ut_ant
+                # h_bs: [B, num_bs, ut, SC, BS_Ant, UT_Ant]
+                # Permute to [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
+                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 5, 4, 3])
             else:
-                target_ports = self.channel_interface.hybrid_channel.num_tx_ports
+                # BS is Transmitter: RxA = num_ut_ant, TxA = num_bs_ant
+                # h_bs: [B, num_bs, ut, SC, UT_Ant, BS_Ant]
+                # Permute to [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
+                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 5, 3])
 
-            num_candidates = tf.shape(w_rf_flat)[-1]
+            # Flatten to [Batch * num_bs, num_ut_per_sector, Other_Ant, BS_Ant, SC]
+            h_selector_input = tf.reshape(
+                h_bs_permuted,
+                [
+                    -1,
+                    self.num_ut_per_sector,
+                    tf.shape(h_bs_permuted)[3],
+                    self.num_bs_ant,
+                    tf.shape(h_bs_permuted)[5],
+                ],
+            )
 
-            if num_candidates >= target_ports:
-                w_rf_bs = w_rf_flat[..., :target_ports]
-            else:
-                padding = tf.zeros(
-                    [self.batch_size, self.num_bs_ant, target_ports - num_candidates],
-                    dtype=w_rf_flat.dtype,
-                )
-                w_rf_bs = tf.concat([w_rf_flat, padding], axis=-1)
+            # BS Beam Selection
+            # w_rf_bs_flat: [Batch * num_bs, TotalAnt, TotalPorts]
+            w_rf_bs_flat = self.beam_selector(h_selector_input, self.config.bs_array)
+
+            # Reshape back to [Batch, num_bs, TotalAnt, TotalPorts]
+            w_rf_bs = tf.reshape(
+                w_rf_bs_flat, [self.batch_size, self.num_bs, self.num_bs_ant, -1]
+            )
 
             # UE Analog Beam: Identity (Full Digital or Fixed)
             if self.direction == "uplink":

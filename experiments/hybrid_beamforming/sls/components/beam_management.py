@@ -206,90 +206,91 @@ class BeamSelector(Block):
 
         Args:
             h_elem (tf.Tensor): Element-domain channel.
-                Shape: [batch, num_ut, num_rx_cp, 1, num_tx_ant, 1, num_sc] (approx)
-                We assume 'num_tx_ant' is the dimension to sweep.
-                Note: h_elem from `get_element_channel_for_beam_selection` needs to be defined.
+                Shape: [batch, num_ut, ... , num_tx_ant, num_sc]
+            antenna_array: The BS antenna array object.
 
         Returns:
-            w_rf (tf.Tensor): Analog precoder weights [batch, num_ut, num_tx_ant, num_tx_ports]
-                Constructed for all panels.
+            w_rf (tf.Tensor): Analog precoder weights [batch, num_tx_ant, num_tx_ports]
+                Constructed for all panels, combining beams for all users in the batch sector.
         """
         # --- 1. パネル0のチャネル抽出 ---
-        n = 0  # first panel
-        # 1パネルあたりのアンテナ数 (偏波含む)
+        n = 0
         n_ant_panel = antenna_array._num_panel_ant.numpy()
-        # パネル番号 'n' のアンテナインデックスの範囲
         start_idx = n * n_ant_panel
         end_idx = (n + 1) * n_ant_panel
-        # パネル 'n' の物理座標を確認
-        # panel_n_pos = antenna_array.ant_pos[start_idx:end_idx]
-        # Get h_elem for first panel
-        h_panel = h_elem[..., start_idx:end_idx, :]
+        h_panel = h_elem[..., start_idx:end_idx, :]  # [B, U, R, PanelAnt, S]
 
         # --- 2. コードブックをDual-pol構造に拡張 ---
         # w_spatial: [ant_per_pol(rows*cols), num_beams]
-        # Sionnaのインデックスに合わせて [Pol1, Pol2, Pol1, Pol2...] にリピート
-        # w_dual_pol: [ant_per_panel(rows*cols*2), num_beams]
+        # Sionnaのインデックスに合わせて偏波を挟み込む
         w_dual_pol = tf.repeat(self.w_spatial, repeats=2, axis=0)
 
         # --- 3. ビームスイープ (全ビームの応答計算) ---
-        # h_panel: [B, U, R, N_ant_panel, S]
-        # w_dual_pol: [N_ant_panel, N_beams]
-        # beam_response: [B, U, R, N_beams, S]
         beam_response = tf.einsum(
             "...ns,nk->...ks", h_panel, tf.cast(w_dual_pol, h_panel.dtype)
         )
 
         # --- 4. パワー計算とベストビーム選択 ---
-        # Rxアンテナ(axis=2)とサブキャリア(axis=-1)で平均/和をとる
         beam_power = tf.reduce_sum(tf.abs(beam_response) ** 2, axis=[2, -1])
-        best_beam_idx = tf.argmax(beam_power, axis=-1, output_type=tf.int32)  # [B, U]
+        best_beam_idx = tf.argmax(beam_power, axis=-1, output_type=tf.int32)
 
-        # --- 5. 全パネルへのブロードキャスト適用 ---
-        # _construct_full_precoder 内で全パネル(32個)に対して
-        # 選択されたビームをブロック対角に配置する
+        # --- 5. 全パネルへのマッピング (BS単位の行列生成) ---
         return self._construct_full_precoder(best_beam_idx)
 
     def _construct_full_precoder(self, best_beam_idx):
         """
-        best_beam_idx: [Batch, User]
-        Returns: [Batch, User, Total_Ant(num_panels*4), Total_RF(num_panels*2)]
+        best_beam_idx: [Batch, num_ut_per_sector]
+        Returns: [Batch, Total_Ant, Total_RF]
         """
-        # 1. 選択された空間重みを取得 [Batch, U, ant_per_pol_in_panel(2)]
-        # w_spatial.T は [num_beams, 2]
-        w_selected = tf.gather(tf.transpose(self.w_spatial), best_beam_idx)
-
         batch_size = tf.shape(best_beam_idx)[0]
         num_ut = tf.shape(best_beam_idx)[1]
-        num_panels = self.num_panels_v * self.num_panels_h  # 32
+        num_panels = self.num_panels_v * self.num_panels_h
+        ant_per_panel = self.ant_per_panel  # e.g., 8
 
-        # 2. パネル単位のウェイト行列作成 [Batch, U, 4(Ant), 2(Port)]
-        # Sionnaの順序 [P1, P2, P1, P2] に合わせる
-        # w_selected: [B, U, 2] -> w0, w1
-        w0 = w_selected[:, :, 0:1]  # [B, U, 1]
-        w1 = w_selected[:, :, 1:2]  # [B, U, 1]
-        z = tf.zeros_like(w0)
+        # 1. 選択された空間重みを取得 [Batch, U, ant_per_pol_in_panel]
+        w_all_beams = tf.transpose(self.w_spatial)
+        # w_selected: [Batch, U, ant_per_pol]
+        w_selected = tf.gather(w_all_beams, best_beam_idx)
 
-        # Port0用 (Pol1のみに重み): [w0, 0, w1, 0]
-        port0 = tf.stack([w0, z, w1, z], axis=-2)  # [B, U, 4, 1]
-        # Port1用 (Pol2のみに重み): [0, w0, 0, w1]
-        port1 = tf.stack([z, w0, z, w1], axis=-2)  # [B, U, 4, 1]
+        # 2. パネル単位のウェイト行列作成 [Batch, U, ant_per_panel, 2(Ports)]
+        # 偏波ごとにウェイトを配置
+        # w_selected は[Batch, U, N] で、N個のアンテナ素子それぞれに同じ偏波内ウェイト
+        # Sionnaの順序 [Pol1, Pol2, Pol1, Pol2...]
+        # port0: [w0, 0, w1, 0, ...]
+        # port1: [0, w0, 0, w1, ...]
+        w_expanded = tf.repeat(w_selected, repeats=2, axis=-1)  # [B, U, ant_per_panel]
+        z = tf.zeros_like(w_expanded)
 
-        # パネル内接続行列 [B, U, 4, 2]
-        w_panel = tf.concat([port0, port1], axis=-1)
-
-        # 3. 全パネルをブロック対角に配置
-        # 各パネルが独立したRFポート(2個ずつ)を持つように拡張
-        # identity: [num_panels, num_panels]
-        eye_panels = tf.eye(num_panels, dtype=self.dtype)
-
-        # [B, U, 1, 1, 4, 2] * [1, 1, P, P, 1, 1] -> [B, U, P, P, 4, 2]
-        w_big = tf.expand_dims(tf.expand_dims(w_panel, 2), 2) * tf.reshape(
-            eye_panels, [1, 1, num_panels, num_panels, 1, 1]
+        mask0 = tf.tile(
+            tf.constant([1.0, 0.0], dtype=self.cdtype), [ant_per_panel // 2]
+        )
+        mask1 = tf.tile(
+            tf.constant([0.0, 1.0], dtype=self.cdtype), [ant_per_panel // 2]
         )
 
-        # 次元置換と結合: [B, U, P(row), Ant, P(col), Port] -> [B, U, P*Ant, P*Port]
-        w_rf = tf.transpose(w_big, [0, 1, 2, 4, 3, 5])
-        w_rf = tf.reshape(w_rf, [batch_size, num_ut, num_panels * 4, num_panels * 2])
+        port0 = w_expanded * tf.cast(mask0, self.cdtype)
+        port1 = w_expanded * tf.cast(mask1, self.cdtype)
+
+        # [B, U, ant_per_panel, 2]
+        w_panel_per_ut = tf.stack([port0, port1], axis=-1)
+
+        # 3. ユーザーをパネルにマッピング
+        eye_ut = tf.eye(num_ut, num_columns=num_panels, dtype=self.cdtype)
+        w_diag = tf.expand_dims(w_panel_per_ut, 2) * tf.reshape(
+            eye_ut, [1, num_ut, num_panels, 1, 1]
+        )
+        w_per_panel = tf.reduce_sum(w_diag, axis=1)  # [B, P, Ant_p, 2]
+
+        # 4. 全パネルを結合して巨大な行列にする
+        eye_p = tf.eye(num_panels, dtype=self.cdtype)
+        w_big = tf.expand_dims(w_per_panel, 2) * tf.reshape(
+            eye_p, [1, num_panels, num_panels, 1, 1]
+        )
+
+        # [B, P(row), Ant_p, P(col), 2] -> [B, P*Ant_p, P*2]
+        w_rf = tf.transpose(w_big, [0, 1, 3, 2, 4])
+        w_rf = tf.reshape(
+            w_rf, [batch_size, num_panels * ant_per_panel, num_panels * 2]
+        )
 
         return w_rf
