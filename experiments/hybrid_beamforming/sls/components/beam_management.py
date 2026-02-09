@@ -223,7 +223,10 @@ class BeamSelector(Block):
         # --- 2. コードブックをDual-pol構造に拡張 ---
         # w_spatial: [ant_per_pol(rows*cols), num_beams]
         # Sionnaのインデックスに合わせて偏波を挟み込む
-        w_dual_pol = tf.repeat(self.w_spatial, repeats=2, axis=0)
+        if self.polarization in ["dual", "cross"]:
+            w_dual_pol = tf.repeat(self.w_spatial, repeats=2, axis=0)
+        else:
+            w_dual_pol = self.w_spatial
 
         # --- 3. ビームスイープ (全ビームの応答計算) ---
         beam_response = tf.einsum(
@@ -252,27 +255,33 @@ class BeamSelector(Block):
         # w_selected: [Batch, U, ant_per_pol]
         w_selected = tf.gather(w_all_beams, best_beam_idx)
 
-        # 2. パネル単位のウェイト行列作成 [Batch, U, ant_per_panel, 2(Ports)]
-        # 偏波ごとにウェイトを配置
-        # w_selected は[Batch, U, N] で、N個のアンテナ素子それぞれに同じ偏波内ウェイト
-        # Sionnaの順序 [Pol1, Pol2, Pol1, Pol2...]
-        # port0: [w0, 0, w1, 0, ...]
-        # port1: [0, w0, 0, w1, ...]
-        w_expanded = tf.repeat(w_selected, repeats=2, axis=-1)  # [B, U, ant_per_panel]
-        z = tf.zeros_like(w_expanded)
+        if self.polarization in ["dual", "cross"]:
+            # 2. パネル単位のウェイト行列作成 [Batch, U, ant_per_panel, 2(Ports)]
+            # 偏波ごとにウェイトを配置
+            # w_selected は[Batch, U, N] で、N個のアンテナ素子それぞれに同じ偏波内ウェイト
+            # Sionnaの順序 [Pol1, Pol2, Pol1, Pol2...]
+            # port0: [w0, 0, w1, 0, ...]
+            # port1: [0, w0, 0, w1, ...]
+            w_expanded = tf.repeat(
+                w_selected, repeats=2, axis=-1
+            )  # [B, U, ant_per_panel]
 
-        mask0 = tf.tile(
-            tf.constant([1.0, 0.0], dtype=self.cdtype), [ant_per_panel // 2]
-        )
-        mask1 = tf.tile(
-            tf.constant([0.0, 1.0], dtype=self.cdtype), [ant_per_panel // 2]
-        )
+            mask0 = tf.tile(
+                tf.constant([1.0, 0.0], dtype=self.cdtype), [ant_per_panel // 2]
+            )
+            mask1 = tf.tile(
+                tf.constant([0.0, 1.0], dtype=self.cdtype), [ant_per_panel // 2]
+            )
 
-        port0 = w_expanded * tf.cast(mask0, self.cdtype)
-        port1 = w_expanded * tf.cast(mask1, self.cdtype)
+            port0 = w_expanded * tf.cast(mask0, self.cdtype)
+            port1 = w_expanded * tf.cast(mask1, self.cdtype)
 
-        # [B, U, ant_per_panel, 2]
-        w_panel_per_ut = tf.stack([port0, port1], axis=-1)
+            # [B, U, ant_per_panel, 2]
+            w_panel_per_ut = tf.stack([port0, port1], axis=-1)
+        else:
+            # Single Polarization
+            # [B, U, ant_per_panel, 1]
+            w_panel_per_ut = tf.expand_dims(w_selected, axis=-1)
 
         # 3. ユーザーをパネルにマッピング
         eye_ut = tf.eye(num_ut, num_columns=num_panels, dtype=self.cdtype)

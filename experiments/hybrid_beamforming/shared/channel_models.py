@@ -317,7 +317,7 @@ class HybridOFDMChannel(ChunkedOFDMChannel):
             if w_rf.shape[0] == h_elem.shape[3]:  # matches num_tx
                 eq_tx = "brutvsc,tvp->brutpsc"
             else:  # assumes [batch, v, p]
-                eq_tx = "brutvsc,bvp->brutpsc"
+                eq_tx = "brutvsc,bvm->brutpsc"
         else:  # [b, t, v, p]
             eq_tx = "brutvsc,btvp->brutpsc"
 

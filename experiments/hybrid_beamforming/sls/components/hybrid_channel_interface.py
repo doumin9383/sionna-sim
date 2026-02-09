@@ -68,6 +68,7 @@ class HybridChannelInterface(Block):
         in_state=None,
         return_element_channel=False,
         rbg_size_sc=1,
+        return_s_u_v=True,
     ):
         """
         Generates channel only for the specified neighbors using virtual topology mapping.
@@ -348,6 +349,9 @@ class HybridChannelInterface(Block):
         if return_element_channel:
             return h_neighbor
 
+        if not return_s_u_v:
+            return h_neighbor
+
         s, u, v = tf.linalg.svd(h_neighbor)
         return h_neighbor, s, u, v
 
@@ -440,6 +444,7 @@ class HybridChannelInterface(Block):
         bs_orient,
         neighbor_indices=None,
         return_element_channel=False,
+        return_s_u_v=True,
     ):
         """
         Generates channel using external ray-tracing data (Zarr).
@@ -913,6 +918,12 @@ class HybridChannelInterface(Block):
         if return_element_channel:
             return h_neighbor
 
+        if not return_s_u_v:
+            return h_neighbor
+
+        if not return_s_u_v:
+            return h_neighbor
+
         s, u, v = tf.linalg.svd(h_neighbor)
         return h_neighbor, s, u, v
 
@@ -926,6 +937,7 @@ class HybridChannelInterface(Block):
         neighbor_indices=None,
         ut_velocities=None,
         in_state=None,
+        return_s_u_v=True,
     ):
         """
         Returns the port-domain channel information.
@@ -950,7 +962,9 @@ class HybridChannelInterface(Block):
                 bs_loc,
                 ut_orient,
                 bs_orient,
+                bs_orient,
                 neighbor_indices=effective_neighbor_indices,
+                return_s_u_v=return_s_u_v,
             )
         if effective_neighbor_indices is not None:
             return self.get_neighbor_channel_info(
@@ -962,12 +976,16 @@ class HybridChannelInterface(Block):
                 neighbor_indices=effective_neighbor_indices,
                 ut_velocities=ut_velocities,
                 in_state=in_state,
+                return_s_u_v=return_s_u_v,
             )
 
         if self.use_rbg_granularity:
             h = self.hybrid_channel.get_rbg_channel(batch_size, self.rbg_size_sc)
         else:
             h = self.hybrid_channel(batch_size)
+
+        if not return_s_u_v:
+            return h
 
         s, u, v = tf.linalg.svd(h)
         return h, s, u, v
