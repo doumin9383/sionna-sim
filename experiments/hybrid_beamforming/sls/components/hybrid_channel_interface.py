@@ -735,23 +735,58 @@ class HybridChannelInterface(Block):
             h_port_links = tf.einsum("lptki, lto -> lpoki", term1, w_rf_links)
             # Shape: [Links, RxP, TxP, Paths, 1]
 
-            # 7. Convert to OFDM
-            # cir_to_ofdm_channel(frequencies, a, tau, ...)
-            # a: [..., Paths, Time]. h_port_links is [Links, RxP, TxP, Paths, 1].
-            # tau: Needs to match shape. rays_delays is [Links, 1, 1, Paths].
-            # Broadcast tau to [Links, RxP, TxP, Paths].
-            tau_flat = (
-                rays_obj_flat.delays
-            )  # [Links, 1, 1, Paths] (from flatten_to_links, expanding Rx/Tx to 1)
-            # Flatten_to_links produced [Links, 1, 1, Paths].
+            # Manual CIR to OFDM for h_port_links (Contracted Channel) to avoid Rank > 5 errors
+            # h_port_links: [Links, RxP, TxP, Paths, 1]
+            # delays_flat: [Links, 1, 1, Paths] (Need broadcasting)
 
-            # a input to cir_to...: [Links, RxP, TxP, Paths, 1]
-            # tau matches broadcast.
+            shape_t2 = tf.shape(h_port_links)
+            # Flatten to [N, Paths, 1]
+            num_paths_dim = shape_t2[3]
+            h_port_links_reshaped = tf.reshape(h_port_links, [-1, num_paths_dim, 1])
 
-            h_ofdm = cir_to_ofdm_channel(
-                frequencies, h_port_links, tau_flat, normalize=False
+            # Broadcast tau to match h_port_links shape prefix
+            # h_port_links shape: [Links, RxP, TxP, Paths, 1]
+            # delays_flat shape: [Links, 1, 1, Paths]
+            # We want tau to broad cast to [Links, RxP, TxP, Paths]
+
+            # Extract dims
+            n_links = shape_t2[0]
+            n_rxp = shape_t2[1]
+            n_txp = shape_t2[2]
+
+            # Reshape delays_flat to [Links, 1, 1, Paths] (It is already)
+            # Tile/Broadcast to [Links, RxP, TxP, Paths]
+            tau_broadcast = tf.broadcast_to(
+                delays_flat, [n_links, n_rxp, n_txp, num_paths_dim]
             )
-            # h_ofdm: [Links, RxP, TxP, 1, NumSubcarriers]
+
+            # Flatten tau to [-1, Paths]
+            tau_reshaped = tf.reshape(tau_broadcast, [-1, num_paths_dim])
+
+            # Manual DFT
+            from sionna.phy import PI
+
+            # phase: [N_flat, Paths, Freq]
+            phase = (
+                -2
+                * PI
+                * tau_reshaped[..., tf.newaxis]
+                * frequencies[tf.newaxis, tf.newaxis, :]
+            )
+            basis = tf.exp(tf.complex(0.0, phase))  # [N_flat, P, F]
+
+            term2_c = (
+                tf.complex(h_port_links_reshaped, 0.0)
+                if h_port_links_reshaped.dtype.is_floating
+                else h_port_links_reshaped
+            )
+
+            # Sum over paths
+            h_ofdm_flat = tf.reduce_sum(term2_c * basis, axis=1)  # [N_flat, F]
+
+            # Reshape back to [Links, RxP, TxP, 1, SC]
+            # h_ofdm_flat is [Links*RxP*TxP, SC]
+            h_ofdm = tf.reshape(h_ofdm_flat, [n_links, n_rxp, n_txp, 1, -1])
 
             # 8. Reshape back to [Batch, SubUT, Neighbors, ...]
             # [B, U, N, RxP, TxP, 1, SC]

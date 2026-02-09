@@ -492,6 +492,9 @@ class HybridSystemSimulator(Block):
             # Assuming "CP-OFDM" and Rank 1 for simplified PC
             # In future, use actual scheduler rank
             mpr_val = self.mpr_model.get_mpr("CP-OFDM", 1)  # Scalar approximation
+            mpr_db = tf.fill(
+                [self.batch_size, self.num_ut], tf.cast(mpr_val, tf.float32)
+            )
 
             # c. Calculate Tx Power
             if self.direction == "uplink":
@@ -501,9 +504,15 @@ class HybridSystemSimulator(Block):
                 p_tx_dbm = self.power_control.calculate_tx_power(
                     pl_db, num_rbs, mpr_val
                 )
+                p_cmax_dbm = self.ut_max_power_dbm - mpr_val
             else:
                 # Downlink: Use fixed power
                 p_tx_dbm = tx_power_dbm
+                p_cmax_dbm = self.bs_max_power_dbm  # Assuming no MPR for BS
+
+            p_cmax_dbm_tensor = tf.fill(
+                [self.batch_size, self.num_ut], tf.cast(p_cmax_dbm, tf.float32)
+            )
 
             # Broadcast p_tx_dbm to [batch, num_ut] if it calculated scalar/vector
             # p_tx_dbm might be tensor [batch, num_ut]
@@ -523,6 +532,10 @@ class HybridSystemSimulator(Block):
             # d. Physics Abstraction (Equal Power Allocation across streams -> SINR)
             # num_streams is dynamic based on channel rank (SVD)
             num_streams = tf.shape(s_power)[-1]
+            rank_per_user = tf.fill(
+                [self.batch_size, self.num_ut], tf.cast(num_streams, tf.float32)
+            )
+
             p_alloc = total_power_expanded / tf.cast(num_streams, self.rdtype)
 
             # Calculate SINR: P * |h|^2 / (N0 + I)
@@ -595,6 +608,9 @@ class HybridSystemSimulator(Block):
                 ),
                 olla_offset=match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
                 sinr_eff=match_hist_shape(sinr_eff_avg),
+                p_cmax_dbm=match_hist_shape(p_cmax_dbm_tensor),
+                rank=match_hist_shape(rank_per_user),
+                mpr_db=match_hist_shape(mpr_db),
                 pf_metric=tf.reshape(
                     match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
                     [self.batch_size, self.num_bs, 1, 1, self.num_ut_per_sector],

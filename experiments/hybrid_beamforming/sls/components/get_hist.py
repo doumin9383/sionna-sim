@@ -1,5 +1,6 @@
 import sionna
 import tensorflow as tf
+
 # Additional external libraries
 import matplotlib.pyplot as plt
 import numpy as np
@@ -49,6 +50,9 @@ def init_result_history(batch_size, num_slots, num_bs, num_ut_per_sector):
         "mcs_index",
         "harq",
         "num_allocated_re",
+        "p_cmax_dbm",
+        "rank",
+        "mpr_db",
     ]:
         hist[key] = tf.TensorArray(
             size=num_slots,
@@ -71,6 +75,9 @@ def record_results(
     olla_offset=None,
     sinr_eff=None,
     pf_metric=None,
+    p_cmax_dbm=None,
+    rank=None,
+    mpr_db=None,
     shape=None,
 ):
     """Record results of last slot"""
@@ -85,6 +92,9 @@ def record_results(
                 "num_decoded_bits",
                 "mcs_index",
                 "harq",
+                "p_cmax_dbm",
+                "rank",
+                "mpr_db",
             ],
             [
                 pathloss_serving_cell,
@@ -95,13 +105,19 @@ def record_results(
                 num_decoded_bits,
                 mcs_index,
                 harq_feedback,
+                p_cmax_dbm,
+                rank,
+                mpr_db,
             ],
         ):
-            hist[key] = hist[key].write(slot, tf.cast(value, tf.float32))
+            if value is not None:
+                hist[key] = hist[key].write(slot, tf.cast(value, tf.float32))
+
         # Average PF metric across resources
-        hist["pf_metric"] = hist["pf_metric"].write(
-            slot, tf.reduce_mean(pf_metric, axis=[-2, -3])
-        )
+        if pf_metric is not None:
+            hist["pf_metric"] = hist["pf_metric"].write(
+                slot, tf.reduce_mean(pf_metric, axis=[-2, -3])
+            )
     else:
         nan_tensor = tf.cast(tf.fill(shape, float("nan")), dtype=tf.float32)
         for key in hist:
@@ -121,9 +137,21 @@ def clean_hist(hist, batch=0):
             pass
 
     # Mask metrics when user is not scheduled
-    hist["mcs_index"] = np.where(hist["harq"] == -1, np.nan, hist["mcs_index"])
-    hist["sinr_eff"] = np.where(hist["harq"] == -1, np.nan, hist["sinr_eff"])
-    hist["tx_power"] = np.where(hist["harq"] == -1, np.nan, hist["tx_power"])
-    hist["num_allocated_re"] = np.where(hist["harq"] == -1, 0, hist["num_allocated_re"])
-    hist["harq"] = np.where(hist["harq"] == -1, np.nan, hist["harq"])
+    for key in [
+        "mcs_index",
+        "sinr_eff",
+        "tx_power",
+        "p_cmax_dbm",
+        "rank",
+        "mpr_db",
+        "harq",
+    ]:
+        if key in hist:
+            hist[key] = np.where(hist["harq"] == -1, np.nan, hist[key])
+
+    if "num_allocated_re" in hist:
+        hist["num_allocated_re"] = np.where(
+            hist["harq"] == -1, 0, hist["num_allocated_re"]
+        )
+
     return hist
