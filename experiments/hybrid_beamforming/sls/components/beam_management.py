@@ -287,6 +287,10 @@ class BeamSelector(Block):
         # Total elements in one panel = n_sp * stride
         n_panel_total = n_sp * stride
 
+        # DEBUG
+        print(f"DEBUG: BeamSelector h_elem shape: {h_elem.shape}")
+        print(f"DEBUG: n_panel_total: {n_panel_total}, stride: {stride}")
+
         h_panel = h_elem[..., :n_panel_total, :]  # Slicing TxAnt axis (axis -2 assumed)
 
         # Subsample for single pol
@@ -405,13 +409,20 @@ class BeamSelector(Block):
             # This is tricky with simple stacking.
 
             # Alternative: w_base * eye(2)
-            # w_base: [B, U, n_sp, 1, 1]
-            # eye: [1, 1, 1, 2, 2]
-            # res: [B, U, n_sp, 2, 2]
+            # w_base: [..., n_sp, 1, 1]
+            # eye: [..., 2, 2]
+            # res: [..., n_sp, 2, 2]
             w_block = tf.expand_dims(w_base, -1) * tf.eye(2, dtype=w_base.dtype)
 
-            # Flatten to [B, U, n_sp*2, 2]
-            w_panel = tf.reshape(w_block, [batch_size, num_ut, self.ant_per_panel, 2])
+            # Reshape to [..., n_sp*2, 2] handling arbitrary leading dims (Batch, U, Neighbors, Time)
+            input_shape = tf.shape(w_block)
+            # Leading dims: all except last 3 (n_sp, 2, 2)
+            leading_dims = input_shape[:-3]
+
+            # Target dim for antenna: ant_per_panel (should correspond to n_sp * 2)
+            target_shape = tf.concat([leading_dims, [self.ant_per_panel, 2]], axis=0)
+
+            w_panel = tf.reshape(w_block, target_shape)
 
         else:
             w_panel = w_base  # [B, U, n_sp, 1]
@@ -515,7 +526,15 @@ class BeamSelector(Block):
         # I will implement Simple Repetition.
         # If the user wants coherent global beamforming, they need a global codebook.
 
-        w_final = tf.tile(w_panel, [1, 1, num_panels, 1])
+        # w_panel shape: [..., Ant, Ports] (Rank N)
+        # We want to tile axis -2 (Ant) by num_panels.
+        rank = tf.rank(w_panel)
+        # Multiples: [1, ..., 1, num_panels, 1]
+        multiples = tf.concat(
+            [tf.ones([rank - 2], dtype=tf.int32), [num_panels], [1]], axis=0
+        )
+
+        w_final = tf.tile(w_panel, multiples)
         # [B, U, NumPanels * n_sp * 2, 2]
 
         return w_final

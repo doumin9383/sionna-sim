@@ -22,7 +22,8 @@ def test_external_sim():
     print("Testing External Data SLS Pipeline...")
 
     # 1. Initialize External Loader
-    loader = ExternalChannelLoader("data/processed/coverage.zarr")
+    # 1. Initialize External Loader
+    loader = ExternalChannelLoader("data/processed/calibration_sls.zarr")
 
     # 2. Configuration (Match the dummy data)
     carrier_frequency = 3.5e9
@@ -58,26 +59,39 @@ def test_external_sim():
         cyclic_prefix_length=6,
     )
 
-    sim_config = HybridSLSConfig(
-        scenario="uma",
-        num_rings=1,  # num_rings=1 -> 1-ring = 21 sectors
-        num_ut_per_sector=2,  # Total num_ut = 42
-        num_neighbors=4,
-        use_rbg_granularity=True,
-        rbg_size_rb=1,
-        bs_array=bs_array,
-        ut_array=ut_array,
-        resource_grid=rg,
-        batch_size=1,
-    )
+    sim_config = HybridSLSConfig()
+    sim_config.scenario = "umi"
+    sim_config.direction = "downlink"
+    sim_config.num_rings = 1
+    sim_config.num_ut_per_sector = 2
+    sim_config.num_neighbors = 4
+    sim_config.use_rbg_granularity = True
+    sim_config.rbg_size_rb = 1
+    # Overwrite arrays created by init with our custom ones if needed, or update params
+    # Here we created custom arrays above, so we assign them
+    sim_config.bs_array = bs_array
+    sim_config.ut_array = ut_array
+    sim_config.resource_grid = rg
+    sim_config.batch_size = 1
+
+    # Update array config parameters to match the custom arrays
+    sim_config.bs_num_rows_panel = 1
+    sim_config.bs_num_cols_panel = 1
+    sim_config.bs_num_rows_per_panel = 4
+    sim_config.bs_num_cols_per_panel = 4
+
+    sim_config.ut_num_rows_panel = 1
+    sim_config.ut_num_cols_panel = 1
+    sim_config.ut_num_rows_per_panel = 1
+    sim_config.ut_num_cols_per_panel = 1
 
     # 3. Instantiate Simulator with External Loader
     sim = HybridSystemSimulator(sim_config, external_loader=loader)
 
     # 4. Run Simulation
     print("Running simulation slot...")
-    # num_slots=1, tx_power=30dBm
-    sim(num_slots=1, tx_power_dbm=30.0)
+    # num_drops=1, tx_power=30dBm
+    sim(num_drops=1, tx_power_dbm=30.0)
 
     # 5. Report Memory
     try:

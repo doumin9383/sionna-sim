@@ -203,7 +203,28 @@ class HybridSystemSimulator(Block):
     def _setup_topology(self, num_rings, min_bs_ut_dist, max_bs_ut_dist):
         """Generate and set up network topology"""
 
-        if self.config.topology_type == "HexGrid":
+        # 0. Load Topology from External Loader if available
+        if self.external_loader is not None:
+            topo = self.external_loader.get_topology()
+            self.ut_loc = topo["ut_loc"]
+            self.bs_loc = topo["bs_loc"]
+            self.ut_orientations = topo["ut_orient"]
+            self.bs_orientations = topo["bs_orient"]
+            self.ut_velocities = topo["ut_vel"]
+            self.in_state = topo["in_state"]
+            self.los = topo["los"]
+            self.serving_cell_id = topo["serving_cell_id"]
+
+            # BS Virtual Loc needs to be derived or loaded?
+            # gen_hexgrid_topology returns it.
+            # If not saved, we might need it for some logic?
+            # It's used for wrapped-around distance calculation if enabled.
+            # If we don't support wrap-around in external mode or if saved bs_loc is already virtual/final?
+            # Usually bs_loc is enough for distance if no wrap-around logic is explicitly called later.
+            # We'll set it to None or bs_loc for now.
+            self.bs_virtual_loc = None
+
+        elif self.config.topology_type == "HexGrid":
             (
                 self.ut_loc,
                 self.bs_loc,
@@ -242,24 +263,27 @@ class HybridSystemSimulator(Block):
         self.neighbor_indices = neighbor_indices
 
         # 3. Set topology in channel model
-        if self.external_loader is None:
-            self.channel_model.set_topology(
-                self.ut_loc,
-                self.bs_loc,
-                self.ut_orientations,
-                self.bs_orientations,
-                self.ut_velocities,
-                self.in_state,
-                self.los,
-                self.bs_virtual_loc,
-            )
+
+        # Determine LoS argument
+        if self.external_loader is not None:
+            # Pass None for 'los' to avoid validation error/re-generation when using external Rays
+            los_arg = None
         else:
-            # When using external data, we still need mesh indices
-            self.ut_mesh_indices = self.external_loader.find_nearest_mesh(self.ut_loc)
+            los_arg = self.los
+
+        self.channel_model.set_topology(
+            self.ut_loc,
+            self.bs_loc,
+            self.ut_orientations,
+            self.bs_orientations,
+            self.ut_velocities,
+            self.in_state,
+            los_arg,
+            self.bs_virtual_loc,
+        )
 
     # @tf.function(jit_compile=False)
     def call(self, num_drops, tx_power_dbm):
-        # Initialize result history
         # We use 'num_drops' as the time dimension in the history
         hist = init_result_history(
             self.batch_size, num_drops, self.num_bs, self.num_ut_per_sector
@@ -274,7 +298,11 @@ class HybridSystemSimulator(Block):
 
         for drop_idx in range(num_drops):
             # 0. Set up new topology for this drop
+            if self.external_loader is not None:
+                self.external_loader.load_drop(drop_idx)
+
             # This generates new UT locations, channels, etc.
+            # If external_loader is used, _setup_topology should use it.
             self._setup_topology(
                 self.config.num_rings,
                 self.config.min_bs_ut_dist,
@@ -309,6 +337,22 @@ class HybridSystemSimulator(Block):
             # BS Beam Selection
             # w_rf_selected: [Batch, U, TotalAnt, SubPorts(2)]
             w_rf_selected = self.beam_selector(h_elem_bs)
+
+            # Handle extra dimensions from BeamSelector (Neighbors, Time)
+            # Expected: [Batch, U, Ant, Ports]
+            if tf.rank(w_rf_selected) > 4:
+                # Assume [Batch, U, Neighbors, Time, Ant, Ports]
+                # Take Serving Cell (Neighbor 0) and Time 0
+                # Or generic flattening?
+                # For now, slice to restore compat.
+                # We want [Batch, U, Ant, Ports]
+                # If shape is [B, U, N, T, A, P], we take [:, :, 0, 0, :, :]
+                # But let's be safe and just taking element 0 of extra dims.
+                while tf.rank(w_rf_selected) > 4:
+                    w_rf_selected = w_rf_selected[:, :, 0]  # consume dim 2
+
+            # Transpose to [Batch, NumTxAnt, U, NumTxPorts] (if that is the logic)
+            # Note: This logic assumes 1-to-1 mapping or simplified precoding.
 
             # Reshape to [Batch, TotalAnt, U * SubPorts] -> Mapping Users/Pols to RF Chains
             # Transpose to [Batch, TotalAnt, U, SubPorts]

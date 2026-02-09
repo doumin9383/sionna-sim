@@ -44,3 +44,5 @@ test_log.txt
 # Projects
 sionna/
 sionna-rt/
+
+data/
