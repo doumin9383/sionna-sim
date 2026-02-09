@@ -200,7 +200,7 @@ class BeamSelector(Block):
 
         return h_elem
 
-    def call(self, h_elem):
+    def call(self, h_elem, antenna_array):
         """
         Selects best beam for each user/link based on h_elem.
 
@@ -214,327 +214,82 @@ class BeamSelector(Block):
             w_rf (tf.Tensor): Analog precoder weights [batch, num_ut, num_tx_ant, num_tx_ports]
                 Constructed for all panels.
         """
-        # 1. Identify dimensions
-        # Expected h_elem: [batch, num_ut, num_rx_ant, num_tx_ant, num_sc]
-        # (Assuming we reduced other dims or specific shape)
+        # --- 1. パネル0のチャネル抽出 ---
+        n = 0  # first panel
+        # 1パネルあたりのアンテナ数 (偏波含む)
+        n_ant_panel = antenna_array._num_panel_ant.numpy()
+        # パネル番号 'n' のアンテナインデックスの範囲
+        start_idx = n * n_ant_panel
+        end_idx = (n + 1) * n_ant_panel
+        # パネル 'n' の物理座標を確認
+        # panel_n_pos = antenna_array.ant_pos[start_idx:end_idx]
+        # Get h_elem for first panel
+        h_panel = h_elem[..., start_idx:end_idx, :]
 
-        # Let's assume h_elem is [batch, num_ut, num_rx_ant, num_tx_ant, num_sc]
-        # We want to maximize power summing over rx_ant and sc.
+        # --- 2. コードブックをDual-pol構造に拡張 ---
+        # w_spatial: [ant_per_pol(rows*cols), num_beams]
+        # Sionnaのインデックスに合わせて [Pol1, Pol2, Pol1, Pol2...] にリピート
+        # w_dual_pol: [ant_per_panel(rows*cols*2), num_beams]
+        w_dual_pol = tf.repeat(self.w_spatial, repeats=2, axis=0)
 
-        # Limit to first panel
-        # num_tx_ant = h_elem.shape[-2]
-        # first_panel_size = self.rows_per_panel * self.cols_per_panel * (2 if dual-pol else 1)
-
-        # For cross-pol, the ordering is usually [Panel, Element, Pol] or [Pol, Panel, Element]
-        # Sionna PanelArray by default:
-        # The elements are indexed as: 0..N-1.
-        # We need to construct a mask or slice for the 0-th panel.
-
-        # Since implementation of arbitrary slicing is risky without knowing exact internal ordering,
-        # we assume standard PanelArray where we can calculate indexing.
-        # But actually, constructing the FULL W_RF is the goal.
-
-        # Let's simplify:
-        # We apply the codebook (spatial weights) to the channel.
-        # w_spatial: [ant_per_pol, num_beams]
-
-        # If cross-pol, we have 2 polarizations. We want to find the best SPATIAL beam.
-        # We can sum power across both polarizations for each beam.
-
-        # Extract Co-polarized and Cross-polarized sub-channels for the first panel?
-        # Simpler approach:
-        # 1. Take the first num_rows_per_panel * num_cols_per_panel elements.
-        #    These are Pol 1 of Panel 1 (assuming ordering allows).
-        #    Actually, Sionna PanelArray flattens as [num_panels_v, num_panels_h, pol, num_rows, num_cols] usually?
-        #    Let's check `PanelArray` doc or source if needed.
-        #    However, if we just take "First N elements" where N is single-pol single-panel count,
-        #    we might be taking a mix if ordering is interleaved.
-
-        # Workaround: Use the Codebook to expand to full array size but with zeros for other panels?
-        # No, that's inefficient.
-
-        # Assumption: We sweep using the first polarization of the first subpanel.
-        # We assume the channel correlation is high enough that this beam is good for all.
-
-        # Let's assume flattened index 0 to N_sp-1 corresponds to the first polarization of first panel.
-        # N_sp = rows_per_panel * cols_per_panel.
-
-        n_sp = self.rows_per_panel * self.cols_per_panel
-
-        # h_subset: [batch, num_ut, rx_ant, n_sp, sc]
-        # We slice the tx_ant dimension.
-        # Need to ensure which axis is tx_ant.
-        # In `HybridChannelInterface.get_element_channel...` we will define the return shape.
-        # Let's assume it returns [Batch, U, RxAnt, TxAnt, SC]
-
-        # Extract first n_sp elements of TxAnt
-        # CAUTION: We need to know if indices 0..n_sp-1 are indeed forming a valid spatial array.
-        # In Sionna PanelArray, default is created by tiling.
-        # Typically the "fastest" varying indices are the last ones.
-        # PanelArray(..., polarization='cross') -> 2 elements at each position.
-        # So index 0 is Pos(0,0) Pol+45, index 1 is Pos(0,0) Pol-45.
-        # Then index 2 is Pos(0,1) Pol+45...
-        # So we should take every 2nd element to get a single polarization spatial array.
-
-        is_cross_pol = self.polarization in ["dual", "cross"]
-        stride = 2 if is_cross_pol else 1
-
-        # Slice for one polarization of first panel
-        # Length needed: n_sp * stride
-        # Then subsample by stride
-
-        # h_elem columns corresponding to first panel
-        # Total elements in one panel = n_sp * stride
-        n_panel_total = n_sp * stride
-
-        # DEBUG
-        print(f"DEBUG: BeamSelector h_elem shape: {h_elem.shape}")
-        print(f"DEBUG: n_panel_total: {n_panel_total}, stride: {stride}")
-
-        h_panel = h_elem[..., :n_panel_total, :]  # Slicing TxAnt axis (axis -2 assumed)
-
-        # Subsample for single pol
-        h_single_pol = h_panel[..., 0::stride, :]  # [..., n_sp, sc]
-
-        # Apply Codebook
-        # h_single_pol: [..., n_sp, sc]
-        # w_spatial: [n_sp, num_beams]
-        # beam_response: [..., num_beams, sc]
-        # contract n_sp
-
+        # --- 3. ビームスイープ (全ビームの応答計算) ---
+        # h_panel: [B, U, R, N_ant_panel, S]
+        # w_dual_pol: [N_ant_panel, N_beams]
+        # beam_response: [B, U, R, N_beams, S]
         beam_response = tf.einsum(
-            "...ns,...nb->...bs",
-            h_single_pol,
-            tf.cast(self.w_spatial, h_single_pol.dtype),
+            "...ns,nk->...ks", h_panel, tf.cast(w_dual_pol, h_panel.dtype)
         )
 
-        # Calculate Power (sum over subcarriers and Rx antennas if kept)
-        # shape [Batch, U, RxAnt, Beams, SC]
-        # Power = sum(|x|^2)
+        # --- 4. パワー計算とベストビーム選択 ---
+        # Rxアンテナ(axis=2)とサブキャリア(axis=-1)で平均/和をとる
+        beam_power = tf.reduce_sum(tf.abs(beam_response) ** 2, axis=[2, -1])
+        best_beam_idx = tf.argmax(beam_power, axis=-1, output_type=tf.int32)  # [B, U]
 
-        beam_power = tf.reduce_sum(
-            tf.square(tf.abs(beam_response)), axis=[-1, -3]
-        )  # Sum SC, RxAnt
-        # Result: [Batch, U, Beams]
-
-        # Select Index
-        best_beam_idx = tf.argmax(
-            beam_power, axis=-1, output_type=tf.int32
-        )  # [Batch, U]
-
-        # Construct Full Precoders
+        # --- 5. 全パネルへのブロードキャスト適用 ---
+        # _construct_full_precoder 内で全パネル(32個)に対して
+        # 選択されたビームをブロック対角に配置する
         return self._construct_full_precoder(best_beam_idx)
 
     def _construct_full_precoder(self, best_beam_idx):
         """
-        Constructs W_RF from selected beam indices.
-        Applies the selected spatial beam to all panels and both polarizations.
-
-        Output: W_RF [Batch, U, NumTotalTxAnt, NumTxPorts]
-        NumTxPorts: We need to define this.
-        Usually for Digital-Analog Hybrid, we map:
-        - Each polarization to a separate port? (Rank 2 analog support)
-        - Or combine them?
-
-        Let's assume we map each polarization to a separate logical port.
-        And we have P panels.
-        If we want fully digital baseband access to all Panels x Pols, we need many ports.
-        But typically "Analog Beamforming" implies phase shifters reduce ports.
-
-        Scenario 1: All panels steer to same direction.
-        V-pol and H-pol steer to same direction.
-        Result: 2 RF chains (ports) seeing the whole array gain?
-        Or 2 RF chains PER PANEL?
-
-        User requirement: "Single panel sweep -> Apply to all panels".
-        Usually implies we form a large specific beam.
-
-        Let's assume a simplified architecture:
-        W_RF connects TotalAntennas -> 2 Ports (One for Pol1, One for Pol2).
-        Or Number of RF chains defined in Config.
-
-        If BS has 4 RF chains, maybe we use 2 panels?
-        Let's assume we simply map:
-        Pol1 of All Panels -> Port 0
-        Pol2 of All Panels -> Port 1
-        (This creates a massive array effect, narrowing the beam significantly if panels are coherent.
-         If panels are distributed/non-coherent, this might be bad, but physically they are usually coherent in PanelArray).
-
-        Implementation:
-        Gather w_spatial[best_beam_idx] -> [Batch, U, n_sp]
-
-        Title the weight to all panels.
+        best_beam_idx: [Batch, User]
+        Returns: [Batch, User, Total_Ant(num_panels*4), Total_RF(num_panels*2)]
         """
+        # 1. 選択された空間重みを取得 [Batch, U, ant_per_pol_in_panel(2)]
+        # w_spatial.T は [num_beams, 2]
+        w_selected = tf.gather(tf.transpose(self.w_spatial), best_beam_idx)
 
         batch_size = tf.shape(best_beam_idx)[0]
         num_ut = tf.shape(best_beam_idx)[1]
+        num_panels = self.num_panels_v * self.num_panels_h  # 32
 
-        # Gather selected spatial weights
-        # best_beam_idx: [ Batch, U ]
-        # w_spatial: [n_sp, num_beams]
-        # Transpose w: [ num_beams, n_sp ]
-        w_spatial_t = tf.transpose(self.w_spatial)
+        # 2. パネル単位のウェイト行列作成 [Batch, U, 4(Ant), 2(Port)]
+        # Sionnaの順序 [P1, P2, P1, P2] に合わせる
+        # w_selected: [B, U, 2] -> w0, w1
+        w0 = w_selected[:, :, 0:1]  # [B, U, 1]
+        w1 = w_selected[:, :, 1:2]  # [B, U, 1]
+        z = tf.zeros_like(w0)
 
-        # Gather: [Batch, U, n_sp]
-        w_selected = tf.gather(w_spatial_t, best_beam_idx)
+        # Port0用 (Pol1のみに重み): [w0, 0, w1, 0]
+        port0 = tf.stack([w0, z, w1, z], axis=-2)  # [B, U, 4, 1]
+        # Port1用 (Pol2のみに重み): [0, w0, 0, w1]
+        port1 = tf.stack([z, w0, z, w1], axis=-2)  # [B, U, 4, 1]
 
-        # We need to construct W_RF of shape [Batch, U, TotalAnt, NumPorts]
-        # Let's assume NumPorts = 2 (Dual Pol) or 1 (Single Pol).
-        # And we apply the same 'w_selected' to proper elements.
+        # パネル内接続行列 [B, U, 4, 2]
+        w_panel = tf.concat([port0, port1], axis=-1)
 
-        # Total Ant elements = NumPanels * n_sp * stride
-        num_panels = self.num_panels_v * self.num_panels_h
-        stride = 2 if self.polarization in ["dual", "cross"] else 1
-        num_ports = stride  # 1 port per polarization
+        # 3. 全パネルをブロック対角に配置
+        # 各パネルが独立したRFポート(2個ずつ)を持つように拡張
+        # identity: [num_panels, num_panels]
+        eye_panels = tf.eye(num_panels, dtype=self.dtype)
 
-        # We construct the vector for ONE panel first
-        # Panel vector: [Batch, U, n_sp * stride, num_ports]
-        # If stride=2:
-        #   Element 2i   (Pol1) -> Port 0: w_selected[i]
-        #   Element 2i+1 (Pol2) -> Port 1: w_selected[i]
-        #   Cross terms 0.
-
-        # Let's build purely using tensor ops
-        # w_selected: [B, U, n_sp] -> expand to [B, U, n_sp, 1]
-        w_base = tf.expand_dims(w_selected, -1)
-
-        if stride == 2:
-            # We want block diagonal per element pair?
-            # [w, 0]
-            # [0, w]
-            # Shape [B, U, n_sp, 2, 2] (Ant, Port) then reshape to [B, U, n_sp*2, 2]
-
-            zeros = tf.zeros_like(w_base)
-            # col1 = stack(w, 0), col2 = stack(0, w)
-            # This is tricky with simple stacking.
-
-            # Alternative: w_base * eye(2)
-            # w_base: [..., n_sp, 1, 1]
-            # eye: [..., 2, 2]
-            # res: [..., n_sp, 2, 2]
-            w_block = tf.expand_dims(w_base, -1) * tf.eye(2, dtype=w_base.dtype)
-
-            # Reshape to [..., n_sp*2, 2] handling arbitrary leading dims (Batch, U, Neighbors, Time)
-            input_shape = tf.shape(w_block)
-            # Leading dims: all except last 3 (n_sp, 2, 2)
-            leading_dims = input_shape[:-3]
-
-            # Target dim for antenna: ant_per_panel (should correspond to n_sp * 2)
-            target_shape = tf.concat([leading_dims, [self.ant_per_panel, 2]], axis=0)
-
-            w_panel = tf.reshape(w_block, target_shape)
-
-        else:
-            w_panel = w_base  # [B, U, n_sp, 1]
-
-        # Now tile for all panels
-        # We simply repeat this weight vector for each panel.
-        # This implies all panels steer to the same angle (Phase alignment between panels is assumed ideal/calibrated to 0 or geometric)
-        # Note: If panels are essentially forming a larger planar array, just repeating the steering vector
-        # is only valid if the 'w_spatial' was derived for the geometry of the WHOLE array.
-        # BUT here we derived it for a SUB-PANEL.
-        # If we blindly repeat it, we might have grating lobes or misalignment if the global geometry isn't periodic with wavelength.
-
-        # CRITICAL PHYSICS CHECK:
-        # A steering vector for direction theta depends on position: exp(j k . r)
-        # If we have two panels at r1 and r2.
-        # w(r) = exp(j k(theta) . r)
-        # w_panel1 = exp(j k . (r_local + R_panel1)) = exp(j k . r_local) * exp(j k . R_panel1)
-        # w_panel2 = exp(j k . (r_local + R_panel2)) = exp(j k . r_local) * exp(j k . R_panel2)
-        # So w_panel2 = w_panel1 * exp(j k . (R_panel2 - R_panel1))
-        # We need that phase shift!
-
-        # If we only repeat w_spatial, we leverage the array gain of individual panels,
-        # but the signals from different panels might add destructively (or non-coherently) at the UE.
-        # HOWEVER, the 'BeamSelector' calculates this phase shift? No, it calculates 'w_spatial' for panel 0.
-
-        # If we want COHERENT combining of panels, we need to calculate the phase offset for each panel for the selected angle.
-        # Or, we just accept that we control each panel to point to that direction locally,
-        # and the digital precoder (SVD) will handle the inter-panel phasing (if we have separate RF chains per panel).
-
-        # IF we have 1 RF chain for ALL panels (analog combined), we MUST do the phase shifting here.
-        # Implementation Plan Assumption: "UE is full digital" (SVD).
-        # BS has 'bs_num_rf_chains'.
-        # If bs_num_rf_chains >= num_panels * num_pol, then we can map each panel to a separate port,
-        # and SVD will handle the phase alignment between panels.
-        # If bs_num_rf_chains < num_panels, we are forced to combine analog-ly.
-
-        # Let's check config.bs_num_rf_chains vs topology.
-        # In this task, let's assume we maintain one port per polarization per Panel?
-        # Or one port per polarization for the WHOLE (fully fully analog combined)?
-
-        # User said "Subpanel sweep -> Apply to all".
-        # Let's implement the "Geometric Phase Shift" application to be safe and correct.
-        # We know the beam index -> We know the Angle (approximately) from the codebook.
-        # We can compute the phase shift for PANEL centers.
-
-        # But wait, `CodebookGenerator` generates orthogonal DFT beams.
-        # We can retrieve the angle index (k_h, k_v) from best_beam_idx.
-
-        # Let's calculate k_h, k_v.
-        k_h = best_beam_idx % self.codebook_gen.num_beams_h
-        k_v = best_beam_idx // self.codebook_gen.num_beams_h
-
-        # Convert to angles or directly compute phase shift?
-        # d_h = 0.5 lambda, d_v = 0.5 lambda usually.
-        # Phase shift between columns: 2pi * k_h / N_beams_h
-        # If Panels are placed on a gri with spacing D_panel_h, D_panel_v.
-        # We need specific geometry.
-
-        # SIMPLIFICATION for this iteration:
-        # Assume separate RF ports per panel is NOT the case (usually hybrid is limited ports).
-        # BUT constructing the true phase shift is complex without exact panel geometry access here.
-        # PanelArray gives `ant_pos`.
-
-        # Let's follow a Robust Robust strategy:
-        # The user asked for "Apply to all panels".
-        # If we just repeat the weights, we get max power from each panel individually.
-        # The total signal is Sum( H_panel_i * w ).
-        # If H_panel_i has random phase relative to H_panel_j (due to channel),
-        # then coherent combining needs SVD.
-        # IF Line of Sight and calibrated array, H phase is deterministic.
-
-        # DECISION: To ensure SVD can do its job, we should ideally expose ports per panel if possible.
-        # BUT current config likely sets `bs_num_rf_chains` to a small number (e.g. 4 or 8).
-        # Params: bs_num_rows_panel=1, cols=1 usually?
-
-        # Let's verify `my_configs.py` again.
-        # It inherits params. `bs_array` config is `PanelArray(...)`.
-
-        # For this implementation, I will implement **Simple Repetition**.
-        # `w_rf` will repeat the sub-panel weights for all panels.
-        # This means all panels "look" in the same direction.
-        # The SVD (Digital Precoder) will handle the phase alignment between the effective ports
-        # IF we map them to different ports.
-        # IF we map all to 1 port, we rely on luck/geometry (constructive interference at broadside?).
-
-        # Let's check `HybridOFDMChannel` default weights.
-        # It uses `tf.eye`.
-        # `HybridChannelInterface` takes `num_tx_ports` from config.
-
-        # I will map:
-        # All panels Pol 0 -> Port 0
-        # All panels Pol 1 -> Port 1
-        # (Massive Parallel connection).
-        # This is standard "Subarray connection" type: "Fully Connected" (phase shifters on all elements going to sum).
-
-        # So I DO need to align phases if I want Array Gain from N panels > 1 panel.
-        # Without phase alignment, I get N * Power(1 panel) (incoherent sum expectation)
-        # vs N^2 * Power (coherent).
-
-        # Given "Subpanel sweep" instruction, it's likely an approximation.
-        # I will implement Simple Repetition.
-        # If the user wants coherent global beamforming, they need a global codebook.
-
-        # w_panel shape: [..., Ant, Ports] (Rank N)
-        # We want to tile axis -2 (Ant) by num_panels.
-        rank = tf.rank(w_panel)
-        # Multiples: [1, ..., 1, num_panels, 1]
-        multiples = tf.concat(
-            [tf.ones([rank - 2], dtype=tf.int32), [num_panels], [1]], axis=0
+        # [B, U, 1, 1, 4, 2] * [1, 1, P, P, 1, 1] -> [B, U, P, P, 4, 2]
+        w_big = tf.expand_dims(tf.expand_dims(w_panel, 2), 2) * tf.reshape(
+            eye_panels, [1, 1, num_panels, num_panels, 1, 1]
         )
 
-        w_final = tf.tile(w_panel, multiples)
-        # [B, U, NumPanels * n_sp * 2, 2]
+        # 次元置換と結合: [B, U, P(row), Ant, P(col), Port] -> [B, U, P*Ant, P*Port]
+        w_rf = tf.transpose(w_big, [0, 1, 2, 4, 3, 5])
+        w_rf = tf.reshape(w_rf, [batch_size, num_ut, num_panels * 4, num_panels * 2])
 
-        return w_final
+        return w_rf

@@ -25,16 +25,16 @@ class HybridSimulationCommonConfig:
     # Antenna Common Parameters (Standard 3GPP Panel Layout)
     bs_polarization: str = "dual"  # "single" or "dual"
     bs_num_rows_per_panel: int = (
-        1  # Number of rows per panel (real element is *2 for dual polarization)
+        2  # Number of rows per panel (real element is *2 for dual polarization)
     )
     bs_num_cols_per_panel: int = (
         2  # Number of columns per panel (real element is *2 for dual polarization)
     )
     bs_num_rows_panel: int = 4  # Number of rows per panel
-    bs_num_cols_panel: int = 16  # Number of columns per panel
+    bs_num_cols_panel: int = 8  # Number of columns per panel
     bs_num_rf_chains: int = (
-        bs_num_rows_panel * bs_num_cols_panel
-    )  # Total Digital Ports (RF Chains) for Hybrid BF
+        bs_num_rows_panel * bs_num_cols_panel * (2 if bs_polarization == "dual" else 1)
+    )  # Total Digital Ports (RF Chains) for Hybrid BF 偏波込みなら2倍
 
     ut_polarization: str = "dual"  # "single" or "dual"
     ut_num_rows_per_panel: int = (
@@ -46,8 +46,8 @@ class HybridSimulationCommonConfig:
     ut_num_rows_panel: int = 1  # Number of rows per panel
     ut_num_cols_panel: int = 2  # Number of columns per panel
     ut_num_rf_chains: int = (
-        ut_num_rows_panel * ut_num_cols_panel
-    )  # Total Digital Ports (RF Chains) for Hybrid BF
+        ut_num_rows_panel * ut_num_cols_panel * (2 if ut_polarization == "dual" else 1)
+    )  # Total Digital Ports (RF Chains) for Hybrid BF 偏波込みなら2倍
 
     def __init__(self):
         self.mcs_decoder = lambda mcs: decode_mcs_index(
@@ -71,7 +71,7 @@ class HybridSimulationCommonConfig:
         n = (
             self.bs_num_rows_per_panel
             * self.bs_num_cols_per_panel
-            * self.bs_num_rf_chains
+            * self.bs_num_panel_ports
         )
         return n * 2 if self.bs_polarization == "dual" else n
 
@@ -80,7 +80,7 @@ class HybridSimulationCommonConfig:
         n = (
             self.ut_num_rows_per_panel
             * self.ut_num_cols_per_panel
-            * self.ut_num_rf_chains
+            * self.ut_num_panel_ports
         )
         return n * 2 if self.ut_polarization == "dual" else n
 

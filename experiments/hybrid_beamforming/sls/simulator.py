@@ -321,35 +321,12 @@ class HybridSystemSimulator(Block):
                 neighbor_indices=self.neighbor_indices,
                 ut_velocities=self.ut_velocities,
                 in_state=self.in_state,
-            )[
-                0
-            ]  # get_element returns (h, s, u, v) from SVD call inside? No, I defined it to return h_elem?
-            # Wait, get_element_channel_for_beam_selection implementation:
-            # It returns "return h, s, u, v" because it copies logic from get_full_channel_info/calls svd?
-            # In my previous edit Step 57:
-            # s, u, v = tf.linalg.svd(h)
-            # return h, s, u, v
-            # So I should take index [0].
+            )[0]
 
             # 2. Select Analog Beams (BS Side)
             # BS Beam Selection
-            # 2. Select Analog Beams (BS Side)
-            # BS Beam Selection
-            # w_rf_selected: [Batch, U, TotalAnt, SubPorts(2)]
-            w_rf_selected = self.beam_selector(h_elem_bs)
-
-            # Handle extra dimensions from BeamSelector (Neighbors, Time)
-            # Expected: [Batch, U, Ant, Ports]
-            if tf.rank(w_rf_selected) > 4:
-                # Assume [Batch, U, Neighbors, Time, Ant, Ports]
-                # Take Serving Cell (Neighbor 0) and Time 0
-                # Or generic flattening?
-                # For now, slice to restore compat.
-                # We want [Batch, U, Ant, Ports]
-                # If shape is [B, U, N, T, A, P], we take [:, :, 0, 0, :, :]
-                # But let's be safe and just taking element 0 of extra dims.
-                while tf.rank(w_rf_selected) > 4:
-                    w_rf_selected = w_rf_selected[:, :, 0]  # consume dim 2
+            # w_rf_selected: [B, U, TotalAnt, SubPorts(2)]
+            w_rf_selected = self.beam_selector(h_elem_bs, self.config.bs_array)
 
             # Transpose to [Batch, NumTxAnt, U, NumTxPorts] (if that is the logic)
             # Note: This logic assumes 1-to-1 mapping or simplified precoding.

@@ -48,7 +48,7 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
     )
 
     # Beam Management
-    beambook_oversampling_factor: int = 1
+    beambook_oversampling_factor: int = 4
     beam_selection_method: str = "subpanel_sweep"  # "subpanel_sweep"
 
     num_rb = 66
