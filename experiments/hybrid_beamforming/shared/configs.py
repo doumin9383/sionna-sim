@@ -7,7 +7,7 @@ from sionna.phy.nr import PUSCHConfig, PUSCHReceiver, CarrierConfig, TBConfig
 
 
 @dataclass
-class HybridSimulationCommonConfig:
+class SimulationCommonConfig:
     """Common configuration for both SLS and LLS"""
 
     # RF/Frequency
@@ -32,7 +32,7 @@ class HybridSimulationCommonConfig:
     )
     bs_num_rows_panel: int = 4  # Number of rows per panel
     bs_num_cols_panel: int = 8  # Number of columns per panel
-    bs_num_rf_chains: int = (
+    bs_num_ports: int = (
         bs_num_rows_panel * bs_num_cols_panel * (2 if bs_polarization == "dual" else 1)
     )  # Total Digital Ports (RF Chains) for Hybrid BF 偏波込みなら2倍
 
@@ -45,7 +45,7 @@ class HybridSimulationCommonConfig:
     )
     ut_num_rows_panel: int = 1  # Number of rows per panel
     ut_num_cols_panel: int = 2  # Number of columns per panel
-    ut_num_rf_chains: int = (
+    ut_num_ports: int = (
         ut_num_rows_panel * ut_num_cols_panel * (2 if ut_polarization == "dual" else 1)
     )  # Total Digital Ports (RF Chains) for Hybrid BF 偏波込みなら2倍
 

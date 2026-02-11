@@ -29,14 +29,14 @@ sionna.phy.config.seed = 42
 sionna.phy.config.precision = "single"  # 'single' or 'double'
 
 
-from .my_configs import HybridSLSConfig
+from .configs import SLSConfig
 
 
-class HybridSystemSimulator(Block):
+class SystemSimulator(Block):
 
     def __init__(
         self,
-        config: HybridSLSConfig,
+        config: SLSConfig,
         max_bs_ut_dist=None,
         min_bs_ut_dist=None,
         temperature=294,
@@ -66,26 +66,17 @@ class HybridSystemSimulator(Block):
         self.resource_grid = ResourceGrid(
             # num_ofdm_symbols=config.num_ofdm_symbols,
             num_ofdm_symbols=1,  # チャネル生成のためだけに使うので1でOK
-            fft_size=config.num_subcarriers,
-            subcarrier_spacing=config.subcarrier_spacing,
+            fft_size=self.config.num_subcarriers,
+            subcarrier_spacing=self.config.subcarrier_spacing,
             # pilot_pattern=rg_config.pilot_pattern,
             # pilot_ofdm_symbol_indices=rg_config.pilot_ofdm_symbol_indices,
         )
 
-        # Instantiate Antenna Arrays from config
-        self.bs_array = config.bs_array
-        self.ut_array = config.ut_array
-
-        self.num_ut_ant = self.ut_array.num_ant
-        self.num_bs_ant = self.bs_array.num_ant
-
         if self.direction == "uplink":
             self.num_tx, self.num_rx = self.num_ut, self.num_bs
-            self.num_tx_ant, self.num_rx_ant = self.num_ut_ant, self.num_bs_ant
             self.num_tx_per_sector = self.num_ut_per_sector
         else:
             self.num_tx, self.num_rx = self.num_bs, self.num_ut
-            self.num_tx_ant, self.num_rx_ant = self.num_bs_ant, self.num_ut_ant
             self.num_tx_per_sector = 1
 
         # Precoding Granularity Settings
@@ -106,51 +97,37 @@ class HybridSystemSimulator(Block):
         )
 
         # Initialize channel model based on scenario
-        self._setup_channel_model(
-            config.scenario,
-            config.carrier_frequency,
-            o2i_model,
-            self.ut_array,
-            self.bs_array,
-            average_street_width,
-            average_building_height,
-        )
+        if external_loader is not None:
+            self.channel_model = external_loader(config)
+        else:
+            self._setup_channel_model(
+                config.scenario,
+                config.carrier_frequency,
+                o2i_model,
+                self.config.ut_array,
+                self.config.bs_array,
+                average_street_width,
+                average_building_height,
+            )
 
         # Generate multicell topology
         # Moved to call method loop for drops
         # self._setup_topology(config.num_rings, min_bs_ut_dist, max_bs_ut_dist)
 
-        if self.direction == "uplink":
-            num_tx_ports = config.ut_num_rf_chains
-            num_rx_ports = config.bs_num_rf_chains
-        else:
-            num_tx_ports = config.bs_num_rf_chains
-            num_rx_ports = config.ut_num_rf_chains
-
-        if self.direction == "uplink":
-            self.sim_tx_array = self.ut_array
-            self.sim_rx_array = self.bs_array
-        else:
-            self.sim_tx_array = self.bs_array
-            self.sim_rx_array = self.ut_array
-
         # Instantiate the Hybrid Channel Interface
         self.channel_interface = HybridChannelInterface(
             channel_model=self.channel_model,
             resource_grid=self.resource_grid,
-            tx_array=self.sim_tx_array,
-            rx_array=self.sim_rx_array,
-            num_tx_ports=num_tx_ports,
-            num_rx_ports=num_rx_ports,
+            tx_array=self.config.tx_array,
+            rx_array=self.config.rx_array,
+            num_tx_ports=self.config.tx_num_ports,
+            num_rx_ports=self.config.rx_num_ports,
             precision=self.precision,
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
-            neighbor_indices=None,  # Topology is set in the loop
+            neighbor_indices=self.config.neighbor_indices,  # Topology is set in the loop
             external_loader=self.external_loader,
         )
-
-        # Instantiate simplified link adaptation (Physics Abstraction for SINR)
-        # self.phy_abstraction was removed. We calculate SINR directly in call().
 
         # Instantiate SLS components
         self.mpr_model = MPRModel(csv_path=config.mpr_table_path)

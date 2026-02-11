@@ -7,20 +7,45 @@ from libs.my_configs import (
     ResourceGridConfig,
     PlanarArrayConfig,
 )
-from experiments.hybrid_beamforming.shared.configs import HybridSimulationCommonConfig
+from experiments.hybrid_beamforming.shared.configs import SimulationCommonConfig
 
 from sionna.phy.channel.tr38901 import PanelArray
 
 
 @dataclass
-class HybridSLSConfig(HybridSimulationCommonConfig):
+class SLSConfig(SimulationCommonConfig):
     """System Level Simulation Configuration for experiments/hybrid_beamforming/sls"""
 
     # Simulation Control
     batch_size: int = 1  # Debug: 1
-    num_rings: int = 1
+
+    num_ut_drops: int = 2  # Debug: 2. Number of random topology drops.
+    num_slots: int = 1  # Fixed to 1 for snapshot simulation
+
+    precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
+    use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
+    num_neighbors: int = (
+        16  # For spatial masking: num BS per UT to calculate channel for
+    )
+
+    # Beam Management
+    beambook_oversampling_factor: int = 4
+    beam_selection_method: str = (
+        "subpanel_sweep"  # "subpanel_sweep" or "full_array_sweep"
+    )
+
+    num_rb = 66
+    num_subcarriers = num_rb * 12
+
+    # Power Settings
+    bs_max_power_dbm: float = 43.0
+    ut_max_power_dbm: float = 23.0
+
+    # Topology
     topology_type: str = "HexGrid"  # "HexGrid", "Custom", etc.
-    num_ut_per_sector: int = 1  # Production: 4
+    # hex gridの場合
+    num_rings: int = 1
+    num_ut_per_sector: int = 1
     min_bs_ut_dist: float = 10.0  # Min distance between BS and UT
     max_bs_ut_dist: Optional[float] = (
         None  # Max distance, None means infinite/cell edge
@@ -39,38 +64,6 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
                 f"Topology type {self.topology_type} not supported for auto num_bs calc."
             )
 
-    num_ut_drops: int = 2  # Debug: 2. Number of random topology drops.
-    num_slots: int = 1  # Fixed to 1 for snapshot simulation
-    precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
-    use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
-    num_neighbors: int = (
-        16  # For spatial masking: num BS per UT to calculate channel for
-    )
-
-    # Beam Management
-    beambook_oversampling_factor: int = 4
-    beam_selection_method: str = "subpanel_sweep"  # "subpanel_sweep"
-
-    num_rb = 66
-    num_subcarriers = num_rb * 12
-
-    # RF/Frequency (Inherited from HybridSimulationCommonConfig)
-    # carrier_frequency: float = 3.5e9
-    # subcarrier_spacing: float = 30e3
-
-    # Power Settings
-    bs_max_power_dbm: float = 43.0
-    ut_max_power_dbm: float = 23.0
-
-    # Resource Grid (Inherited from HybridSimulationCommonConfig)
-    # resource_grid field is available.
-
-    # Antenna Arrays
-    # bs_array and ut_array are created inside the simulator based on config parameters.
-    # We do not store the object instances here to avoid serialization issues and keep config pure data.
-    # bs_array: Any = None
-    # ut_array: Any = None
-
     # Scenario
     scenario: str = "umi"  # "umi", "uma", "rma"
 
@@ -84,12 +77,6 @@ class HybridSLSConfig(HybridSimulationCommonConfig):
 
     def __init__(self):
         super().__init__()
-        # self.resource_grid = ResourceGridConfig(
-        #     num_ofdm_symbols=1,
-        #     fft_size=72,
-        #     subcarrier_spacing=self.subcarrier_spacing / 1e3,
-        #     pilot_ofdm_symbol_indices=[2, 11],
-        # )
 
         # Instantiate Antenna Arrays from config
         self.bs_array = PanelArray(

@@ -9,9 +9,9 @@ sys.path.append(project_root)
 
 # Import Local Components
 from experiments.hybrid_beamforming.sls.simulator import (
-    HybridSystemSimulator,
+    SystemSimulator,
 )
-from experiments.hybrid_beamforming.sls.my_configs import HybridSLSConfig
+from experiments.hybrid_beamforming.sls.configs import SLSConfig
 import csv
 
 
@@ -19,11 +19,11 @@ def run_test():
     # Master Config
     # デフォルトのプロダクション設定を使用（batch_size=32, num_ut_per_sector=4, num_slots=20）
     # 必要に応じてここでオーバーライド可能
-    config = HybridSLSConfig()
+    config = SLSConfig()
 
     # 4. Instantiate Simulator
     # ResourceGridやPanelArrayはSimulator内部でConfigから生成される
-    sim = HybridSystemSimulator(config=config)
+    sim = SystemSimulator(config=config)
 
     # 5. Run Simulation
     print(

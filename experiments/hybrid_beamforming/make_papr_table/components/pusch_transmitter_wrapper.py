@@ -3,11 +3,11 @@
 #
 
 import tensorflow as tf
-from sionna.phy.nr import PUSCHTransmitter
+from sionna.phy.nr import PUSCHTransmitter as _PUSCHTransmitter
 from sionna.phy.ofdm import OFDMModulator
 
 
-class HybridPUSCHTransmitter(PUSCHTransmitter):
+class PUSCHTransmitter(_PUSCHTransmitter):
     """
     Wraps standard PUSCHTransmitter to provide manual control over Transform Precoding (DFT-s-OFDM).
 
@@ -68,16 +68,6 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         x_rg_precoded = self._apply_precoding(x_rg)
 
         # 6. OFDM Modulation
-        # New modulator for the correct number of tx antennas
-        # PUSCHTransmitter's modulator is bound to its resource_grid_mapper output ports.
-        # We might need to use the OFDMModulator directly or adjust.
-        # However, _ofdm_modulator in Sionna is just an OFDMModulator(self.resource_grid).
-        # It takes [batch, ports, symbols, subcarriers].
-        # If we change ports from layers to num_tx_ant, we need it to handle that.
-
-        # In Sionna, OFDMModulator just does IFFT on the last dimension and CP.
-        # It doesn't care about the number of 'ports' as long as it's the second-to-last dim?
-        # Actually it's [batch, tx_ant, num_symbols, num_samples].
         x_time = self._ofdm_modulator(x_rg_precoded)
 
         return x_time
@@ -96,7 +86,9 @@ class HybridPUSCHTransmitter(PUSCHTransmitter):
         num_subcarriers = tf.shape(x_rg)[3]
 
         # Determine granularity in subcarriers
-        if self.precoding_granularity == "Narrowband":
+        if self.precoding_granularity == "Subcarrier-wise":
+            g_sc = 1
+        elif self.precoding_granularity == "Narrowband":
             g_sc = 12
         elif self.precoding_granularity == "Subband":
             # Use rbg_size_rb from config to match SLS behavior

@@ -3,7 +3,8 @@
 #
 
 import tensorflow as tf
-from sionna.phy.nr import PUSCHConfig, PUSCHReceiver, CarrierConfig
+from sionna.phy.nr import PUSCHReceiver, CarrierConfig
+from ..shared.pusch_config import PUSCHConfig
 from .pusch_transmitter_wrapper import HybridPUSCHTransmitter
 from experiments.hybrid_beamforming.shared.channel_models import (
     GeneratHybridBeamformingTimeChannel,
@@ -40,10 +41,9 @@ class PUSCHCommunicationModel(tf.keras.Model):
         # In Sionna NR, num_antenna_ports must match num_layers for PUSCHConfig
         # when using it to map layers to ports.
         # We will handle precoding (port to antenna) in our wrapper if needed.
-        self.pusch_config.num_antenna_ports = config.num_ut_ant
+        self.pusch_config.num_antenna_ports = config.num_ut_ports
         self.pusch_config.num_layers = num_layers
-        self.pusch_config.precoding = "codebook"
-        self.pusch_config.tpmi = 1
+        self.pusch_config.precoding = "none"
 
         # Set Bandwidth Part size (controls FFT size and num_subcarriers)
         self.pusch_config.n_size_bwp = num_rb

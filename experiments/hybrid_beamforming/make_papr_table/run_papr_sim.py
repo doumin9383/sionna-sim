@@ -14,7 +14,7 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from experiments.hybrid_beamforming.lls.my_configs import HybridLLSConfig
+from experiments.hybrid_beamforming.lls.configs import HybridLLSConfig
 from experiments.hybrid_beamforming.lls.components.pusch_model import (
     PUSCHCommunicationModel,
 )
@@ -77,8 +77,8 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
     for sc in tqdm(scenarios):
         # Scenario identifier for filenames
         # Shorten ID to avoid too long filenames
-        if isinstance(sc["granularity"], int):
-            gran_str = f"G{sc['granularity']}RB"
+        if sc["granularity"] == "Subcarrer-wise":
+            gran_str = "GSC"
         elif sc["granularity"] == "Narrowband":
             gran_str = "GNB"
         elif sc["granularity"] == "Subband":
@@ -123,13 +123,13 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         if sc["num_rb"] in representative_rb:
             plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
 
-        # Compute 99.9% CCDF
+        # Compute 10e-3 CCDF
         idx = int(0.999 * len(papr_sorted))
-        papr_999 = papr_sorted[idx]
+        papr_10e_3 = papr_sorted[idx]
 
         # Record result
         res = sc.copy()
-        res["papr_db_99.9"] = papr_999
+        res["papr_db_10e-3"] = papr_10e_3
         results.append(res)
 
         # --- Memory Management ---
@@ -139,10 +139,6 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         import gc
 
         gc.collect()
-
-        # except Exception as e:
-        #     print(f"Error in scenario {sc}: {e}")
-        #     tf.keras.backend.clear_session()
 
     # Plot Comparison CCDF (Cleaned up)
     plot_summary_ccdf(all_papr_data, results_dir)
