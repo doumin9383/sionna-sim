@@ -62,6 +62,10 @@ class SystemSimulator(Block):
         self.ut_max_power_dbm = config.ut_max_power_dbm
         self.num_ut = self.num_bs * self.num_ut_per_sector
 
+        # Antenna Counts
+        self.num_bs_ant = config.bs_array.num_ant
+        self.num_ut_ant = config.ut_array.num_ant
+
         # Instantiate ResourceGrid from config (Factory)
         self.resource_grid = ResourceGrid(
             # num_ofdm_symbols=config.num_ofdm_symbols,
@@ -370,23 +374,53 @@ class SystemSimulator(Block):
                 self.config.max_bs_ut_dist,
             )
 
-            # 1. Get Channel Information
-            # Get Element-Domain Channel for Beam Selection
-            h_elem_all = self.channel_interface.get_element_channel_for_beam_selection(
-                batch_size=self.batch_size,
-                rbg_size_sc=self.rbg_size_sc,
-                ut_loc=self.ut_loc,
-                bs_loc=self.bs_loc,
-                ut_orient=self.ut_orientations,
-                bs_orient=self.bs_orientations,
-                neighbor_indices=self.neighbor_indices,
-                ut_velocities=self.ut_velocities,
-                in_state=self.in_state,
-            )
-            # Serving link channel extraction
-            # neighbor index 0 corresponds to serving link.
-            # h_elem_all shape: [Batch, Total_UT, Neighbors, Time(1), SC, RxA, TxA]
-            h_serv = h_elem_all[:, :, 0, 0, :, :, :]
+            # 1. Get Channel Information (Batched to avoid OOM)
+            # We only need h_serv (Serving Link) for Beam Selection.
+            # h_elem_all (including neighbors) is too large to hold in memory for all UTs at once.
+
+            h_serv_list = []
+            batch_size_beam = 1  # Process 1 UT at a time to be safe
+
+            for i in range(0, self.num_ut, batch_size_beam):
+                end_i = min(i + batch_size_beam, self.num_ut)
+
+                # Slice Topology for this batch
+                # neighbor_indices: [Batch, Num_UT, Neighbor]
+                curr_neigh_inds = self.neighbor_indices[:, i:end_i, :]
+
+                # Slice UT properties
+                curr_ut_loc = self.ut_loc[:, i:end_i, :]
+                curr_ut_orient = self.ut_orientations[:, i:end_i, :]
+                curr_ut_vel = self.ut_velocities[:, i:end_i, :]
+                curr_in_state = self.in_state[:, i:end_i]
+
+                # Get Element Channel for this batch
+                h_elem_batch = (
+                    self.channel_interface.get_element_channel_for_beam_selection(
+                        batch_size=self.batch_size,
+                        rbg_size_sc=self.rbg_size_sc,
+                        ut_loc=curr_ut_loc,
+                        bs_loc=self.bs_loc,
+                        ut_orient=curr_ut_orient,
+                        bs_orient=self.bs_orientations,
+                        neighbor_indices=curr_neigh_inds,
+                        ut_velocities=curr_ut_vel,
+                        in_state=curr_in_state,
+                    )
+                )
+
+                # Extract Serving Channel (Neighbor 0) and remove Time dimension (index 5)
+                # h_elem_batch: [Batch, Batch_UT, Neighbors, RxA, TxA, Time, SC] (Wait, check order)
+                # Order confirmed: [Batch, UT, Neighbor, RxA, TxA, Time, Freq]
+                # We want Neighbor=0, Time=0.
+                h_serv_batch = h_elem_batch[:, :, 0, :, :, 0, :]
+                h_serv_list.append(h_serv_batch)
+
+            # Concatenate all batches
+            # h_serv: [Batch, Total_UT, SC, RxA, TxA] (assuming Time=1 and squeezed)
+            # wait, h_elem_batch[:, :, 0, 0, :, :, :] removes Neighbor(2) and Time(3).
+            # Result dims: [Batch, Batch_UT, SC, RxA, TxA]
+            h_serv = tf.concat(h_serv_list, axis=1)  # Concat along UT axis
 
             # 2. Select Analog Beams (BS Side)
             # h_serv channel is from UT to Serving BS (because neighbor_index=0 is serving BS)
@@ -398,10 +432,10 @@ class SystemSimulator(Block):
             N_BS = self.num_bs
             N_UT_Sec = self.num_ut_per_sector  # Should be 1 typically
             N_UT_Total = self.num_ut
-            # h_serv shape: [Batch, Total_UT, SC, RxA, TxA]
-            FFT = tf.shape(h_serv)[2]
-            RxA = tf.shape(h_serv)[3]
-            TxA = tf.shape(h_serv)[4]
+            # h_serv shape: [Batch, Total_UT, RxA, TxA, Freq] (Verified)
+            RxA = tf.shape(h_serv)[2]
+            TxA = tf.shape(h_serv)[3]
+            FFT = tf.shape(h_serv)[4]
 
             # Construct indices for scatter update
             # Indices: [b, ut_idx] -> [b, serving_bs_id, slot_id]
@@ -441,20 +475,24 @@ class SystemSimulator(Block):
             h_bs_flat = tf.scatter_nd(indices, h_serv_flat, h_bs_shape)
 
             # Reshape back to detailed dimensions
-            h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, FFT, RxA, TxA])
+            # h_serv was flattened from [RxA, TxA, SC].
+            # So we must reshape to [RxA, TxA, FFT].
+            h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, RxA, TxA, FFT])
 
             # Note: scatter_nd fills unassigned slots with 0.
 
             if self.direction == "uplink":
                 # BS is Receiver: RxA = num_bs_ant, TxA = num_ut_ant
-                # h_bs: [B, num_bs, ut, SC, BS_Ant, UT_Ant]
-                # Permute to [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
-                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 5, 4, 3])
+                # h_bs: [B, num_bs, ut, BS_Ant, UT_Ant, SC]
+                # Target: [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
+                # Indices: 0, 1, 2, 4(UT), 3(BS), 5(SC)
+                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 3, 5])
             else:
                 # BS is Transmitter: RxA = num_ut_ant, TxA = num_bs_ant
-                # h_bs: [B, num_bs, ut, SC, UT_Ant, BS_Ant]
-                # Permute to [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
-                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 5, 3])
+                # h_bs: [B, num_bs, ut, UT_Ant, BS_Ant, SC]
+                # Target: [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
+                # Indices: 0, 1, 2, 3(UT), 4(BS), 5(SC)
+                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 3, 4, 5])
 
             # Flatten to [Batch * num_bs, num_ut_per_sector, Other_Ant, BS_Ant, SC]
             h_selector_input = tf.reshape(
@@ -488,8 +526,12 @@ class SystemSimulator(Block):
             # Apply weights
             if self.direction == "uplink":
                 self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
+                u_bs_global = w_rf_bs
+                v_bs_global = None
             else:
                 self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
+                v_bs_global = w_rf_bs
+                u_bs_global = None
 
             # --- 3. Power Control & Link Adaptation (Moved up) ---
             # For Power Control: Identify Serving BS
@@ -560,170 +602,173 @@ class SystemSimulator(Block):
 
             # p_alloc setup will happen after Rank determination
 
-            # --- 4. Effective Channel & SINR Calculation ---
-            # Full Channel for Interference/SINR Calc (No SVD here, raw channel needed)
-            # But we need effective channel to apply beams.
-            # actually, we need to apply beams to H_full.
-            # H_full: [Batch, UT, Neighbors, Time, SC, RxA, TxA]
-            # SVD is only for Serving Link to get U and V.
+            # --- 4. Effective Channel & SINR Calculation (BATCHED to avoid OOM) ---
+            # batch_size_ut_sinr = 1 is safest for 718MB VRAM
+            batch_size_ut_sinr = 1
+            num_batches_ut_sinr = (
+                self.num_ut + batch_size_ut_sinr - 1
+            ) // batch_size_ut_sinr
 
-            h_full = self.channel_interface.get_full_channel_info(
-                self.batch_size,
-                ut_loc=self.ut_loc,
-                bs_loc=self.bs_loc,
-                ut_orient=self.ut_orientations,
-                bs_orient=self.bs_orientations,
-                neighbor_indices=self.neighbor_indices,
-                ut_velocities=self.ut_velocities,
-                in_state=self.in_state,
-                return_s_u_v=False,  # New flag to avoid heavy SVD on all links
-            )
-            # h_full: [Batch, UT, Neighbors, Time, SC, RxA, TxA]
-
-            # --- A. Serving Link Processing (SVD & Precoder Determination) ---
-            # Extract Serving Link Channel (Neighbor 0)
-            h_srv = h_full[:, :, 0, 0, :, :, :]  # [Batch, UT, SC, RxA, TxA]
-
-            # Perform SVD on Serving Link to get Digital Precoders
-            s_srv, u_srv, v_srv = tf.linalg.svd(h_srv)
-            # s_srv: [B, U, SC, K], u_srv: [B, U, SC, Rx, Rx], v_srv: [B, U, SC, Tx, Tx]
-
-            # Determine Rank / Number of Streams
+            # Constants for SINR Calculation
+            B = self.batch_size
+            N_BS = self.num_bs
+            N_UT_Total = self.num_ut
+            FFT = self.resource_grid.fft_size
             rank = 1
-            v_srv_eff = v_srv[..., :rank]
-            u_srv_eff = u_srv[..., :rank]
 
-            # --- Power Allocation (based on Rank) ---
-            num_streams = rank
-            p_alloc = total_power / tf.cast(num_streams, self.rdtype)
-            # p_alloc: [B, U]
-            p_alloc = tf.reshape(
-                p_alloc, [B, N_UT_Total, 1, 1]
-            )  # [B, U, 1, 1] for broadcasting
-            p_alloc_sqrt = tf.sqrt(p_alloc)
+            # Power Allocation (based on Rank)
+            p_alloc = total_power / tf.cast(rank, self.rdtype)
+            p_alloc = tf.reshape(p_alloc, [B, N_UT_Total, 1, 1])
 
-            # --- B. Store Precoders/Combiners for Interference Calculation ---
-            # Shape: [Batch, Num_BS, Num_UT_Per_Sector, SC, Ant, Rank]
+            # Buffers for results
+            s_power_all = []
+            i_total_all = []
+            sinr_all = []
 
-            def scatter_to_bs(tensor_per_ut, shape_per_bs):
-                # tensor_per_ut: [B, U, ...]
-                # shape_per_bs: [B, N_BS, N_UT_Sec, ...]
-                flat_shape = [B, N_BS, N_UT_Sec, -1]
-                tensor_flat = tf.reshape(tensor_per_ut, [B, N_UT_Total, -1])
-                scattered_flat = tf.scatter_nd(indices, tensor_flat, flat_shape)
-                return tf.reshape(scattered_flat, shape_per_bs)
+            # Global Interference Buffer (for Uplink)
+            # Shapes: [B, N_BS, FFT, rank]
+            interference_buffer_bs = tf.zeros([B, N_BS, FFT, rank], dtype=self.rdtype)
+
+            # --- Phase 1: Signal Power & UL Interference Accumulation ---
+            for i in range(num_batches_ut_sinr):
+                start_ut = i * batch_size_ut_sinr
+                end_ut = tf.minimum(start_ut + batch_size_ut_sinr, N_UT_Total)
+                current_batch_size = end_ut - start_ut
+
+                # Slice inputs for current batch
+                sliced_ut_loc = self.ut_loc[:, start_ut:end_ut, :]
+                sliced_ut_orient = self.ut_orientations[:, start_ut:end_ut, :]
+                sliced_ut_vel = self.ut_velocities[:, start_ut:end_ut, :]
+                sliced_in_state = self.in_state[:, start_ut:end_ut]
+                sliced_neighbor_indices = self.neighbor_indices[:, start_ut:end_ut, :]
+
+                # Get Channel for Batch
+                # h_batch: [Batch=1, BatchUT, Neighbors, RxA, TxA, Time, Freq]
+                h_batch = self.channel_interface.get_neighbor_channel_info(
+                    self.batch_size,
+                    ut_loc=sliced_ut_loc,
+                    bs_loc=self.bs_loc,
+                    ut_orient=sliced_ut_orient,
+                    bs_orient=self.bs_orientations,
+                    neighbor_indices=sliced_neighbor_indices,
+                    ut_velocities=sliced_ut_vel,
+                    in_state=sliced_in_state,
+                    return_element_channel=True,
+                    return_s_u_v=False,
+                )
+
+                if i == 0:
+                    tf.print("DEBUG: direction =", self.direction)
+                    tf.print("DEBUG: num_bs_ant =", self.num_bs_ant)
+                    tf.print("DEBUG: num_ut_ant =", self.num_ut_ant)
+                    tf.print("DEBUG: h_batch shape =", tf.shape(h_batch))
+
+                # --- Signal Power (Serving Link, Neighbor 0) ---
+                h_srv_raw = h_batch[:, :, 0, :, :, 0, :]  # [B, BatchUT, RxA, TxA, F]
+                h_srv = tf.transpose(
+                    h_srv_raw, [0, 1, 4, 2, 3]
+                )  # [B, BUT, F, RxA, TxA]
+                s_srv, u_srv, v_srv = tf.linalg.svd(h_srv)
+
+                v_srv_eff = v_srv[..., :rank]
+                u_srv_eff = u_srv[..., :rank]
+
+                hv_srv = tf.einsum("busrt,bustk->busrk", h_srv, v_srv_eff)
+                Heff_srv = tf.einsum(
+                    "busrk,busrk->busk", tf.math.conj(u_srv_eff), hv_srv
+                )
+
+                # Signal Power
+                p_alloc_batch = tf.gather(p_alloc, tf.range(start_ut, end_ut), axis=1)
+                p_alloc_batch = tf.reshape(p_alloc_batch, [B, current_batch_size, 1, 1])
+                s_p = p_alloc_batch * tf.square(tf.abs(Heff_srv))
+                s_power_all.append(s_p)
+
+                # --- Interference Step (UL/DL) ---
+                neighbor_ids_batch = sliced_neighbor_indices[:, :, 1:]
+                h_int_raw = h_batch[:, :, 1:, :, :, 0, :]  # [B, BUT, K-1, RxA, TxA, F]
+                h_int = tf.transpose(
+                    h_int_raw, [0, 1, 2, 5, 3, 4]
+                )  # [B, BUT, K-1, F, RxA, TxA]
+
+                if self.direction == "uplink":
+                    # --- UL: Leakage to Neighbor BSs ---
+                    # Gather current Beam-Weights (Analog) for Neighbor BSs
+                    u_neighbor = tf.gather(
+                        u_bs_global, neighbor_ids_batch, axis=1, batch_dims=1
+                    )
+                    # u_neighbor: [B, BUT, K-1, RxA, Rank]
+
+                    # Leakage = | U_neighbor^H * H_int * V_self |^2
+                    # Implicitly broadcast v_srv_eff over Neighbors (k)
+                    hv_i = tf.einsum("buksrt,bustf->buksrf", h_int, v_srv_eff)
+                    # Implicitly broadcast u_neighbor over Freq (s)
+                    heff_i = tf.einsum(
+                        "bukrf,buksrf->buksf", tf.math.conj(u_neighbor), hv_i
+                    )
+                    p_leak = p_alloc_batch[:, :, :, None, None] * tf.square(
+                        tf.abs(heff_i)
+                    )
+
+                    # Scatter add to global buffer
+                    b_ids = tf.range(B, dtype=tf.int32)[:, None, None]
+                    b_ids = tf.broadcast_to(b_ids, tf.shape(neighbor_ids_batch))
+                    indices_sc = tf.stack(
+                        [b_ids, tf.cast(neighbor_ids_batch, tf.int32)], axis=-1
+                    )
+                    indices_sc_flat = tf.reshape(indices_sc, [-1, 2])
+                    p_leak_updates = tf.reshape(p_leak, [-1, FFT, rank])
+
+                    interference_buffer_bs = tf.tensor_scatter_nd_add(
+                        interference_buffer_bs, indices_sc_flat, p_leak_updates
+                    )
+                else:
+                    # --- DL: Interference from Neighbor BSs ---
+                    v_neighbor = tf.gather(
+                        v_bs_global, neighbor_ids_batch, axis=1, batch_dims=1
+                    )
+                    # v_neighbor: [B, BUT, K-1, TxA, Rank]
+
+                    # Power from Neighbors
+                    # Implicitly broadcast v_neighbor over Freq (s)
+                    hv_i = tf.einsum("buksrt,buktf->buksrf", h_int, v_neighbor)
+                    # Implicitly broadcast u_srv_eff over Neighbors (k)
+                    heff_i = tf.einsum(
+                        "busrf,buksrf->buksf", tf.math.conj(u_srv_eff), hv_i
+                    )
+                    p_int = tf.square(tf.abs(heff_i))
+
+                    p_alloc_exp = tf.expand_dims(
+                        p_alloc_batch, axis=2
+                    )  # [B, BUT, 1, 1, 1]
+                    p_int_scaled = p_alloc_exp * p_int
+                    i_p = tf.reduce_sum(p_int_scaled, axis=2)  # [B, BUT, F, Rank]
+                    i_total_all.append(i_p)
+
+            # --- Phase 2: Final SINR and Throughput Calculation ---
+            s_power = tf.concat(s_power_all, axis=1)
 
             if self.direction == "uplink":
-                # UL: Scatter Combiner U to BS
-                RxP = tf.shape(u_srv_eff)[3]
-                u_global_shape = [B, N_BS, N_UT_Sec, FFT, RxP, rank]
-                u_bs_global = scatter_to_bs(u_srv_eff, u_global_shape)
-            else:
-                # DL: Scatter Precoder V to BS
-                TxP = tf.shape(v_srv_eff)[3]
-                v_global_shape = [B, N_BS, N_UT_Sec, FFT, TxP, rank]
-                v_bs_global = scatter_to_bs(v_srv_eff, v_global_shape)
-
-            # --- C. Calculate Interference & SINR ---
-
-            # Container for Total Interference Power
-            i_total = tf.zeros([B, N_UT_Total, FFT, rank], dtype=self.rdtype)
-
-            # 1. Calculate Signal Power (Serving Link)
-            # Hv = H * V
-            hv_srv = tf.einsum("busrt,bustk->busrk", h_srv, v_srv_eff)
-            # U^H * Hv
-            Heff_srv = tf.einsum("busrk,busrk->busk", tf.math.conj(u_srv_eff), hv_srv)
-
-            # Scale Signal by P_alloc
-            # Signal Power = | sqrt(p_alloc) * U^H * H * V |^2
-            #              = p_alloc * | U^H * H * V |^2
-            s_power = p_alloc * tf.square(tf.abs(Heff_srv))  # [B, U, SC, Rank]
-
-            # 2. Calculate Interference Power
-            neighbor_ids = self.neighbor_indices[:, :, 1:]  # [B, U, K-1]
-            h_int = h_full[:, :, 1:, 0, :, :, :]  # [B, U, K-1, SC, Rx, Tx]
-
-            if self.direction == "uplink":
-                # UL Interference Formulation
-                # Gather Neighbor BS Combiners U_neighbor
-                u_neighbor = tf.gather(u_bs_global, neighbor_ids, axis=1, batch_dims=1)
-                u_neighbor = tf.squeeze(u_neighbor, axis=3)  # [B, U, K-1, SC, Rx, R]
-
-                # Self Precoder V_self (Serving V)
-                v_self = tf.expand_dims(v_srv_eff, axis=2)
-
-                # Leakage Calculation
-                # H_int: [B, U, K-1, SC, Rx, Tx]
-                # Leakage = | U_neigh^H * H_int * V_self |^2
-                hv_int = tf.einsum("buksrt,bukstr->buksrk", h_int, v_self)
-                heff_int = tf.einsum(
-                    "buksrk,buksrk->buksk", tf.math.conj(u_neighbor), hv_int
-                )
-
-                # Scale Leakage by P_alloc (Self)
-                # Because this UE is the source of interference
-                # p_leak_scaled = p_alloc_self * | U_neigh^H * H * V_self |^2
-                p_alloc_expanded = tf.expand_dims(p_alloc, axis=2)  # [B, U, 1, 1, 1]
-                p_leak = p_alloc_expanded * tf.square(
-                    tf.abs(heff_int)
-                )  # [B, U, K-1, SC, Rank]
-
-                # Scatter Add to BS Buffers
-                # Flatten indices
-                b_ids = tf.range(B, dtype=tf.int32)[:, None, None]
-                b_ids = tf.broadcast_to(b_ids, tf.shape(neighbor_ids))
-                indices_scatter = tf.stack(
-                    [b_ids, tf.cast(neighbor_ids, tf.int32)], axis=-1
-                )
-                indices_scatter_flat = tf.reshape(indices_scatter, [-1, 2])
-                p_leak_updates = tf.reshape(p_leak, [-1, FFT, rank])
-
-                # Interference Buffer
-                interference_buffer = tf.zeros([B, N_BS, FFT, rank], dtype=self.rdtype)
-                interference_buffer = tf.tensor_scatter_nd_add(
-                    interference_buffer, indices_scatter_flat, p_leak_updates
-                )
-
-                # Fetch Interference for Serving BS
+                # Fetch accumulated interference from buffer for each UE's serving BS
                 i_total = tf.gather(
-                    interference_buffer,
+                    interference_buffer_bs,
                     tf.cast(self.serving_bs_ids, tf.int32),
                     axis=1,
                     batch_dims=1,
                 )
-
             else:
-                # DL Procedure
-                # V_neighbor: Neighbor BS's Transmit Precoders.
-                v_neighbor = tf.gather(v_bs_global, neighbor_ids, axis=1, batch_dims=1)
-                v_neighbor = tf.squeeze(v_neighbor, axis=3)  # [B, U, K-1, SC, Tx, R]
+                i_total = tf.concat(i_total_all, axis=1)
 
-                # U_self: UE's Receive Combiner.
-                u_self = tf.expand_dims(u_srv_eff, axis=2)
-
-                # P_int = | U_self^H * H_int * V_neighbor |^2
-                hv_int = tf.einsum("buksrt,bukstr->buksrk", h_int, v_neighbor)
-                heff_int = tf.einsum(
-                    "buksrk,buksrk->buksk", tf.math.conj(u_self), hv_int
-                )
-                p_int = tf.square(tf.abs(heff_int))  # [B, U, K-1, SC, Rank]
-
-                # Scale by Neighbor BS Power
-                # Assuming constant BS Power for now (p_alloc_bs) in DL
-                # We reuse p_alloc (self) if it's constant per BS.
-                # In DL, p_tx_dbm is constant 'tx_power_dbm'.
-                # So p_alloc is same for all BSs.
-                # p_int_scaled = p_alloc * p_int
-                p_alloc_expanded = tf.expand_dims(p_alloc, axis=2)
-                p_int_scaled = p_alloc_expanded * p_int
-
-                # Sum over neighbors
-                i_total = tf.reduce_sum(p_int_scaled, axis=2)  # [B, U, SC, Rank]
-
-            # 3. Final SINR
+            # Final SINR
             noise_power = self.no  # Scalar or [SC]
-            sinr = s_power / (noise_power + i_total)
+            sinr = s_power / (i_total + noise_power)
+            sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
+
+            # 4. Throughput Calculation (Simple Capacity for now or use MCS)
+            throughput = tf.reduce_mean(
+                tf.math.log(1.0 + sinr) / tf.math.log(2.0), axis=[2, 3]
+            )
+            # [B, U]
 
             # --- End New SINR Logic ---
 

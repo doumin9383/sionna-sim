@@ -1,13 +1,13 @@
 import tensorflow as tf
 import numpy as np
 from sionna.phy import Block, PI
-from experiments.hybrid_beamforming.shared.channel_models import HybridOFDMChannel
+from .hybrid_channels import GenerateHybridBeamformingOFDMChannel
 
 
 class HybridChannelInterface(Block):
     """
     Interface for Hybrid Beamforming Channel.
-    Wraps HybridOFDMChannel to provide effective channel gains via SVD.
+    Wraps GenerateHybridBeamformingOFDMChannel to provide effective channel gains via SVD.
     """
 
     def __init__(
@@ -33,8 +33,8 @@ class HybridChannelInterface(Block):
         self.neighbor_indices = neighbor_indices
         self.external_loader = external_loader
 
-        # Instantiate the HybridOFDMChannel
-        self.hybrid_channel = HybridOFDMChannel(
+        # Instantiate the GenerateHybridBeamformingOFDMChannel
+        self.hybrid_channel = GenerateHybridBeamformingOFDMChannel(
             channel_model=channel_model,
             resource_grid=resource_grid,
             tx_array=tx_array,
@@ -42,8 +42,6 @@ class HybridChannelInterface(Block):
             num_tx_ports=num_tx_ports,
             num_rx_ports=num_rx_ports,
             normalize_channel=False,  # Disable normalization for SLS (Pathloss required)
-            use_rbg_granularity=use_rbg_granularity,
-            rbg_size=rbg_size_sc,
         )
 
     def call(self, batch_size):
@@ -71,8 +69,8 @@ class HybridChannelInterface(Block):
         return_s_u_v=True,
     ):
         """
-        Generates channel only for the specified neighbors using virtual topology mapping.
-        Delegates physical channel generation to the Base class.
+        Generates channel only for the specified neighbors using ID-Based Sparse Calculation.
+        Delegates all physical channel generation to Base class.
         """
         current_neighbor_indices = (
             neighbor_indices if neighbor_indices is not None else self.neighbor_indices
@@ -82,241 +80,50 @@ class HybridChannelInterface(Block):
                 "neighbor_indices must be provided either in init or in method call."
             )
 
-        # Batch processing for UTs to avoid OOM
-        # Process UTs in small batches (e.g., 1)
-        batch_size_ut = 1
-        h_chunks = []
-
-        # We process all UTs
-        # neighbor_indices: [batch, num_ut, num_neighbors]
-        # We need to loop over the 'num_ut' dimension
-
-        num_ut_total = current_neighbor_indices.shape[1]
-        num_neighbors = current_neighbor_indices.shape[2]
-
-        # Determine strict loop count
-        num_batches_ut = (num_ut_total + batch_size_ut - 1) // batch_size_ut
-
-        for i in range(num_batches_ut):
-            start_ut = i * batch_size_ut
-            end_ut = min(start_ut + batch_size_ut, num_ut_total)
-            current_batch_size = end_ut - start_ut
-
-            # Slicing inputs for current UT batch
-            # ut_loc: [batch, num_ut, 3] -> [batch, current_batch_size, 3]
-            ut_loc_batch = ut_loc[:, start_ut:end_ut, :]
-            ut_orient_batch = ut_orient[:, start_ut:end_ut, :]
-
-            # Additional states that need slicing if they exist in channel model
-            # in_state is usually [batch, num_ut]
-            # ut_velocities is [batch, num_ut, 3]
-            # We access them from channel_model properties if not passed explicitly,
-            # but set_topology expects arguments if we want to update them.
-            # Ideally `get_neighbor_channel_info` should receive them or we extract from model.
-            # But `ut_loc` etc are passed as args.
-
-            # Prepare additional states
-            if ut_velocities is not None:
-                ut_vel_full = ut_velocities
-            elif hasattr(self.channel_model, "ut_velocities"):
-                ut_vel_full = self.channel_model.ut_velocities
-            elif hasattr(self.channel_model, "_scenario") and hasattr(
-                self.channel_model._scenario, "ut_velocities"
-            ):
-                ut_vel_full = self.channel_model._scenario.ut_velocities
-            else:
-                # Default to zeros if not found [batch, num_ut, 3]
-                ut_vel_full = tf.zeros_like(ut_loc)
-
-            if in_state is not None:
-                in_state_full = in_state
-            elif hasattr(self.channel_model, "indoor"):
-                in_state_full = self.channel_model.indoor
-            elif hasattr(self.channel_model, "_scenario") and hasattr(
-                self.channel_model._scenario, "indoor"
-            ):
-                in_state_full = self.channel_model._scenario.indoor
-            else:
-                # Default to false (outdoor) [batch, num_ut]
-                in_state_full = tf.zeros(ut_loc.shape[:2], dtype=tf.bool)
-
-            in_state_batch = in_state_full[:, start_ut:end_ut]
-            ut_vel_batch = ut_vel_full[:, start_ut:end_ut, :]
-
-            # neighbor_indices for this batch: [batch, current_batch_size, num_neighbors]
-            neighbor_indices_batch = current_neighbor_indices[:, start_ut:end_ut, :]
-
-            # 1. Map physical positions/orientations to virtual BSs for this batch
-            # bs_loc: [batch, num_bs, 3]
-            # Gather BSs relevant to these UTs
-            # Use batch_dims=1 to gather per-batch-item
-            bs_loc_mapped = tf.gather(
-                bs_loc, neighbor_indices_batch, axis=1, batch_dims=1
-            )
-            bs_orient_mapped = tf.gather(
-                bs_orient, neighbor_indices_batch, axis=1, batch_dims=1
+        # 1. Update Base Class Topology Storage (for Statistical Models)
+        # If external loader is used, set_topology is bypassed in Base, but we pass info via kwargs.
+        if self.external_loader is None:
+            self.hybrid_channel.set_topology(
+                ut_loc=ut_loc,
+                bs_loc=bs_loc,
+                ut_orient=ut_orient,
+                bs_orient=bs_orient,
+                ut_velocities=ut_velocities,
+                in_state=in_state,
+                store=True,
             )
 
-            # Flatten neighbors for channel model: [batch, current_batch_size * num_neighbors, 3]
-            bs_loc_flat = tf.reshape(bs_loc_mapped, [batch_size, -1, 3])
-            bs_orient_flat = tf.reshape(bs_orient_mapped, [batch_size, -1, 3])
+        # 2. Prepare Topology Kwargs (for External Path)
+        topology_kwargs = {
+            "ut_loc": ut_loc,
+            "bs_loc": bs_loc,
+            "ut_orient": ut_orient,
+            "bs_orient": bs_orient,
+            "ut_velocities": ut_velocities,
+            "in_state": in_state,
+        }
 
-            # 2. SET VIRTUAL TOPOLOGY (Small batch)
-            self.channel_model.set_topology(
-                ut_loc=ut_loc_batch,
-                bs_loc=bs_loc_flat,
-                ut_orientations=ut_orient_batch,
-                bs_orientations=bs_orient_flat,
-                ut_velocities=ut_vel_batch,
-                in_state=in_state_batch,
-            )
+        # 3. Call Base Class ID-Based Calculation
+        h_channel = self.hybrid_channel.compute_specific_links(
+            batch_size=batch_size,
+            neighbor_indices=current_neighbor_indices,
+            external_loader=self.external_loader,
+            return_element_channel=return_element_channel,
+            # Use smaller chunk_size to avoid OOM.
+            # rbg_size_sc might be large (Wideband), so we don't use it for chunking memory.
+            chunk_size=36,
+            **topology_kwargs,
+        )
 
-            # 2.5 Set Analog Weights for this Virtual Topology
-            if not return_element_channel:
-                # Ensure global weights are available
-                if not hasattr(self, "global_w_rf") or self.global_w_rf is None:
-                    # If no weight is set, Base class uses identity.
-                    pass
-                else:
-                    # Determine Direction
-                    direction = getattr(self.channel_model, "direction", "uplink")
-                    is_uplink = direction == "uplink"
-
-                    # Identify Weight Sources
-                    if is_uplink:
-                        # Uplink: Tx = UT, Rx = BS
-                        bs_weights_source = self.global_a_rf
-                        ut_weights_source = self.global_w_rf
-                    else:
-                        # Downlink: Tx = BS, Rx = UT
-                        bs_weights_source = self.global_w_rf
-                        ut_weights_source = self.global_a_rf
-
-                    # --- 1. Gather BS Weights (Neighbors) ---
-                    # We want [Batch, VirtualBS, Ant, Port] matching bs_loc_flat
-                    if len(bs_weights_source.shape) == 2:  # [Ant, Port] - Global
-                        bs_weights_flat = bs_weights_source
-                    elif len(bs_weights_source.shape) >= 3:
-                        # Map to neighbors: [Batch, SubUT, Neighbors, ...]
-                        bs_weights_mapped = tf.gather(
-                            bs_weights_source,
-                            neighbor_indices_batch,
-                            axis=1,
-                            batch_dims=1,
-                        )
-                        # Flatten SubUT and Neighbors to VirtualBS
-                        bs_weights_flat = tf.reshape(
-                            bs_weights_mapped,
-                            [
-                                tf.shape(bs_weights_mapped)[0],
-                                -1,
-                                tf.shape(bs_weights_mapped)[-2],
-                                tf.shape(bs_weights_mapped)[-1],
-                            ],
-                        )
-                    else:
-                        bs_weights_flat = bs_weights_source
-
-                    # --- 2. Gather UT Weights (Users) ---
-                    # We want [Batch, SubUT, Ant, Port] matching ut_loc_batch
-                    if len(ut_weights_source.shape) == 2:
-                        ut_weights_flat = ut_weights_source
-                    elif len(ut_weights_source.shape) >= 3:
-                        # Slice for current UT batch
-                        ut_weights_flat = ut_weights_source[:, start_ut:end_ut, :, :]
-                    else:
-                        ut_weights_flat = ut_weights_source
-
-                    # --- 3. Assign back to Channel ---
-                    if is_uplink:
-                        # w_rf = UT, a_rf = BS
-                        self.hybrid_channel.set_analog_weights(
-                            ut_weights_flat, bs_weights_flat
-                        )
-                    else:
-                        # w_rf = BS, a_rf = UT
-                        self.hybrid_channel.set_analog_weights(
-                            bs_weights_flat, ut_weights_flat
-                        )
-
-            # 3. Call channel model (Delegate to Base)
-            # This generates H for all pairs in the batch:
-            # (current_batch_size UTs) x (current_batch_size * num_neighbors Virtual BSs)
-
-            if return_element_channel:
-                h_port_flat = self.hybrid_channel.get_element_channel(
-                    batch_size=batch_size, chunk_size=rbg_size_sc
-                )
-            else:
-                h_port_flat = self.hybrid_channel.get_port_channel(
-                    batch_size=batch_size, chunk_size=rbg_size_sc
-                )
-
-            # 4. Extract active links (Diagonal blocks)
-            # h_port_flat includes Cross-UT interference terms (UT_i vs Neighbors_of_UT_j).
-            # We only want (UT_i vs Neighbors_of_UT_i).
-
-            num_virtual_bs_batch = current_batch_size * num_neighbors
-            # Check direction based on dimensions (Base returns [Batch, Rx, ..., Tx, ...])
-            # DL: Rx=SubUT, Tx=VirtualBS. UL: Rx=VirtualBS, Tx=SubUT.
-            is_uplink_detected = h_port_flat.shape[1] == num_virtual_bs_batch
-
-            h_list_batch = []
-
-            for k in range(current_batch_size):
-                start_idx = k * num_neighbors
-                end_idx = (k + 1) * num_neighbors
-
-                if is_uplink_detected:
-                    # UL: Rx=VirtualBS (BS), Tx=SubUT (UT)
-                    # Slice VirtualBS=start:end, UT=k
-                    # Base output: [Batch, VirtualBS, RxA, UT, TxA, Time, SC] (approx)
-                    chan_slice = h_port_flat[:, start_idx:end_idx, :, k, ...]
-                else:
-                    # DL: Rx=SubUT, Tx=VirtualBS
-                    # Base output: [Batch, UT, RxA, VirtualBS, TxA, Time, SC]
-                    chan_slice = h_port_flat[:, k, :, start_idx:end_idx, ...]
-
-                    # Transpose needed to align with expected output format [B, Neighbors, Rx, Tx, ...]
-                    # Current chan_slice: [Batch, RxA, Neighbors, TxA, Time, SC]
-                    # We want: [Batch, Neighbors, RxA, TxA, Time, SC] (Stacking on axis 1 later)
-
-                    # Permutation:
-                    # 0: Batch
-                    # 1: RxA
-                    # 2: Neighbors
-                    # 3: TxA
-                    # 4: Time
-                    # 5: SC
-                    # Target: 0, 2, 1, 3, 4, 5
-                    chan_slice = tf.transpose(chan_slice, perm=[0, 2, 1, 3, 4, 5])
-
-                h_list_batch.append(chan_slice)
-
-            # Stack batch results: [Batch, current_batch_size, Neighbors, RxA, TxA, Time, SC]
-            h_chunk = tf.stack(h_list_batch, axis=1)
-            h_chunks.append(h_chunk)
-
-        # 4. RESTORE ORIGINAL TOPOLOGY
-        self.channel_model.set_topology(ut_loc, bs_loc, ut_orient, bs_orient)
-
-        # 6. Concatenate all chunks
-        # [Batch, Total_UT, Neighbors, RxP, TxP, S, C]
-        h_neighbor = tf.concat(h_chunks, axis=1)
-
-        # Transpose to Simulator format: [Batch, U, Neighbors, Time, SC, RxP, TxP]
-        # Indices: 0=Batch, 1=U, 2=Neighbors, 3=RxP, 4=TxP, 5=Time, 6=SC
-        # Target: 0, 1, 2, 5, 6, 3, 4
-        h_neighbor = tf.transpose(h_neighbor, perm=[0, 1, 2, 5, 6, 3, 4])
-
+        # 4. Return Results (with SVD if requested)
         if return_element_channel:
-            return h_neighbor
+            return h_channel
 
         if not return_s_u_v:
-            return h_neighbor
+            return h_channel
 
-        s, u, v = tf.linalg.svd(h_neighbor)
-        return h_neighbor, s, u, v
+        s, u, v = tf.linalg.svd(h_channel)
+        return h_channel, s, u, v
 
     def get_element_channel_for_beam_selection(
         self,
@@ -331,564 +138,34 @@ class HybridChannelInterface(Block):
         rbg_size_sc=1,
     ):
         """
-        Get element-domain channel for beam selection, handling topology and neighbors.
+        Get element-domain channel for beam selection.
+        Delegates to get_neighbor_channel_info with return_element_channel=True.
         """
-        effective_neighbor_indices = (
-            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
-        )
-
-        # Check external loader
-        if self.external_loader is not None:
-            return self.get_external_neighbor_channel_info(
-                batch_size,
-                ut_loc,
-                bs_loc,
-                ut_orient,
-                bs_orient,
-                neighbor_indices=effective_neighbor_indices,
-                return_element_channel=True,
-            )
-
-        # Re-use get_neighbor_channel_info with flag
         return self.get_neighbor_channel_info(
-            batch_size,
-            ut_loc,
-            bs_loc,
-            ut_orient,
-            bs_orient,
-            neighbor_indices=effective_neighbor_indices,
+            batch_size=batch_size,
+            ut_loc=ut_loc,
+            bs_loc=bs_loc,
+            ut_orient=ut_orient,
+            bs_orient=bs_orient,
+            neighbor_indices=neighbor_indices,
             ut_velocities=ut_velocities,
             in_state=in_state,
             return_element_channel=True,
             rbg_size_sc=rbg_size_sc,
+            return_s_u_v=False,
         )
 
-    def _get_steering_vector(self, array, theta, phi):
+    def _compute_approximate_interference(self, ut_loc, bs_loc, neighbor_indices):
         """
-        Manually computes 3GPP-compliant steering vector for a PanelArray.
-        theta: [..., L] Zenith angle [0, pi]
-        phi: [..., L] Azimuth angle [-pi, pi]
-        Returns: [..., L, num_ant] complex response
+        Stub for Phase 3.6: Calculate approximate interference from non-neighbor BSs.
+        Computes distance-based Path Loss and returns estimated interference power.
         """
-        # 1. Gain Pattern (Element Field)
-        f_pol1_theta, f_pol1_phi = array.ant_pol1.field(theta, phi)
-        e_gain = tf.sqrt(tf.abs(f_pol1_theta) ** 2 + tf.abs(f_pol1_phi) ** 2)
-
-        # 2. Array Phase Shift
-        pos = array.ant_pos  # [N, 3]
-
-        k_y = tf.sin(theta) * tf.sin(phi)
-        k_z = tf.cos(theta)
-
-        # [..., L, 1] * [1, N] -> [..., L, N]
-        # array.ant_pos is already in meters.
-        # Phase = 2*pi * (k . pos) / lambda
-        phase = (
-            2.0
-            * PI
-            * (
-                tf.expand_dims(k_y, -1) * tf.expand_dims(pos[:, 1], 0)
-                + tf.expand_dims(k_z, -1) * tf.expand_dims(pos[:, 2], 0)
-            )
-            / array._lambda_0
-        )
-
-        e_array = tf.complex(tf.cos(phase), tf.sin(phase))
-
-        # Apply element gain [..., L, N]
-        return tf.cast(e_gain, e_array.dtype)[..., tf.newaxis] * e_array
-
-    def get_external_neighbor_channel_info(
-        self,
-        batch_size,
-        ut_loc,
-        bs_loc,
-        ut_orient,
-        bs_orient,
-        neighbor_indices=None,
-        return_element_channel=False,
-        return_s_u_v=True,
-    ):
-        """
-        Generates channel using external ray-tracing data (Zarr).
-        Reconstructs channel using stored Rays and LSPs.
-        """
-        current_neighbor_indices = (
-            neighbor_indices if neighbor_indices is not None else self.neighbor_indices
-        )
-        if current_neighbor_indices is None:
-            raise ValueError(
-                "neighbor_indices must be provided either in init or in method call."
-            )
-
-        # Imports to avoid circular dependency
-        from sionna.phy.channel.tr38901 import Rays, Topology
-        from sionna.phy.channel import cir_to_ofdm_channel
-        from experiments.hybrid_beamforming.shared.channel_models import (
-            subcarrier_frequencies,
-        )
-
-        num_rx_ports = self.hybrid_channel.num_rx_ports
-        num_tx_ports = self.hybrid_channel.num_tx_ports
-
-        # Batch processing for UTs to avoid OOM
-        batch_size_ut = 4  # Adjust based on memory
-        h_chunks = []
-
-        num_ut_total = current_neighbor_indices.shape[1]
-        num_neighbors = current_neighbor_indices.shape[2]
-
-        # Prepare frequencies for OFDM conversion
-        num_subcarriers = self.resource_grid.fft_size
-        if self.use_rbg_granularity:
-            num_rbgs = tf.maximum(num_subcarriers // self.rbg_size_sc, 1)
-            rbg_indices = tf.range(num_rbgs) * self.rbg_size_sc + (
-                self.rbg_size_sc // 2
-            )
-            all_frequencies = subcarrier_frequencies(
-                num_subcarriers, self.resource_grid.subcarrier_spacing
-            )
-            frequencies = tf.gather(all_frequencies, rbg_indices)
-        else:
-            frequencies = self.resource_grid.frequencies
-
-        # Loop over UT batches
-        num_batches_ut = (num_ut_total + batch_size_ut - 1) // batch_size_ut
-
-        for i in range(num_batches_ut):
-            start_ut = i * batch_size_ut
-            end_ut = min(start_ut + batch_size_ut, num_ut_total)
-            current_batch_size = end_ut - start_ut
-
-            # Indices for slicing
-            # ut_indices: [start_ut ... end_ut]
-            ut_indices = tf.range(start_ut, end_ut)
-
-            # neighbor_indices_batch: [B, SubUT, Neighbors]
-            neighbor_indices_batch = current_neighbor_indices[:, start_ut:end_ut, :]
-
-            # Slicing Inputs
-            # ut_loc_batch: [Batch, SubUT, 3]
-            ut_loc_batch = ut_loc[:, start_ut:end_ut, :]
-            ut_orient_batch = ut_orient[:, start_ut:end_ut, :]
-
-            # 1. Retrieve Rays & LSPs for this batch
-            data = self.external_loader.get_rays(ut_indices=ut_indices, bs_indices=None)
-
-            # Helper to gather neighbors
-            def gather_neighbors(tensor, indices, axis, batch_dims):
-                return tf.gather(tensor, indices, axis=axis, batch_dims=batch_dims)
-
-            # Unpack Rays Data [B, U, BS, P] -> Gather neighbors
-            delays = gather_neighbors(
-                data["delays"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            powers = gather_neighbors(
-                data["powers"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            aoa = gather_neighbors(
-                data["aoa"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            aod = gather_neighbors(
-                data["aod"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            zoa = gather_neighbors(
-                data["zoa"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            zod = gather_neighbors(
-                data["zod"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            xpr = gather_neighbors(
-                data["xpr"], neighbor_indices_batch, axis=2, batch_dims=2
-            )
-
-            # Unpack LSPs [B, BS, U] -> Transpose -> Gather
-            pathloss = tf.transpose(data["pathloss"], [0, 2, 1])  # [B, U, BS]
-            shadow_fading = tf.transpose(data["shadow_fading"], [0, 2, 1])
-            k_factor = tf.transpose(data["k_factor"], [0, 2, 1])
-
-            pl_batch = gather_neighbors(
-                pathloss, neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            sf_batch = gather_neighbors(
-                shadow_fading, neighbor_indices_batch, axis=2, batch_dims=2
-            )
-            k_batch = gather_neighbors(
-                k_factor, neighbor_indices_batch, axis=2, batch_dims=2
-            )
-
-            # 2. Flatten to Links for _cir_sampler [TotalLinks]
-            total_links = current_batch_size * num_neighbors
-
-            def flatten_to_links(tensor):
-                shape = tf.shape(tensor)
-                new_shape = tf.concat(
-                    [[batch_size * total_links], shape[3:]], axis=0
-                )  # [TotalLinks, ...]
-                flat = tf.reshape(tensor, new_shape)
-                return flat[:, tf.newaxis, tf.newaxis, ...]
-
-            rays_obj_flat = Rays(
-                delays=flatten_to_links(delays),
-                powers=flatten_to_links(powers),
-                aoa=flatten_to_links(aoa),
-                aod=flatten_to_links(aod),
-                zoa=flatten_to_links(zoa),
-                zod=flatten_to_links(zod),
-                xpr=flatten_to_links(xpr),
-            )
-
-            # Flatten LSPs [TotalLinks, 1, 1] (Ensure these are defined!)
-            k_flat = flatten_to_links(k_batch[..., tf.newaxis])[..., 0]
-            sf_flat = flatten_to_links(sf_batch[..., tf.newaxis])[..., 0]
-            pl_flat = flatten_to_links(pl_batch[..., tf.newaxis])[..., 0]
-
-            # Flatten LSPs [TotalLinks, 1, 1]
-            # We gather axis 1.
-            # gather(bs_loc, indices, axis=1, batch_dims=1)
-            # bs_loc needs to be broadcast to [Batch, SubUT, AllBS, 3]?
-            # No, bs_loc is [Batch, AllBS, 3].
-            # neighbor_indices is [Batch, SubUT, Neighbors].
-            # This gathering is tricky.
-            # Use gather_nd? Or broadcast bs_loc?
-            # bs_loc_exp = tf.expand_dims(bs_loc, 1) # [B, 1, AllBS, 3]
-            # bs_loc_tiled = tf.tile(bs_loc_exp, [1, current_batch_size, 1, 1]) # [B, U, AllBS, 3]
-            # Then gather axis 2.
-            # Optimized:
-            # Flatten indices [B*U*N]. Flatten bs_loc [B*AllBS].
-            # But B=1 usually.
-
-            # Simple gather logic:
-            # bs_loc_mapped = tf.gather(bs_loc, neighbor_indices_batch, axis=1, batch_dims=1)
-            # This works if neighbor_indices_batch refers to AllBS index. Yes it does.
-            bs_loc_mapped = tf.gather(
-                bs_loc, neighbor_indices_batch, axis=1, batch_dims=1
-            )  # [B, U, N, 3]
-
-            ut_loc_expanded = tf.repeat(
-                ut_loc_batch, repeats=num_neighbors, axis=2
-            )  # [B, U*N?, 3]? No.
-            ut_loc_tiled = tf.tile(
-                tf.expand_dims(ut_loc_batch, 2), [1, 1, num_neighbors, 1]
-            )  # [B, U, N, 3]
-            ut_orient_tiled = tf.tile(
-                tf.expand_dims(ut_orient_batch, 2), [1, 1, num_neighbors, 1]
-            )
-
-            # Flatten Locations
-            ut_loc_flat = tf.reshape(
-                ut_loc_tiled, [-1, 1, 3]
-            )  # [TotalLinks, 1, 3] (Rx)
-            bs_loc_flat = tf.reshape(
-                bs_loc_mapped, [-1, 1, 3]
-            )  # [TotalLinks, 1, 3] (Tx)
-            ut_orient_flat = tf.reshape(ut_orient_tiled, [-1, 1, 3])
-            # BS orientations need gathering too
-            bs_orient_mapped = tf.gather(
-                bs_orient, neighbor_indices_batch, axis=1, batch_dims=1
-            )
-            bs_orient_flat = tf.reshape(bs_orient_mapped, [-1, 1, 3])
-
-            # Construct dummy Topology
-            # We provide minimal info needed by _step_11
-            # _step_11 needs orientations and velocities (for Doppler).
-            # We assume velocity is 0 if not provided or handle it.
-            # Construct dummy Topology with all required fields
-            # We provide minimal info needed by _step_11 (Doppler & Orientations)
-
-            ut_vel = tf.zeros_like(ut_loc_flat)
-
-            # Shapes: [Batch, NumBS, NumUT] -> [TotalLinks, 1, 1]
-            dummy_zeros = tf.zeros([batch_size * total_links, 1, 1], dtype=tf.float32)
-            dummy_los = tf.zeros([batch_size * total_links, 1, 1], dtype=tf.bool)
-
-            topo = Topology(
-                velocities=ut_vel,  # [TotalLinks, 1, 3]
-                moving_end="rx",
-                los_aoa=dummy_zeros,
-                los_aod=dummy_zeros,
-                los_zoa=dummy_zeros,
-                los_zod=dummy_zeros,
-                los=dummy_los,
-                distance_3d=dummy_zeros,
-                tx_orientations=bs_orient_flat,
-                rx_orientations=ut_orient_flat,
-            )
-
-            # Retrieve c_ds from scenario [Batch, AllUT, NumBS]
-            # c_ds is [Batch, Rx, Tx]. For DL, Rx=UT. So [Batch, AllUT, NumBS].
-            c_ds_full = self.channel_model._scenario.get_param("cDS") * 1e-9
-
-            # 1. Slice for current UT batch [B, SubUT, NumBS]
-            c_ds_batch_ut = tf.gather(c_ds_full, ut_indices, axis=1)
-
-            # 2. Gather neighbors [B, SubUT, Neighbors]
-            c_ds_batch = gather_neighbors(
-                c_ds_batch_ut, neighbor_indices_batch, axis=2, batch_dims=2
-            )
-
-            c_ds_flat = flatten_to_links(c_ds_batch[..., tf.newaxis])[..., 0]
-
-            c_ds = c_ds_flat  # [TotalLinks, 1, 1]
-
-            # Call Sampler
-            # h comes out as [TotalLinks, Rx(1), RxAnt, Tx(1), TxAnt, Paths, Time]
-            h_element, delays_flat = self.channel_model._cir_sampler(
-                1,  # num_time_samples
-                30e3,  # sampling_frequency (dummy)
-                k_flat,
-                rays_obj_flat,
-                topo,
-                c_ds,
-            )
-
-            # 5. Apply Pathloss and Shadow Fading
-            # gain = 10^(-PL/20) * sqrt(SF)
-            # pl_flat [Links, 1, 1], sf_flat [Links, 1, 1]
-            gain_lin = tf.sqrt(sf_flat) * tf.pow(10.0, -pl_flat / 20.0)
-            h_element = (
-                h_element
-                * tf.complex(gain_lin, 0.0)[
-                    :, :, tf.newaxis, :, tf.newaxis, tf.newaxis, tf.newaxis
-                ]
-            )
-
-            # Sum over paths (Step 11 usually returns paths? No, Step 11 returns Multi-path components?
-            # ChannelCoefficientsGenerator returns [..., num_paths, num_time_steps].
-            # h_element is [Links, 1, RxA, 1, TxA, Paths, Time].
-            # We need to apply Doppler? Step 11 includes Doppler.
-            # We need to sum over paths to get CIR?
-            # cir_to_ofdm_channel takes 'a' (paths) and 'tau'.
-            # It expects [..., Paths, Time].
-            # So we KEEP paths distinct for OFDM conversion!
-            # h_element IS 'a' (complex gains per path).
-
-            # 6. Apply Analog Weights (Contraction)
-            # Observed h_element shape: [Links, Rx(1), Tx(1), Paths, TxAnt, RxAnt, Time]
-            # We need [Links, RxAnt, TxAnt, Paths, 1]
-
-            # Remove singleton Rx/Tx dims (indices 1 and 2)
-            h_e = tf.squeeze(
-                h_element, axis=[1, 2]
-            )  # [Links, Paths, TxAnt, RxAnt, Time]
-
-            # Transpose to [Links, RxAnt, TxAnt, Paths, Time]
-            # Input determined to be [Links, Paths, RxAnt, TxAnt, Time] based on tracebacks.
-            # Permutation: 0(Links), 2(RxAnt), 3(TxAnt), 1(Paths), 4(Time)
-            h_e = tf.transpose(
-                h_e, perm=[0, 2, 3, 1, 4]
-            )  # [Links, RxAnt, TxAnt, Paths, Time]
-
-            if return_element_channel:
-                # User requested Element Channel (e.g. for Beam Selection)
-                # Convert to OFDM
-                # h_e: [Links, RxA, TxA, Paths, 1]
-                # tau_flat: [Links, 1, 1, Paths] (Need to broadcast to RxA/TxA? cir_to_ofdm handles broadcasting if ranks align)
-                # h_e has rank 5. tau_flat has rank 4.
-                # cir_to_ofdm(frequencies, a, tau). 'a' and 'tau' shape tail should match.
-                # 'tau' should be [..., Paths]. 'a' is [..., Paths, Time].
-
-                # Flatten dimensions to avoid Rank > 5 error in cir_to_ofdm_channel on GPU
-                # h_e: [Links, RxA, TxA, Paths, 1]
-                shape_h = tf.shape(h_e)
-                num_links = shape_h[0]
-                rx_ant = shape_h[1]
-                tx_ant = shape_h[2]
-                num_paths_dim = shape_h[3]
-
-                # Broadcast tau to match h_e dims
-                # Use delays_flat returned from _cir_sampler (includes sub-clustering)
-                tau_flat = delays_flat
-                # tau_flat shape likely [Links, 1, 1, Paths] (or similar rank 4).
-
-                tau_broadcast = tf.broadcast_to(
-                    tau_flat, [num_links, rx_ant, tx_ant, num_paths_dim]
-                )
-
-                # Flatten to [N, Paths, 1] and [N, Paths]
-                h_e_reshaped = tf.reshape(h_e, [-1, num_paths_dim, 1])
-                tau_reshaped = tf.reshape(tau_broadcast, [-1, num_paths_dim])
-
-                # Manual CIR to OFDM (Avoiding Rank>5 and hardcoded axis errors)
-                from sionna.phy import PI
-
-                # tau: [N, P]. freq: [F].
-                # We need [N, P, F]
-                phase = (
-                    -2
-                    * PI
-                    * tau_reshaped[..., tf.newaxis]
-                    * frequencies[tf.newaxis, tf.newaxis, :]
-                )
-                basis = tf.exp(tf.complex(0.0, phase))  # [N, P, F]
-
-                # h_e: [N, P, 1]
-                h_term = (
-                    tf.complex(h_e_reshaped, 0.0)
-                    if h_e_reshaped.dtype.is_floating
-                    else h_e_reshaped
-                )
-
-                # Multiply and Sum over paths
-                h_ofdm_flat = tf.reduce_sum(h_term * basis, axis=1)  # [N, F]
-
-                # Reshape back to [Links, RxA, TxA, 1, SC]
-                h_ofdm = tf.reshape(h_ofdm_flat, [num_links, rx_ant, tx_ant, 1, -1])
-
-                # Reshape back to [Batch, SubUT, Neighbors, RxA, TxA, Time, SC]
-                h_chunk_shape = [
-                    batch_size,
-                    current_batch_size,
-                    num_neighbors,
-                    self.hybrid_channel.rx_array.num_ant,
-                    self.hybrid_channel.tx_array.num_ant,
-                    1,  # Time
-                    -1,  # SC
-                ]
-                h_chunk = tf.reshape(h_ofdm, h_chunk_shape)
-
-                # Transpose to [B, U, N, Time, SC, Rx, Tx]
-                # Indices: 0:B, 1:U, 2:N, 3:Rx, 4:Tx, 5:Time, 6:SC
-                # Target: 0, 1, 2, 5, 6, 3, 4
-                h_chunk = tf.transpose(h_chunk, perm=[0, 1, 2, 5, 6, 3, 4])
-
-                h_chunks.append(h_chunk)
-                continue  # Next batch
-
-                h_chunks.append(h_chunk)
-                continue  # Next batch
-
-            # Weights need to be gathered/tiled to [Links, ...]
-            # w_rf: [b, s, j, p] or similar.
-            w_rf_full = self.hybrid_channel.w_rf
-            a_rf_full = self.hybrid_channel.a_rf
-
-            # Handle w_rf shape
-            neighbor_indices_flat = tf.reshape(neighbor_indices_batch, [-1])
-
-            # Gather w_rf
-            if len(w_rf_full.shape) == 4:  # [B, S, Ant, Port]
-                w_rf_links = tf.gather(
-                    w_rf_full[0], neighbor_indices_flat
-                )  # Assume B=1
-            elif len(w_rf_full.shape) == 2:  # [Ant, Port] (Global)
-                w_rf_links = tf.expand_dims(w_rf_full, 0)
-                w_rf_links = tf.tile(w_rf_links, [tf.shape(h_e)[0], 1, 1])
-            else:
-                w_rf_links = tf.gather(w_rf_full, neighbor_indices_flat)
-
-            # Gather a_rf (Rx)
-            # a_rf [Batch, UT, Ant, Port] or [Ant, Port]
-            ut_indices_repeated = tf.repeat(ut_indices, num_neighbors)
-
-            if len(a_rf_full.shape) == 4:  # [B, U, Ant, Port]
-                a_rf_links = tf.gather(a_rf_full[0], ut_indices_repeated)
-            elif len(a_rf_full.shape) == 2:  # [Ant, Port] (Global)
-                a_rf_links = tf.expand_dims(a_rf_full, 0)
-                a_rf_links = tf.tile(a_rf_links, [tf.shape(h_e)[0], 1, 1])
-            else:
-                a_rf_links = tf.gather(a_rf_full, ut_indices_repeated)
-
-            # Contract
-            # h_e: [Links, RxA, TxA, Paths, 1]
-            # a_rf_links: [Links, RxA, RxP]
-            # w_rf_links: [Links, TxA, TxP]
-
-            # v_rx = a^H * h
-            # einsum("lrp, lrtpx -> lptpx", conj(a_rf), h_e)
-            term1 = tf.einsum("lrp, lrtki -> lptki", tf.math.conj(a_rf_links), h_e)
-
-            # v_tx = term1 * w
-            # einsum("lptki, lto -> lpok i", term1, w_rf) -> [Links, RxP, Paths, TxP, 1] ?
-            # indices: l=Links, p=RxP, t=TxA, k=Paths, i=Time.
-            # w: l=Links, t=TxA, o=TxP.
-            # result: l, p, o, k, i.
-            h_port_links = tf.einsum("lptki, lto -> lpoki", term1, w_rf_links)
-            # Shape: [Links, RxP, TxP, Paths, 1]
-
-            # Manual CIR to OFDM for h_port_links (Contracted Channel) to avoid Rank > 5 errors
-            # h_port_links: [Links, RxP, TxP, Paths, 1]
-            # delays_flat: [Links, 1, 1, Paths] (Need broadcasting)
-
-            shape_t2 = tf.shape(h_port_links)
-            # Flatten to [N, Paths, 1]
-            num_paths_dim = shape_t2[3]
-            h_port_links_reshaped = tf.reshape(h_port_links, [-1, num_paths_dim, 1])
-
-            # Broadcast tau to match h_port_links shape prefix
-            # h_port_links shape: [Links, RxP, TxP, Paths, 1]
-            # delays_flat shape: [Links, 1, 1, Paths]
-            # We want tau to broad cast to [Links, RxP, TxP, Paths]
-
-            # Extract dims
-            n_links = shape_t2[0]
-            n_rxp = shape_t2[1]
-            n_txp = shape_t2[2]
-
-            # Reshape delays_flat to [Links, 1, 1, Paths] (It is already)
-            # Tile/Broadcast to [Links, RxP, TxP, Paths]
-            tau_broadcast = tf.broadcast_to(
-                delays_flat, [n_links, n_rxp, n_txp, num_paths_dim]
-            )
-
-            # Flatten tau to [-1, Paths]
-            tau_reshaped = tf.reshape(tau_broadcast, [-1, num_paths_dim])
-
-            # Manual DFT
-            from sionna.phy import PI
-
-            # phase: [N_flat, Paths, Freq]
-            phase = (
-                -2
-                * PI
-                * tau_reshaped[..., tf.newaxis]
-                * frequencies[tf.newaxis, tf.newaxis, :]
-            )
-            basis = tf.exp(tf.complex(0.0, phase))  # [N_flat, P, F]
-
-            term2_c = (
-                tf.complex(h_port_links_reshaped, 0.0)
-                if h_port_links_reshaped.dtype.is_floating
-                else h_port_links_reshaped
-            )
-
-            # Sum over paths
-            h_ofdm_flat = tf.reduce_sum(term2_c * basis, axis=1)  # [N_flat, F]
-
-            # Reshape back to [Links, RxP, TxP, 1, SC]
-            # h_ofdm_flat is [Links*RxP*TxP, SC]
-            h_ofdm = tf.reshape(h_ofdm_flat, [n_links, n_rxp, n_txp, 1, -1])
-
-            # 8. Reshape back to [Batch, SubUT, Neighbors, ...]
-            # [B, U, N, RxP, TxP, 1, SC]
-            h_chunk_shape = [
-                batch_size,
-                current_batch_size,
-                num_neighbors,
-            ] + h_ofdm.shape[1:]
-            h_chunk = tf.reshape(h_ofdm, h_chunk_shape)
-
-            # Transpose to Simulator format: [B, U, Neighbors, 1(Time), SC, RxP, TxP]
-            # Current: [B, U, N, RxP, TxP, 1, SC]
-            # Perm: 0, 1, 2, 5, 6, 3, 4
-            h_chunk = tf.transpose(h_chunk, perm=[0, 1, 2, 5, 6, 3, 4])
-
-            h_chunks.append(h_chunk)
-
-        # Concatenate all chunks
-        h_neighbor = tf.concat(h_chunks, axis=1)
-
-        if return_element_channel:
-            return h_neighbor
-
-        if not return_s_u_v:
-            return h_neighbor
-
-        if not return_s_u_v:
-            return h_neighbor
-
-        s, u, v = tf.linalg.svd(h_neighbor)
-        return h_neighbor, s, u, v
+        # Placeholder implementation
+        # 1. Calculate distances to all BSs
+        # 2. Mask neighbors
+        # 3. Apply simplified Path Loss model
+        # 4. Sum power
+        return tf.zeros([tf.shape(ut_loc)[0], tf.shape(ut_loc)[1], 1])  # [Batch, UT, 1]
 
     def get_full_channel_info(
         self,
@@ -912,23 +189,6 @@ class HybridChannelInterface(Block):
             neighbor_indices if neighbor_indices is not None else self.neighbor_indices
         )
 
-        if self.external_loader is not None and effective_neighbor_indices is not None:
-            # Note: get_external_neighbor_channel_info also needs update to accept neighbor_indices if we want full consistency,
-            # but for now let's assume external loader path handles it or we update it too.
-            # Let's check get_external_neighbor_channel_info signature.
-            # It uses self.neighbor_indices. We should probably update it too or temporarilly set self.neighbor_indices.
-            # For safety, let's update it in next step if needed.
-            # For now, let's just assume we need to pass it.
-            return self.get_external_neighbor_channel_info(
-                batch_size,
-                ut_loc,
-                bs_loc,
-                ut_orient,
-                bs_orient,
-                bs_orient,
-                neighbor_indices=effective_neighbor_indices,
-                return_s_u_v=return_s_u_v,
-            )
         if effective_neighbor_indices is not None:
             return self.get_neighbor_channel_info(
                 batch_size,

@@ -25,7 +25,7 @@ class SLSConfig(SimulationCommonConfig):
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
     num_neighbors: int = (
-        16  # For spatial masking: num BS per UT to calculate channel for
+        4  # For spatial masking: num BS per UT to calculate channel for
     )
 
     # Beam Management
