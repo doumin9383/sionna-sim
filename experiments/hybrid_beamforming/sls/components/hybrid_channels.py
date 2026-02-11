@@ -114,37 +114,59 @@ class GenerateHybridBeamformingOFDMChannel(GenerateOFDMChannel):
         self.w_rf = w_rf
         self.a_rf = a_rf
 
+    def set_topology(self, *args, **kwargs):
+        """
+        Proxy method to set topology on the underlying channel model.
+        """
+        self._channel_model.set_topology(*args, **kwargs)
+
     def _apply_weights(self, h_elem, w_rf, a_rf):
         """
-        Applies weights with broadcasting.
-        h_elem: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm, num_sc]
-        w_rf: [..., tx_ant, tx_port]
-        a_rf: [..., rx_ant, rx_port]
-        """
-        # 1. TX Beamforming (v -> p)
-        # h: b r u t v s c
-        # w: possible shapes: [v, p], [t, v, p], [b, t, v, p]
+        Applies Analog Beamforming weights to the element-domain channel.
+        Supports various weight shapes (Shared, Sector-specific, Fully Individual).
 
-        # Determine equation based on w rank
-        if len(w_rf.shape) == 2:  # [v, p]
+        Args:
+            h_elem: Element-domain channel
+                    [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm, num_sc]
+            w_rf: Tx weights. Supported shapes:
+                  - [tx_ant, tx_port] (Shared across all Tx/Batch)
+                  - [num_tx, tx_ant, tx_port] (Per-Tx sector weights)
+                  - [batch, num_tx, tx_ant, tx_port] (Per-Link weights)
+            a_rf: Rx weights. Supported shapes:
+                  - [rx_ant, rx_port] (Shared across all Rx/Batch)
+                  - [num_rx, rx_ant, rx_port] (Per-Rx weights)
+                  - [batch, num_rx, rx_ant, rx_port] (Per-Link weights)
+
+        Returns:
+            h_port: Port-domain channel
+                    [batch, num_rx, num_rx_ports, num_tx, num_tx_ports, num_ofdm, num_sc]
+        """
+        # h dimensions: b(0), r(1), u(2), t(3), v(4), s(5), c(6)
+
+        # --- 1. TX Beamforming (Contract v -> p) ---
+        rank_w = w_rf.shape.ndims
+        if rank_w == 2:  # [v, p]
             eq_tx = "brutvsc,vp->brutpsc"
-        elif len(w_rf.shape) == 3:  # [t, v, p]
+        elif rank_w == 3:  # [t, v, p]
             eq_tx = "brutvsc,tvp->brutpsc"
-        else:  # [b, t, v, p] - assumes full match or correct setup
+        elif rank_w == 4:  # [b, t, v, p]
             eq_tx = "brutvsc,btvp->brutpsc"
+        else:
+            raise ValueError(f"Unsupported w_rf rank: {rank_w}. Expected 2, 3, or 4.")
 
         h_tx_bf = tf.einsum(eq_tx, h_elem, w_rf)
 
-        # 2. RX Beamforming (u -> q)
-        # h_tx_bf: b r u t p s c
-        # a: possible shapes: [u, q], [r, u, q], [b, r, u, q]
-
-        if len(a_rf.shape) == 2:  # [u, q]
+        # --- 2. RX Beamforming (Contract u -> q) ---
+        # h_tx_bf dimensions: b(0), r(1), u(2), t(3), p(4), s(5), c(6)
+        rank_a = a_rf.shape.ndims
+        if rank_a == 2:  # [u, q]
             eq_rx = "brutpsc,uq->brqtpsc"
-        elif len(a_rf.shape) == 3:  # [r, u, q]
+        elif rank_a == 3:  # [r, u, q]
             eq_rx = "brutpsc,ruq->brqtpsc"
-        else:  # [b, r, u, q]
+        elif rank_a == 4:  # [b, r, u, q]
             eq_rx = "brutpsc,bruq->brqtpsc"
+        else:
+            raise ValueError(f"Unsupported a_rf rank: {rank_a}. Expected 2, 3, or 4.")
 
         h_port = tf.einsum(eq_rx, h_tx_bf, tf.math.conj(a_rf))
 
@@ -157,12 +179,39 @@ class GenerateHybridBeamformingOFDMChannel(GenerateOFDMChannel):
         """
         return self.get_port_channel(batch_size)
 
-    def get_port_channel(self, batch_size, chunk_size=72):
+    def _compute_chunk_element_channel(self, a, tau, start_idx, end_idx):
         """
-        Internal implementation of chunked channel generation + BF application.
+        Helper to compute element domain channel for a specific frequency chunk.
+        """
+        chunk_freqs = self._active_frequencies[start_idx:end_idx]
+        h_elem = cir_to_ofdm_channel(
+            chunk_freqs, a, tau, normalize=self._normalize_channel
+        )
+        return h_elem
+
+    def get_element_channel(self, batch_size, chunk_size=72):
+        """
+        Generates the element-domain channel (before BF application).
+        Returns: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm, num_sc]
         """
         # 1. Generate Paths (CIR)
-        # Inherited from GenerateOFDMChannel's setup
+        a, tau = self._cir_sampler(
+            batch_size, self._num_ofdm_symbols, self._sampling_frequency
+        )
+
+        h_element_chunks = []
+        for start_idx in range(0, self._num_active_sc, chunk_size):
+            end_idx = min(start_idx + chunk_size, self._num_active_sc)
+            h_elem = self._compute_chunk_element_channel(a, tau, start_idx, end_idx)
+            h_element_chunks.append(h_elem)
+
+        return tf.concat(h_element_chunks, axis=-1)
+
+    def get_port_channel(self, batch_size, chunk_size=72):
+        """
+        Generates the port-domain channel (after BF application) using chunking.
+        """
+        # 1. Generate Paths (CIR)
         a, tau = self._cir_sampler(
             batch_size, self._num_ofdm_symbols, self._sampling_frequency
         )
@@ -173,14 +222,10 @@ class GenerateHybridBeamformingOFDMChannel(GenerateOFDMChannel):
         for start_idx in range(0, self._num_active_sc, chunk_size):
             end_idx = min(start_idx + chunk_size, self._num_active_sc)
 
-            # A. Convert CIR to Frequency domain for this chunk of active SCs
-            chunk_freqs = self._active_frequencies[start_idx:end_idx]
-            # Ensure output is [..., num_time_steps, num_frequencies]
-            h_elem = cir_to_ofdm_channel(
-                chunk_freqs, a, tau, normalize=self._normalize_channel
-            )
+            # A. Convert CIR to Frequency domain
+            h_elem = self._compute_chunk_element_channel(a, tau, start_idx, end_idx)
 
-            # B. Apply Analog Beamforming (Einsum with broadcasting)
+            # B. Apply Analog Beamforming
             h_port = self._apply_weights(h_elem, self.w_rf, self.a_rf)
 
             h_port_chunks.append(h_port)

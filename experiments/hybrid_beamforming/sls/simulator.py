@@ -115,17 +115,54 @@ class SystemSimulator(Block):
         # self._setup_topology(config.num_rings, min_bs_ut_dist, max_bs_ut_dist)
 
         # Instantiate the Hybrid Channel Interface
+        if self.direction == "uplink":
+            tx_array = self.config.ut_array
+            rx_array = self.config.bs_array
+
+            # Calculate ports fallback
+            ut_pol_factor = 2 if self.config.ut_polarization == "dual" else 1
+            num_tx_ports = (
+                self.config.ut_num_rows_panel
+                * self.config.ut_num_cols_panel
+                * ut_pol_factor
+            )
+
+            bs_pol_factor = 2 if self.config.bs_polarization == "dual" else 1
+            num_rx_ports = (
+                self.config.bs_num_rows_panel
+                * self.config.bs_num_cols_panel
+                * bs_pol_factor
+            )
+
+        else:
+            tx_array = self.config.bs_array
+            rx_array = self.config.ut_array
+
+            bs_pol_factor = 2 if self.config.bs_polarization == "dual" else 1
+            num_tx_ports = (
+                self.config.bs_num_rows_panel
+                * self.config.bs_num_cols_panel
+                * bs_pol_factor
+            )
+
+            ut_pol_factor = 2 if self.config.ut_polarization == "dual" else 1
+            num_rx_ports = (
+                self.config.ut_num_rows_panel
+                * self.config.ut_num_cols_panel
+                * ut_pol_factor
+            )
+
         self.channel_interface = HybridChannelInterface(
             channel_model=self.channel_model,
             resource_grid=self.resource_grid,
-            tx_array=self.config.tx_array,
-            rx_array=self.config.rx_array,
-            num_tx_ports=self.config.tx_num_ports,
-            num_rx_ports=self.config.rx_num_ports,
+            tx_array=tx_array,
+            rx_array=rx_array,
+            num_tx_ports=num_tx_ports,
+            num_rx_ports=num_rx_ports,
             precision=self.precision,
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
-            neighbor_indices=self.config.neighbor_indices,  # Topology is set in the loop
+            neighbor_indices=None,  # Topology is set in the loop and updated dynamically
             external_loader=self.external_loader,
         )
 

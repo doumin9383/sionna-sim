@@ -72,6 +72,7 @@ class HybridChannelInterface(Block):
     ):
         """
         Generates channel only for the specified neighbors using virtual topology mapping.
+        Delegates physical channel generation to the Base class.
         """
         current_neighbor_indices = (
             neighbor_indices if neighbor_indices is not None else self.neighbor_indices
@@ -80,6 +81,7 @@ class HybridChannelInterface(Block):
             raise ValueError(
                 "neighbor_indices must be provided either in init or in method call."
             )
+
         # Batch processing for UTs to avoid OOM
         # Process UTs in small batches (e.g., 1)
         batch_size_ut = 1
@@ -173,6 +175,7 @@ class HybridChannelInterface(Block):
             if not return_element_channel:
                 # Ensure global weights are available
                 if not hasattr(self, "global_w_rf") or self.global_w_rf is None:
+                    # If no weight is set, Base class uses identity.
                     pass
                 else:
                     # Determine Direction
@@ -190,38 +193,17 @@ class HybridChannelInterface(Block):
                         ut_weights_source = self.global_a_rf
 
                     # --- 1. Gather BS Weights (Neighbors) ---
-                    # We want [Batch, VirtualBS, Ant, Port]
-                    # VirtualBS = SubUT * Neighbors
-                    # bs_weights_source: [Batch, AllBS, Ant, Port]
-
-                    if (
-                        len(bs_weights_source.shape) == 2
-                    ):  # [Ant, Port] - Global Constant
-                        # Tile to [Batch, SubUT*Neighbors, Ant, Port]
-                        # We need to know Batch size.
-                        batch_size_dim = tf.shape(neighbor_indices_batch)[0]
-                        num_virtual_bs = (
-                            tf.shape(neighbor_indices_batch)[1]
-                            * tf.shape(neighbor_indices_batch)[2]
-                        )
-
-                        bs_weights_flat = tf.tile(
-                            bs_weights_source[None, None, ...],
-                            [batch_size_dim, num_virtual_bs, 1, 1],
-                        )
-
-                    elif len(bs_weights_source.shape) >= 3:  # [Batch, BS, Ant, Port]
-                        # Gather using neighbor indices
-                        # indices: [Batch, SubUT, Neighbors]
-
+                    # We want [Batch, VirtualBS, Ant, Port] matching bs_loc_flat
+                    if len(bs_weights_source.shape) == 2:  # [Ant, Port] - Global
+                        bs_weights_flat = bs_weights_source
+                    elif len(bs_weights_source.shape) >= 3:
+                        # Map to neighbors: [Batch, SubUT, Neighbors, ...]
                         bs_weights_mapped = tf.gather(
                             bs_weights_source,
                             neighbor_indices_batch,
                             axis=1,
                             batch_dims=1,
                         )
-                        # Shape: [Batch, SubUT, Neighbors, Ant, Port]
-
                         # Flatten SubUT and Neighbors to VirtualBS
                         bs_weights_flat = tf.reshape(
                             bs_weights_mapped,
@@ -232,116 +214,97 @@ class HybridChannelInterface(Block):
                                 tf.shape(bs_weights_mapped)[-1],
                             ],
                         )
-
                     else:
                         bs_weights_flat = bs_weights_source
 
                     # --- 2. Gather UT Weights (Users) ---
-                    # ut_indices range: start_ut:end_ut
-                    # We want [Batch, SubUT, Ant, Port]
-
-                    if (
-                        len(ut_weights_source.shape) == 2
-                    ):  # [Ant, Port] - Global Constant
-                        # Tile to [Batch, SubUT, Ant, Port]
-                        batch_size_dim = tf.shape(neighbor_indices_batch)[0]
-                        sub_ut = tf.shape(neighbor_indices_batch)[1]
-
-                        ut_weights_flat = tf.tile(
-                            ut_weights_source[None, None, ...],
-                            [batch_size_dim, sub_ut, 1, 1],
-                        )
-
-                    elif len(ut_weights_source.shape) >= 3:  # [Batch, AllUT, Ant, Port]
+                    # We want [Batch, SubUT, Ant, Port] matching ut_loc_batch
+                    if len(ut_weights_source.shape) == 2:
+                        ut_weights_flat = ut_weights_source
+                    elif len(ut_weights_source.shape) >= 3:
                         # Slice for current UT batch
-                        # [Batch, SubUT, Ant, Port]
                         ut_weights_flat = ut_weights_source[:, start_ut:end_ut, :, :]
-
                     else:
                         ut_weights_flat = ut_weights_source
 
                     # --- 3. Assign back to Channel ---
                     if is_uplink:
                         # w_rf = UT, a_rf = BS
-                        final_w_rf = ut_weights_flat
-                        final_a_rf = bs_weights_flat
+                        self.hybrid_channel.set_analog_weights(
+                            ut_weights_flat, bs_weights_flat
+                        )
                     else:
                         # w_rf = BS, a_rf = UT
-                        final_w_rf = bs_weights_flat
-                        final_a_rf = ut_weights_flat
+                        self.hybrid_channel.set_analog_weights(
+                            bs_weights_flat, ut_weights_flat
+                        )
 
-                    self.hybrid_channel.set_analog_weights(final_w_rf, final_a_rf)
-
-            # 3. Call channel model
+            # 3. Call channel model (Delegate to Base)
             # This generates H for all pairs in the batch:
             # (current_batch_size UTs) x (current_batch_size * num_neighbors Virtual BSs)
-            # Total links generated: current_batch_size * (current_batch_size * num_neighbors)
-            # However, we only care about the diagonal blocks (UT i <-> Neighbors of UT i)
-            # But Sionna generates full mesh.
-            # Batch size = 10 -> 10 * 80 = 800 links. Much smaller than 150 * 1200 = 180,000.
+
             if return_element_channel:
-                # Element Domain Channel (No Analog Weights)
-                # Use get_element_rbg_channel explicitly
-                h_port_flat = self.hybrid_channel.get_element_rbg_channel(
-                    batch_size, rbg_size=rbg_size_sc
+                h_port_flat = self.hybrid_channel.get_element_channel(
+                    batch_size=batch_size, chunk_size=rbg_size_sc
                 )
             else:
-                # Port Domain Channel (With Analog Weights)
-                h_port_flat = self.hybrid_channel(batch_size)
+                h_port_flat = self.hybrid_channel.get_port_channel(
+                    batch_size=batch_size, chunk_size=rbg_size_sc
+                )
 
-            # 4. Extract active links
-            # h_port_flat shape depends on direction.
-            # Uplink: [Batch, NumVirtualBS, RxP, NumUT, TxP, S, C]
-            # Downlink: [Batch, NumUT, RxP, NumVirtualBS, TxP, S, C]
+            # 4. Extract active links (Diagonal blocks)
+            # h_port_flat includes Cross-UT interference terms (UT_i vs Neighbors_of_UT_j).
+            # We only want (UT_i vs Neighbors_of_UT_i).
 
-            # NumVirtualBS in this batch
             num_virtual_bs_batch = current_batch_size * num_neighbors
-            is_uplink = h_port_flat.shape[1] == num_virtual_bs_batch
+            # Check direction based on dimensions (Base returns [Batch, Rx, ..., Tx, ...])
+            # DL: Rx=SubUT, Tx=VirtualBS. UL: Rx=VirtualBS, Tx=SubUT.
+            is_uplink_detected = h_port_flat.shape[1] == num_virtual_bs_batch
 
             h_list_batch = []
 
             for k in range(current_batch_size):
-                # Map k to flattened structure
-                # Virtual BSs for k-th UT in batch are at indices [k*num_neighbors : (k+1)*num_neighbors]
                 start_idx = k * num_neighbors
                 end_idx = (k + 1) * num_neighbors
 
-                if is_uplink:
-                    # Rx=VirtualBS (BS), Tx=UT
+                if is_uplink_detected:
+                    # UL: Rx=VirtualBS (BS), Tx=SubUT (UT)
                     # Slice VirtualBS=start:end, UT=k
-                    # [Batch, Neighbors, RxP, TxP, S, C]
-                    # Note: h_port_flat indices: [B, VirtualBS, RxP, UT, TxP, S, C]
+                    # Base output: [Batch, VirtualBS, RxA, UT, TxA, Time, SC] (approx)
                     chan_slice = h_port_flat[:, start_idx:end_idx, :, k, ...]
                 else:
-                    # Rx=UT, Tx=VirtualBS
-                    # Slice UT=k, VirtualBS=start:end
-                    # [Batch, RxP, Neighbors, TxP, S, C]
+                    # DL: Rx=SubUT, Tx=VirtualBS
+                    # Base output: [Batch, UT, RxA, VirtualBS, TxA, Time, SC]
                     chan_slice = h_port_flat[:, k, :, start_idx:end_idx, ...]
-                    # Transpose to [B, Neighbors, RxP, TxP, S, C]
-                    chan_slice = tf.transpose(chan_slice, [0, 2, 1, 3, 4, 5])
+
+                    # Transpose needed to align with expected output format [B, Neighbors, Rx, Tx, ...]
+                    # Current chan_slice: [Batch, RxA, Neighbors, TxA, Time, SC]
+                    # We want: [Batch, Neighbors, RxA, TxA, Time, SC] (Stacking on axis 1 later)
+
+                    # Permutation:
+                    # 0: Batch
+                    # 1: RxA
+                    # 2: Neighbors
+                    # 3: TxA
+                    # 4: Time
+                    # 5: SC
+                    # Target: 0, 2, 1, 3, 4, 5
+                    chan_slice = tf.transpose(chan_slice, perm=[0, 2, 1, 3, 4, 5])
 
                 h_list_batch.append(chan_slice)
 
-            # Stack batch results: [Batch, current_batch_size, Neighbors, RxP, TxP, S, C]
+            # Stack batch results: [Batch, current_batch_size, Neighbors, RxA, TxA, Time, SC]
             h_chunk = tf.stack(h_list_batch, axis=1)
             h_chunks.append(h_chunk)
 
-            # 5. CLEAR TOPOLOGY (Implicitly handled by next set_topology, but good practice if explicitly needed)
-
-        # 4. RESTORE ORIGINAL TOPOLOGY (Ideally, but usually Simulator calls set_topology every step)
-        # We should restore it to avoid side effects if 'get_neighbor_channel_info' is called
-        # but then 'channel_model' is used elsewhere without setting topology.
-        # However, for pure specific use, it might be fine.
-        # To be safe, let's restore.
+        # 4. RESTORE ORIGINAL TOPOLOGY
         self.channel_model.set_topology(ut_loc, bs_loc, ut_orient, bs_orient)
 
         # 6. Concatenate all chunks
         # [Batch, Total_UT, Neighbors, RxP, TxP, S, C]
         h_neighbor = tf.concat(h_chunks, axis=1)
 
-        # Transpose to [Batch, Total_UT, Neighbors, S, C, RxP, TxP]
-        # to match simulator expectations [Batch, U, Neighbors, Time, SC, RxP, TxP]
-        # S=Time, C=Subcarrier (from Sionna GenerateOFDMChannel convention [..., Time, Subcarrier])
+        # Transpose to Simulator format: [Batch, U, Neighbors, Time, SC, RxP, TxP]
         # Indices: 0=Batch, 1=U, 2=Neighbors, 3=RxP, 4=TxP, 5=Time, 6=SC
         # Target: 0, 1, 2, 5, 6, 3, 4
         h_neighbor = tf.transpose(h_neighbor, perm=[0, 1, 2, 5, 6, 3, 4])
