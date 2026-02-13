@@ -421,10 +421,17 @@ class GenerateHybridBeamformingOFDMChannel(
         inv_perm_tx.insert(ta_ax, inv_perm_tx.pop())
         h_tx = tf.transpose(h_tx_out, inv_perm_tx)  # [..., RA, TP, T, F]
 
-        # 2. Apply Rx BF (Contract RA at axis -4)
+        # 2. Apply Rx BF (Contract RA at axis -4 or -5 depending on rank)
         a_conj = tf.math.conj(a_rf)
         perm_rx = list(range(rank))
-        ra_ax = rank - 4
+
+        # Sionna 7D: [Batch, NR, RA, NT, TA, T, F] -> RA is -5
+        # Standard 5D: [..., RA, TA, Time, Freq]   -> RA is -4
+        if rank == 7:
+            ra_ax = rank - 5
+        else:
+            ra_ax = rank - 4
+
         perm_rx.append(perm_rx.pop(ra_ax))  # [..., TP, T, F, RA]
         h_rx_in = tf.transpose(h_tx, perm_rx)
 
