@@ -390,12 +390,19 @@ class GenerateHybridBeamformingOFDMChannel(
             mapped_idx = tf.searchsorted(unique_bs, tf.cast(idx_slice, tf.int32))
 
             if is_uplink:
-                # h_raw: [B, NumRx=UniqueBS, RA, NumTx=1, TA, Time, SC]
+                # h_raw: [B, nRx=UniqueBS, RP, nTx=1, TP, Time, Freq]
+                # mapped_idx: [B, 1, Neighbors]
+                # h_out: [B, 1, Neighbors, RP, 1, TP, Time, Freq] (Rank 8)
                 h_out = tf.gather(h_raw, mapped_idx, axis=1, batch_dims=1)
+                h_out = tf.squeeze(
+                    h_out, axis=4
+                )  # Remove nTx=1 -> [B, 1, N, RP, TP, T, F]
             else:
-                # h_raw: [1, 1, RA, K', TA, 1, F]
+                # h_raw: [B, nRx=1, RP, nTx=UniqueBS, TP, Time, Freq]
+                # h_out after gather: [B, 1, RP, 1, Neighbors, TP, Time, Freq]
                 h_out = tf.gather(h_raw, mapped_idx, axis=3, batch_dims=1)
-                h_out = tf.transpose(h_out, [0, 1, 3, 2, 4, 5, 6])
+                h_out = tf.squeeze(h_out, axis=1)  # Remove nRx=1
+                # Final shape should be [B, 1, Neighbors, RP, TP, T, F]
 
             h_chunks.append(h_out)
 
@@ -404,44 +411,35 @@ class GenerateHybridBeamformingOFDMChannel(
     def _apply_weights(self, h_elem, w_rf, a_rf):
         # h_elem: [..., RA, TA, Time, Freq]
         rank = len(h_elem.shape)
-
-        # 1. Apply Tx BF (Contract TA at axis -3)
-        # Move TA to last
-        perm_tx = list(range(rank))
-        ta_ax = rank - 3
-        perm_tx.append(perm_tx.pop(ta_ax))  # [..., RA, T, F, TA]
-        h_tx_in = tf.transpose(h_elem, perm_tx)
-
-        # Matmul with w_rf (last 2 dims: TA, TP)
-        # Broadcasting handles leading dims
-        h_tx_out = h_tx_in @ w_rf  # [..., RA, T, F, TP]
-
-        # Restore h_tx: Move TP back to ta_ax
-        inv_perm_tx = list(range(rank))
-        inv_perm_tx.insert(ta_ax, inv_perm_tx.pop())
-        h_tx = tf.transpose(h_tx_out, inv_perm_tx)  # [..., RA, TP, T, F]
-
-        # 2. Apply Rx BF (Contract RA at axis -4 or -5 depending on rank)
         a_conj = tf.math.conj(a_rf)
-        perm_rx = list(range(rank))
 
-        # Sionna 7D: [Batch, NR, RA, NT, TA, T, F] -> RA is -5
-        # Standard 5D: [..., RA, TA, Time, Freq]   -> RA is -4
         if rank == 7:
-            ra_ax = rank - 5
+            # Sionna Standard 7D: [Batch, nRx, RxAnt, nTx, TxAnt, Time, Freq]
+            # Normalize Weights to [B, nEnt, Ant, Port, ...]
+            # Defaults are [Ant, Port], Simulator gives [B, nEnt, Ant, Port]
+            w_tx = w_rf
+            while len(w_tx.shape) < 4:
+                w_tx = tf.expand_dims(w_tx, 0)
+            w_rx = a_conj
+            while len(w_rx.shape) < 4:
+                w_rx = tf.expand_dims(w_rx, 0)
+
+            # Equation: brQtPmf = conj(brRQ...) * brRtTmf * btTP...
+            h_port = tf.einsum("brRtTmf,btTP...,brRQ...->brQtPmf", h_elem, w_tx, w_rx)
+
+        elif rank == 5:
+            # Flattened Links 5D: [Links, RxAnt, TxAnt, Time, Freq]
+            w_tx = w_rf
+            while len(w_tx.shape) < 3:
+                w_tx = tf.expand_dims(w_tx, 0)
+            w_rx = a_conj
+            while len(w_rx.shape) < 3:
+                w_rx = tf.expand_dims(w_rx, 0)
+
+            # Equation: bQPTmf = conj(bRQ...) * bRTmf * bTP...
+            h_port = tf.einsum("lRTmf,lTP...,lRQ...->lQPTmf", h_elem, w_tx, w_rx)
         else:
-            ra_ax = rank - 4
-
-        perm_rx.append(perm_rx.pop(ra_ax))  # [..., TP, T, F, RA]
-        h_rx_in = tf.transpose(h_tx, perm_rx)
-
-        # Matmul with a_conj (last 2 dims: RA, RP)
-        h_rx_out = h_rx_in @ a_conj  # [..., TP, T, F, RP]
-
-        # Restore: Move RP back to ra_ax
-        inv_perm_rx = list(range(rank))
-        inv_perm_rx.insert(ra_ax, inv_perm_rx.pop())
-        h_port = tf.transpose(h_rx_out, inv_perm_rx)  # [..., RP, TP, T, F]
+            raise ValueError(f"Unsupported channel rank for weight application: {rank}")
 
         return h_port
 
