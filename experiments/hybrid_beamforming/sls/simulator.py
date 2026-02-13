@@ -21,6 +21,7 @@ from .components.link_adaptation import MCSLinkAdaptation
 from .components.get_hist import init_result_history, record_results
 from .components.precoder_utils import expand_precoder
 from .components.beam_management import BeamSelector
+from ..shared import weight_utils
 
 # Set random seed for reproducibility
 sionna.phy.config.seed = 42
@@ -350,571 +351,524 @@ class SystemSimulator(Block):
             self.bs_virtual_loc,
         )
 
+    def _setup_drop_topology(self, drop_idx):
+        """シミュレーションの1ドロップ分のトポロジーセットアップ"""
+        if self.external_loader is not None:
+            self.external_loader.load_drop(drop_idx)
+
+        # 新しいUT位置、チャネル等の生成
+        self._setup_topology(
+            self.config.num_rings,
+            self.config.min_bs_ut_dist,
+            self.config.max_bs_ut_dist,
+        )
+
+    def _select_analog_beams(self):
+        """コードブックベースのアナログビーム選択を実行し、重みをセットする"""
+        h_serv_list = []
+        batch_size_beam = 1  # 1 UTずつ処理（メモリ節約）
+
+        for i in range(0, self.num_ut, batch_size_beam):
+            end_i = min(i + batch_size_beam, self.num_ut)
+            curr_neigh_inds = self.neighbor_indices[:, i:end_i, :]
+            curr_ut_loc = self.ut_loc[:, i:end_i, :]
+            curr_ut_orient = self.ut_orientations[:, i:end_i, :]
+            curr_ut_vel = self.ut_velocities[:, i:end_i, :]
+            curr_in_state = self.in_state[:, i:end_i]
+
+            h_elem_batch = (
+                self.channel_interface.get_element_channel_for_beam_selection(
+                    batch_size=self.batch_size,
+                    ut_loc=curr_ut_loc,
+                    bs_loc=self.bs_loc,
+                    ut_orient=curr_ut_orient,
+                    bs_orient=self.bs_orientations,
+                    neighbor_indices=curr_neigh_inds,
+                    ut_velocities=curr_ut_vel,
+                    in_state=curr_in_state,
+                )
+            )
+            # Neighbor=0, Time=0
+            h_serv_batch = h_elem_batch[:, :, 0, :, :, 0, :]
+
+            # 周波数方向のサブサンプリング（メモリ節約）
+            if self.config.use_rbg_granularity:
+                # RBG単位での周波数サンプリング（中心付近の1点を使用）
+                # 完全に平均をとるのではなく、計算負荷を減らすために間引く
+                h_serv_batch = h_serv_batch[..., :: self.rbg_size_sc]
+
+            h_serv_list.append(h_serv_batch)
+
+        h_serv = tf.concat(h_serv_list, axis=1)
+
+        # BS側のビーム選択
+        B = self.batch_size
+        N_BS = self.num_bs
+        N_UT_Sec = self.num_ut_per_sector
+        N_UT_Total = self.num_ut
+        RxA = tf.shape(h_serv)[2]
+        TxA = tf.shape(h_serv)[3]
+        FFT = tf.shape(h_serv)[4]
+
+        batch_indices = tf.broadcast_to(tf.range(B)[:, None], [B, N_UT_Total])
+        bs_indices = tf.cast(self.serving_bs_ids, tf.int32)
+        indices = tf.stack(
+            [batch_indices, bs_indices, tf.zeros_like(bs_indices)], axis=-1
+        )
+
+        h_serv_flat = tf.reshape(h_serv, [B, N_UT_Total, -1])
+        h_bs_shape = [B, N_BS, N_UT_Sec, RxA * TxA * FFT]
+        h_bs_flat = tf.scatter_nd(indices, h_serv_flat, h_bs_shape)
+        h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, RxA, TxA, FFT])
+
+        if self.direction == "uplink":
+            h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 3, 5])
+        else:
+            h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 3, 4, 5])
+
+        h_selector_input = tf.reshape(
+            h_bs_permuted,
+            [-1, N_UT_Sec, tf.shape(h_bs_permuted)[3], self.num_bs_ant, FFT],
+        )
+        w_rf_bs_flat = self.beam_selector(h_selector_input, self.config.bs_array)
+        w_rf_bs = tf.reshape(w_rf_bs_flat, [B, N_BS, self.num_bs_ant, -1])
+
+        # UE側のアナログビーム（Identity）
+        ue_ports = (
+            self.num_tx_ports if self.direction == "uplink" else self.num_rx_ports
+        )
+        a_rf_ue = tf.eye(self.num_ut_ant, num_columns=ue_ports, dtype=tf.complex64)
+
+        if self.direction == "uplink":
+            self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
+        else:
+            self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
+
+        return w_rf_bs
+
+    def _compute_digital_weights(self, granularity="subband"):
+        """SVDベースのデジタル重みを粒度（granularity）に応じて計算する"""
+        B = self.batch_size
+        N_BS = self.num_bs
+        N_UT_Total = self.num_ut
+        # Simulation Resolution (Ntarget) alignment
+        if self.config.use_rbg_granularity:
+            N_target = self.resource_grid.fft_size // self.rbg_size_sc
+        else:
+            N_target = self.resource_grid.num_effective_subcarriers
+
+        rank = self.config.num_layers
+
+        # UTバッチ処理用のバッファ
+        batch_size_ut = self.config.batch_size_ut
+
+        # デジタル重みのバッファ
+        # UT側 (Terminal)
+        w_ut_dig_full = tf.zeros(
+            [
+                B,
+                N_UT_Total,
+                N_target,
+                (
+                    self.num_tx_ports
+                    if self.direction == "uplink"
+                    else self.num_rx_ports
+                ),
+                rank,
+            ],
+            dtype=self.cdtype,
+        )
+        # BS側 (Sector)
+        w_bs_dig_full = tf.zeros(
+            [
+                B,
+                N_BS,
+                N_target,
+                (
+                    self.num_rx_ports
+                    if self.direction == "uplink"
+                    else self.num_tx_ports
+                ),
+                rank,
+            ],
+            dtype=self.cdtype,
+        )
+        # 特異値（Serving Channel）
+        s_srv_full = tf.zeros([B, N_UT_Total, N_target, rank], dtype=self.rdtype)
+
+        for start_ut in range(0, N_UT_Total, batch_size_ut):
+            end_ut = min(start_ut + batch_size_ut, N_UT_Total)
+            curr_batch_size = end_ut - start_ut
+            srv_indices = self.neighbor_indices[:, start_ut:end_ut, 0:1]
+
+            # 1. 接続先BSとのポートドメインチャネルを取得
+            h_srv_port = self.channel_interface.get_neighbor_channel_info(
+                batch_size=B,
+                ut_loc=self.ut_loc[:, start_ut:end_ut, :],
+                bs_loc=self.bs_loc,
+                ut_orient=self.ut_orientations[:, start_ut:end_ut, :],
+                bs_orient=self.bs_orientations,
+                neighbor_indices=srv_indices,
+                ut_velocities=self.ut_velocities[:, start_ut:end_ut, :],
+                in_state=self.in_state[:, start_ut:end_ut],
+                return_element_channel=False,
+                return_s_u_v=False,
+            )
+            # h_srv_port: [B, BUT, Neighbor(1), RxP, TxP, Time(1), F]
+            # [B, BUT, F, RxP, TxP] に変換
+            h_srv = tf.transpose(h_srv_port[:, :, 0, :, :, 0, :], [0, 1, 4, 2, 3])
+
+            # 2. 粒度に応じた重み計算（SVD）
+            s, u, v = weight_utils.compute_digital_weights(
+                h_srv,
+                granularity=granularity,
+                rbg_size_sc=self.rbg_size_sc,
+                weight_type="svd",
+            )
+
+            # 3. ターゲット解像度に展開
+            # SVDの結果から必要なランク分をスライス
+            s_exp = weight_utils.expand_weights(
+                s[..., :rank], N_target, granularity, self.rbg_size_sc
+            )
+            u_exp = weight_utils.expand_weights(
+                u[..., :rank], N_target, granularity, self.rbg_size_sc
+            )
+            v_exp = weight_utils.expand_weights(
+                v[..., :rank], N_target, granularity, self.rbg_size_sc
+            )
+
+            # 4. バッファに格納
+            # Batch方向も考慮したインデックス作成
+            batch_indices = tf.range(B)[:, None]
+            batch_indices = tf.broadcast_to(batch_indices, [B, curr_batch_size])
+            ut_indices_range = tf.range(start_ut, end_ut)[None, :]
+            ut_indices_range = tf.broadcast_to(ut_indices_range, [B, curr_batch_size])
+
+            indices_ut = tf.stack([batch_indices, ut_indices_range], axis=-1)
+            indices_ut_flat = tf.reshape(indices_ut, [-1, 2])
+
+            bs_ids = tf.cast(srv_indices[:, :, 0], tf.int32)
+            bs_ids_flat = tf.reshape(bs_ids, [B, curr_batch_size])
+
+            indices_bs = tf.stack([batch_indices, bs_ids_flat], axis=-1)
+            indices_bs_flat = tf.reshape(indices_bs, [-1, 2])
+
+            # updates もフラットにする [B*BUT, F, P, Rank]
+            u_exp_flat = tf.reshape(u_exp, [-1, N_target, tf.shape(u_exp)[-2], rank])
+            v_exp_flat = tf.reshape(v_exp, [-1, N_target, tf.shape(v_exp)[-2], rank])
+            s_exp_flat = tf.reshape(s_exp, [-1, N_target, rank])
+
+            if self.direction == "uplink":
+                w_ut_dig_full = tf.tensor_scatter_nd_update(
+                    w_ut_dig_full, indices_ut_flat, v_exp_flat
+                )
+                w_bs_dig_full = tf.tensor_scatter_nd_update(
+                    w_bs_dig_full, indices_bs_flat, u_exp_flat
+                )
+            else:
+                w_ut_dig_full = tf.tensor_scatter_nd_update(
+                    w_ut_dig_full, indices_ut_flat, u_exp_flat
+                )
+                w_bs_dig_full = tf.tensor_scatter_nd_update(
+                    w_bs_dig_full, indices_bs_flat, v_exp_flat
+                )
+
+            s_srv_full = tf.tensor_scatter_nd_update(
+                s_srv_full, indices_ut_flat, s_exp_flat
+            )
+
+        return w_ut_dig_full, w_bs_dig_full, s_srv_full
+
+    def _apply_power_control(self, tx_power_dbm):
+        """パスロスと最大電力制約を考慮した送信電力を計算する"""
+        B = self.batch_size
+        N_UT = self.num_ut
+
+        # 1. 接続先BSの特定
+        serving_bs_idx = self.neighbor_indices[:, :, 0]
+        serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)
+        serving_bs_loc = tf.gather(
+            self.bs_loc, serving_bs_idx_i32, axis=1, batch_dims=1
+        )
+        dist = tf.norm(self.ut_loc - serving_bs_loc, axis=-1)
+
+        # 2. パスロス計算
+        if self.external_loader is not None:
+            powers_dbm = self.external_loader.get_power_map(self.ut_mesh_indices)
+            serving_bs_idx_expand = tf.expand_dims(serving_bs_idx_i32, axis=-1)
+            serving_power = tf.gather(
+                powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
+            )
+            serving_power = tf.squeeze(serving_power, axis=-1)
+            pl_db = self.config.bs_max_power_dbm - serving_power
+        else:
+            fc_ghz = self.config.carrier_frequency / 1e9
+            dist_safe = tf.maximum(dist, 1.0)
+            pl_db = (
+                28.0
+                + 22.0 * tf.math.log(dist_safe) / tf.math.log(10.0)
+                + 20.0 * tf.math.log(fc_ghz) / tf.math.log(10.0)
+            )
+
+        # 3. MPR (Maximum Power Reduction)
+        mpr_val = self.mpr_model.get_mpr("CP-OFDM", self.config.num_layers)
+        mpr_db = tf.fill([B, N_UT], tf.cast(mpr_val, tf.float32))
+
+        # 4. Tx Power 計算
+        if self.direction == "uplink":
+            num_rbs = self.resource_grid.num_effective_subcarriers / 12.0
+            p_tx_dbm = self.power_control.calculate_tx_power(pl_db, num_rbs, mpr_val)
+            p_cmax_dbm = self.ut_max_power_dbm - mpr_val
+        else:
+            p_tx_dbm = tx_power_dbm
+            p_cmax_dbm = self.bs_max_power_dbm
+
+        p_cmax_dbm_tensor = tf.fill([B, N_UT], tf.cast(p_cmax_dbm, tf.float32))
+        p_tx_watt = dbm_to_watt(p_tx_dbm)
+        if len(p_tx_watt.shape) == 0:
+            p_tx_watt = tf.broadcast_to(p_tx_watt, [B, N_UT])
+
+        return p_tx_watt, pl_db, mpr_db, p_cmax_dbm_tensor
+
+    def _process_sinr_and_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt):
+        """SINR計算、干渉計算、Link Adaptationを実行する"""
+        B = self.batch_size
+        N_BS = self.num_bs
+        N_UT = self.num_ut
+        if self.config.use_rbg_granularity:
+            N_target = self.resource_grid.fft_size // self.rbg_size_sc
+        else:
+            N_target = self.resource_grid.num_effective_subcarriers
+
+        rank = self.config.num_layers
+
+        # 1. 電力割り当て: レイヤーごとに均等分配
+        p_layer = p_tx_watt / tf.cast(rank, self.rdtype)
+        p_layer_expanded = tf.reshape(p_layer, [B, N_UT, 1, 1])
+
+        s_power_all = []
+        i_total_all = []
+        # [B, N_BS, N_target, rank]
+        interference_buffer_bs = tf.zeros([B, N_BS, N_target, rank], dtype=self.rdtype)
+
+        batch_size_ut = self.config.batch_size_ut
+        for start_ut in range(0, N_UT, batch_size_ut):
+            end_ut = min(start_ut + batch_size_ut, N_UT)
+            curr_batch_size = end_ut - start_ut
+            sliced_neigh_inds = self.neighbor_indices[:, start_ut:end_ut, :]
+
+            # 隣接チャネル（ポートドメイン）取得
+            # h_batch_port: [B, BUT, Neighbor, RxP, TxP, Time(1), N_target]
+            h_batch_port = self.channel_interface.get_neighbor_channel_info(
+                B,
+                self.ut_loc[:, start_ut:end_ut, :],
+                self.bs_loc,
+                self.ut_orientations[:, start_ut:end_ut, :],
+                self.bs_orientations,
+                sliced_neigh_inds,
+                self.ut_velocities[:, start_ut:end_ut, :],
+                self.in_state[:, start_ut:end_ut],
+                False,
+                False,
+            )
+
+            # 希望信号電力 (Serving link is neighbor 0)
+            # s_srv: [B, N_UT, N_target, rank]
+            # p_layer_expanded: [B, N_UT, 1, 1] -> [B, BUT, 1, rank]
+            s_p = p_layer_expanded[:, start_ut:end_ut] * tf.square(
+                s_srv[:, start_ut:end_ut]
+            )
+            s_power_all.append(s_p)
+
+            # 干渉計算 (Neighbor 1+)
+            neighbor_ids = sliced_neigh_inds[:, :, 1:]
+            # [B, BUT, K-1, f, RxP, TxP]
+            h_int = tf.transpose(h_batch_port[:, :, 1:, :, :, 0, :], [0, 1, 2, 5, 3, 4])
+
+            if self.direction == "uplink":
+                # v_self: [B, BUT, f, TxP, rank]
+                v_self = w_ut_dig[:, start_ut:end_ut]
+                # u_neighbor: [B, BUT, K-1, f, RxP, rank]
+                u_neighbor = tf.gather(
+                    w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
+                )
+
+                # Heff = U^H * H * V
+                # hv = H * V -> [B, BUT, K-1, f, RxP, rank_tx]
+                hv = tf.einsum("bukfpt,buftx->bukfpx", h_int, v_self)
+                # heff = U^H * hv -> [B, BUT, K-1, f, rank_rx, rank_tx]
+                heff = tf.einsum("bukfpx,bukfpx->bukfx", tf.math.conj(u_neighbor), hv)
+                # Wait, the above einsum reduces RX axis but also Rank axis?
+                # heff should be per-layer.
+                # heff_full = conj(u_neighbor) [B, BUT, K-1, f, RxP, rank_rx] * hv [B, BUT, K-1, f, RxP, rank_tx]
+                # -> [B, BUT, K-1, f, rank_rx, rank_tx]
+                heff_matrix = tf.einsum(
+                    "bukfpr,bukfpt->bukfrt", tf.math.conj(u_neighbor), hv
+                )
+
+                # p_leak: layer l of neighbor BS is affected by all layers of this UE
+                # p_leak_l = sum_m |heff_l,m|^2 * p_layer
+                p_leak = p_layer_expanded[
+                    :, start_ut:end_ut, :, None, None
+                ] * tf.square(tf.abs(heff_matrix))
+                p_leak_per_layer = tf.reduce_sum(
+                    p_leak, axis=-1
+                )  # [B, BUT, K-1, f, rank_rx]
+
+                # 干渉の蓄積
+                batch_indices = tf.range(B)[:, None, None]
+                batch_indices = tf.broadcast_to(batch_indices, tf.shape(neighbor_ids))
+                indices = tf.stack(
+                    [batch_indices, tf.cast(neighbor_ids, tf.int32)], axis=-1
+                )
+
+                interference_buffer_bs = tf.tensor_scatter_nd_add(
+                    interference_buffer_bs,
+                    tf.reshape(indices, [-1, 2]),
+                    tf.reshape(p_leak_per_layer, [-1, N_target, rank]),
+                )
+            else:
+                # u_self: [B, BUT, f, RxP, rank]
+                u_self = w_ut_dig[:, start_ut:end_ut]
+                # v_neighbor: [B, BUT, K-1, f, TxP, rank]
+                v_neighbor = tf.gather(
+                    w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
+                )
+
+                # hv = H * V -> [B, BUT, K-1, f, RxP, rank_tx]
+                hv = tf.einsum("bukfpt,bukftx->bukfpx", h_int, v_neighbor)
+                # heff_matrix: [B, BUT, K-1, f, rank_rx, rank_tx]
+                heff_matrix = tf.einsum(
+                    "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
+                )
+
+                # p_int_l = sum_m |heff_l,m|^2 * p_layer
+                p_int = p_layer_expanded[:, start_ut:end_ut, :, None, None] * tf.square(
+                    tf.abs(heff_matrix)
+                )
+                p_int_per_layer = tf.reduce_sum(
+                    p_int, axis=-1
+                )  # [B, BUT, K-1, f, rank_rx]
+
+                # UT側での干渉合算: 全ての近隣BSからの干渉を合算
+                i_total_all.append(
+                    tf.reduce_sum(p_int_per_layer, axis=2)
+                )  # [B, BUT, f, rank]
+
+        # 最終SINR
+        s_power = tf.concat(s_power_all, axis=1)  # [B, N_UT, N_target, rank]
+        if self.direction == "uplink":
+            i_total = tf.gather(
+                interference_buffer_bs,
+                tf.cast(self.serving_bs_ids, tf.int32),
+                axis=1,
+                batch_dims=1,
+            )  # [B, N_UT, N_target, rank]
+        else:
+            i_total = tf.concat(i_total_all, axis=1)  # [B, N_UT, N_target, rank]
+
+        sinr = s_power / (i_total + self.no)
+        sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
+
+        # Link Adaptation
+        # throughput_vectorized は [sinr] を受け取りスペクトル効率とMCSを返す
+        # sinr: [B, N_UT, N_target, rank]
+        capacity_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+
+        # RBG単位での計算の場合、各点の容量をRBG全体に適用
+        if self.config.use_rbg_granularity:
+            capacity_per_re *= tf.cast(self.rbg_size_sc, self.rdtype)
+
+        # 全レイヤー・全サブキャリアの容量を合算
+        # capacity_per_re: [B, N_UT, N_target, rank]
+        throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
+        # MCSとSINRの平均を記録
+        mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
+        sinr_eff_avg = tf.reduce_mean(sinr, axis=[-1, -2])
+
+        return {
+            "sinr": sinr,
+            "sinr_db": sinr_db,
+            "sinr_eff_avg": sinr_eff_avg,
+            "throughput_per_user": throughput_per_user,
+            "mcs_idx_avg": mcs_idx_avg,
+            "rank": tf.fill([B, N_UT], tf.cast(rank, tf.float32)),
+        }
+
+    def _record_drop(
+        self, hist, drop_idx, results, pl_db, p_tx_watt, p_cmax_dbm, mpr_db
+    ):
+        """ドロップごとの結果を履歴に記録する"""
+
+        def match_hist_shape(tensor):
+            rank = tensor.shape.rank
+            if rank is not None and rank > 2:
+                tensor = tf.reduce_mean(tensor, axis=list(range(2, rank)))
+            return tf.reshape(
+                tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector]
+            )
+
+        return record_results(
+            hist,
+            drop_idx,
+            sim_failed=False,
+            pathloss_serving_cell=match_hist_shape(pl_db),
+            num_allocated_re=match_hist_shape(
+                tf.fill(
+                    [self.batch_size, self.num_ut],
+                    float(self.resource_grid.num_effective_subcarriers),
+                )
+            ),
+            tx_power_per_ut=match_hist_shape(p_tx_watt),
+            num_decoded_bits=match_hist_shape(results["throughput_per_user"]),
+            mcs_index=match_hist_shape(results["mcs_idx_avg"]),
+            harq_feedback=match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
+            olla_offset=match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
+            sinr_eff=match_hist_shape(results["sinr_eff_avg"]),
+            p_cmax_dbm=match_hist_shape(p_cmax_dbm),
+            rank=match_hist_shape(results["rank"]),
+            mpr_db=match_hist_shape(mpr_db),
+            pf_metric=tf.reshape(
+                match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
+                [self.batch_size, self.num_bs, 1, 1, self.num_ut_per_sector],
+            ),
+        )
+
     # @tf.function(jit_compile=False)
     def call(self, num_drops, tx_power_dbm):
-        # We use 'num_drops' as the time dimension in the history
+        """シミュレーションのメインループ（オーケストレーター）"""
         hist = init_result_history(
             self.batch_size, num_drops, self.num_bs, self.num_ut_per_sector
         )
 
-        # --------------- #
-        # Simulate Drops  #
-        # --------------- #
-        # We use a Python loop instead of tf.while_loop to allow
-        # explicit topology reset and graph re-execution/eager execution for each drop.
-        # This helps in managing memory and ensures topology is actually updated.
-
         for drop_idx in range(num_drops):
-            # 0. Set up new topology for this drop
-            if self.external_loader is not None:
-                self.external_loader.load_drop(drop_idx)
+            # 1. トポロジーのセットアップ
+            self._setup_drop_topology(drop_idx)
 
-            # This generates new UT locations, channels, etc.
-            # If external_loader is used, _setup_topology should use it.
-            self._setup_topology(
-                self.config.num_rings,
-                self.config.min_bs_ut_dist,
-                self.config.max_bs_ut_dist,
+            # 2. アナログビーム選択
+            self._select_analog_beams()
+
+            # 3. デジタル重み計算 (SVD)
+            # 粒度は self.precoding_granularity を使用
+            w_ut_dig, w_bs_dig, s_srv = self._compute_digital_weights(
+                granularity=self.precoding_granularity
             )
 
-            # 1. Get Channel Information (Batched to avoid OOM)
-            # We only need h_serv (Serving Link) for Beam Selection.
-            # h_elem_all (including neighbors) is too large to hold in memory for all UTs at once.
-
-            h_serv_list = []
-            batch_size_beam = 1  # Process 1 UT at a time to be safe
-
-            for i in range(0, self.num_ut, batch_size_beam):
-                end_i = min(i + batch_size_beam, self.num_ut)
-
-                # Slice Topology for this batch
-                # neighbor_indices: [Batch, Num_UT, Neighbor]
-                curr_neigh_inds = self.neighbor_indices[:, i:end_i, :]
-
-                # Slice UT properties
-                curr_ut_loc = self.ut_loc[:, i:end_i, :]
-                curr_ut_orient = self.ut_orientations[:, i:end_i, :]
-                curr_ut_vel = self.ut_velocities[:, i:end_i, :]
-                curr_in_state = self.in_state[:, i:end_i]
-
-                # Get Element Channel for this batch
-                h_elem_batch = (
-                    self.channel_interface.get_element_channel_for_beam_selection(
-                        batch_size=self.batch_size,
-                        ut_loc=curr_ut_loc,
-                        bs_loc=self.bs_loc,
-                        ut_orient=curr_ut_orient,
-                        bs_orient=self.bs_orientations,
-                        neighbor_indices=curr_neigh_inds,
-                        ut_velocities=curr_ut_vel,
-                        in_state=curr_in_state,
-                    )
-                )
-
-                # Extract Serving Channel (Neighbor 0) and remove Time dimension (index 5)
-                # h_elem_batch: [Batch, Batch_UT, Neighbors, RxA, TxA, Time, SC] (Wait, check order)
-                # Order confirmed: [Batch, UT, Neighbor, RxA, TxA, Time, Freq]
-                # We want Neighbor=0, Time=0.
-                h_serv_batch = h_elem_batch[:, :, 0, :, :, 0, :]
-                h_serv_list.append(h_serv_batch)
-
-            # Concatenate all batches
-            # h_serv: [Batch, Total_UT, SC, RxA, TxA] (assuming Time=1 and squeezed)
-            # wait, h_elem_batch[:, :, 0, 0, :, :, :] removes Neighbor(2) and Time(3).
-            # Result dims: [Batch, Batch_UT, SC, RxA, TxA]
-            h_serv = tf.concat(h_serv_list, axis=1)  # Concat along UT axis
-
-            # 2. Select Analog Beams (BS Side)
-            # h_serv channel is from UT to Serving BS (because neighbor_index=0 is serving BS)
-            # We need to restructure this into [Batch, Num_BS, Num_UT_Per_Sector, SC, RxA, TxA]
-            # using the serving_bs_ids map.
-
-            # Dimensions
-            B = self.batch_size
-            N_BS = self.num_bs
-            N_UT_Sec = self.num_ut_per_sector  # Should be 1 typically
-            N_UT_Total = self.num_ut
-            # h_serv shape: [Batch, Total_UT, RxA, TxA, Freq] (Verified)
-            RxA = tf.shape(h_serv)[2]
-            TxA = tf.shape(h_serv)[3]
-            FFT = tf.shape(h_serv)[4]
-
-            # Construct indices for scatter update
-            # Indices: [b, ut_idx] -> [b, serving_bs_id, slot_id]
-
-            batch_indices = tf.range(B)[:, None]  # [B, 1]
-            batch_indices = tf.broadcast_to(
-                batch_indices, [B, N_UT_Total]
-            )  # [B, Num_UT]
-
-            bs_indices = tf.cast(self.serving_bs_ids, tf.int32)  # [B, Num_UT]
-
-            # num_freq_points is usually num_rbgs for beam selection
-            num_freq_points = tf.shape(h_serv)[-1]
-
-            # scatter_nd sums duplicate updates.
-            # We assume N_UT_Sec=1 and each BS is served by at most 1 UE for this logic.
-            slot_indices = tf.zeros_like(bs_indices)
-
-            # Stack to create indices: [B, Num_UT, 3] -> (Batch, BS, Slot)
-            indices = tf.stack([batch_indices, bs_indices, slot_indices], axis=-1)
-
-            # Prepare Updates (h_serv)
-            # h_serv: [B, BUT, 1, RxA, TxA, 1, Freq] -> [B, BUT, Features]
-            # Flatten everything after BUT
-            h_serv_flat = tf.reshape(h_serv, [B, N_UT_Total, -1])
-
-            # Prepare Canvas (h_bs)
-            feature_dim = RxA * TxA * num_freq_points
-            h_bs_shape = [B, N_BS, N_UT_Sec, feature_dim]
-
-            # Scatter
-            h_bs_flat = tf.scatter_nd(indices, h_serv_flat, h_bs_shape)
-
-            # Reshape back to detailed dimensions
-            h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, RxA, TxA, num_freq_points])
-
-            # Note: scatter_nd fills unassigned slots with 0.
-
-            if self.direction == "uplink":
-                # BS is Receiver: RxA = num_bs_ant, TxA = num_ut_ant
-                # h_bs: [B, num_bs, ut, BS_Ant, UT_Ant, SC]
-                # Target: [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
-                # Indices: 0, 1, 2, 4(UT), 3(BS), 5(SC)
-                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 3, 5])
-            else:
-                # BS is Transmitter: RxA = num_ut_ant, TxA = num_bs_ant
-                # h_bs: [B, num_bs, ut, UT_Ant, BS_Ant, SC]
-                # Target: [Batch, num_bs, num_ut_per_sector, UT_Ant, BS_Ant, SC]
-                # Indices: 0, 1, 2, 3(UT), 4(BS), 5(SC)
-                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 3, 4, 5])
-
-            # Flatten to [Batch * num_bs, num_ut_per_sector, Other_Ant, BS_Ant, SC]
-            h_selector_input = tf.reshape(
-                h_bs_permuted,
-                [
-                    -1,
-                    self.num_ut_per_sector,
-                    tf.shape(h_bs_permuted)[3],
-                    self.num_bs_ant,
-                    tf.shape(h_bs_permuted)[5],
-                ],
+            # 4. 送信電力制御
+            p_tx_watt, pl_db, mpr_db, p_cmax_dbm = self._apply_power_control(
+                tx_power_dbm
             )
 
-            # BS Beam Selection
-            # w_rf_bs_flat: [Batch * num_bs, TotalAnt, TotalPorts]
-            w_rf_bs_flat = self.beam_selector(h_selector_input, self.config.bs_array)
+            # 5. SINR計算 & Link Adaptation
+            results = self._process_sinr_and_la(w_ut_dig, w_bs_dig, s_srv, p_tx_watt)
 
-            # Reshape back to [Batch, num_bs, TotalAnt, TotalPorts]
-            w_rf_bs = tf.reshape(
-                w_rf_bs_flat, [self.batch_size, self.num_bs, self.num_bs_ant, -1]
+            # 6. 結果の記録
+            hist = self._record_drop(
+                hist, drop_idx, results, pl_db, p_tx_watt, p_cmax_dbm, mpr_db
             )
 
-            # UE Analog Beam: Identity (Full Digital or Fixed)
-            if self.direction == "uplink":
-                ue_ports = self.channel_interface.hybrid_channel.num_tx_ports
-            else:
-                ue_ports = self.channel_interface.hybrid_channel.num_rx_ports
-
-            a_rf_ue = tf.eye(self.num_ut_ant, num_columns=ue_ports, dtype=tf.complex64)
-
-            # Apply weights
-            if self.direction == "uplink":
-                self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
-                u_bs_global = w_rf_bs
-                v_bs_global = None
-            else:
-                self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
-                v_bs_global = w_rf_bs
-                u_bs_global = None
-
-            # --- 3. Power Control & Link Adaptation (Moved up) ---
-            # For Power Control: Identify Serving BS
-            serving_bs_idx = self.neighbor_indices[:, :, 0]
-            serving_bs_idx_i32 = tf.cast(serving_bs_idx, tf.int32)
-
-            serving_bs_idx_batched = tf.broadcast_to(
-                serving_bs_idx_i32, [self.batch_size, self.num_ut]
-            )
-            serving_bs_loc = tf.gather(
-                self.bs_loc, serving_bs_idx_batched, axis=1, batch_dims=1
-            )
-            dist = tf.norm(self.ut_loc - serving_bs_loc, axis=-1)  # [batch, num_ut]
-
-            # Simple UMi Path Loss Model for 3.5GHz (Placeholder or External)
-            if self.external_loader is not None:
-                powers_dbm = self.external_loader.get_power_map(self.ut_mesh_indices)
-                # For interference, we use powers directly later,
-                # but path loss to serving cell is needed for Power Control
-                serving_bs_idx_expand = tf.expand_dims(serving_bs_idx_batched, axis=-1)
-                serving_power = tf.gather(
-                    powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
-                )
-                serving_power = tf.squeeze(serving_power, axis=-1)
-                pl_db = self.config.bs_max_power_dbm - serving_power
-            else:
-                fc_ghz = 3.5
-                dist_safe = tf.maximum(dist, 1.0)
-                pl_db = (
-                    28.0
-                    + 22.0 * tf.math.log(dist_safe) / tf.math.log(10.0)
-                    + 20.0 * tf.math.log(fc_ghz) / tf.math.log(10.0)
-                )
-
-            # b. Get MPR
-            # Assuming "CP-OFDM" and Rank 1 for simplified PC
-            # In future, use actual scheduler rank
-            mpr_val = self.mpr_model.get_mpr("CP-OFDM", 1)  # Scalar approximation
-            mpr_db = tf.fill(
-                [self.batch_size, self.num_ut], tf.cast(mpr_val, tf.float32)
-            )
-
-            # c. Calculate Tx Power
-            if self.direction == "uplink":
-                # num_rbs: Total RBs (assuming full bw allocation for now or partial)
-                # resource_grid.num_effective_subcarriers / 12
-                num_rbs = self.resource_grid.num_effective_subcarriers / 12.0
-                p_tx_dbm = self.power_control.calculate_tx_power(
-                    pl_db, num_rbs, mpr_val
-                )
-                p_cmax_dbm = self.ut_max_power_dbm - mpr_val
-            else:
-                # Downlink: Use fixed power
-                p_tx_dbm = tx_power_dbm
-                p_cmax_dbm = self.bs_max_power_dbm  # Assuming no MPR for BS
-
-            p_cmax_dbm_tensor = tf.fill(
-                [self.batch_size, self.num_ut], tf.cast(p_cmax_dbm, tf.float32)
-            )
-
-            # Calculate Total Power and Allocation per stream
-            total_power = dbm_to_watt(p_tx_dbm)
-            # Reshape/Broadcast for broadcasting: [batch, num_ut, 1, 1, 1]
-            if len(total_power.shape) == 0:  # Scalar
-                total_power = tf.broadcast_to(
-                    total_power, [self.batch_size, self.num_ut]
-                )
-
-            # p_alloc setup will happen after Rank determination
-
-            # --- 4. Effective Channel & SINR Calculation (BATCHED to avoid OOM) ---
-            # batch_size_ut_sinr = 1 is safest for 718MB VRAM
-            batch_size_ut_sinr = 1
-            num_batches_ut_sinr = (
-                self.num_ut + batch_size_ut_sinr - 1
-            ) // batch_size_ut_sinr
-
-            # Constants for SINR Calculation
-            B = self.batch_size
-            N_BS = self.num_bs
-            N_UT_Total = self.num_ut
-            FFT = self.resource_grid.fft_size
-            rank = 1
-
-            # Power Allocation (based on Rank)
-            p_alloc = total_power / tf.cast(rank, self.rdtype)
-            p_alloc = tf.reshape(p_alloc, [B, N_UT_Total, 1, 1])
-
-            # Buffers for results
-            s_power_all = []
-            i_total_all = []
-
-            # Digital weights buffers [B, Entity, Freq, Ports, Rank]
-            # UT-side (Terminal)
-            w_ut_dig = tf.zeros(
-                [
-                    B,
-                    N_UT_Total,
-                    FFT,
-                    (
-                        self.num_tx_ports
-                        if self.direction == "uplink"
-                        else self.num_rx_ports
-                    ),
-                    rank,
-                ],
-                dtype=self.cdtype,
-            )
-            # BS-side (Sector)
-            w_bs_dig = tf.zeros(
-                [
-                    B,
-                    N_BS,
-                    FFT,
-                    (
-                        self.num_rx_ports
-                        if self.direction == "uplink"
-                        else self.num_tx_ports
-                    ),
-                    rank,
-                ],
-                dtype=self.cdtype,
-            )
-            # Store serving channel singular values for signal power [B, UT, F, R]
-            s_srv_all = tf.zeros([B, N_UT_Total, FFT, rank], dtype=self.rdtype)
-
-            # --- Pass 1: Determine Digital Beamforming Weights (SVD) ---
-            for i in range(num_batches_ut_sinr):
-                start_ut = i * batch_size_ut_sinr
-                end_ut = tf.minimum(start_ut + batch_size_ut_sinr, N_UT_Total)
-                srv_indices = self.neighbor_indices[:, start_ut:end_ut, 0:1]
-
-                # Fetch only serving link in Port Domain
-                h_srv_port = self.channel_interface.get_neighbor_channel_info(
-                    B,
-                    self.ut_loc[:, start_ut:end_ut, :],
-                    self.bs_loc,
-                    self.ut_orientations[:, start_ut:end_ut, :],
-                    self.bs_orientations,
-                    srv_indices,
-                    self.ut_velocities[:, start_ut:end_ut, :],
-                    self.in_state[:, start_ut:end_ut],
-                    return_element_channel=False,
-                    return_s_u_v=False,
-                )
-
-                # h_srv: [B, BUT, F, RxP, TxP]
-                h_srv = tf.transpose(h_srv_port[:, :, 0, :, :, 0, :], [0, 1, 4, 2, 3])
-                s_s, u_s, v_s = tf.linalg.svd(h_srv)
-
-                # Reshape SVD results for scatter update (Remove B and BUT leading dims)
-                # target shape for each update: [FFT, Port, Rank]
-                u_s_update = tf.reshape(
-                    u_s[..., :rank], [end_ut - start_ut, FFT, -1, rank]
-                )
-                v_s_update = tf.reshape(
-                    v_s[..., :rank], [end_ut - start_ut, FFT, -1, rank]
-                )
-                s_s_update = tf.reshape(s_s[..., :rank], [end_ut - start_ut, FFT, rank])
-
-                # Store Weights Mapped by UT/BS ID
-                indices_ut = tf.stack(
-                    [
-                        tf.zeros([end_ut - start_ut], dtype=tf.int32),
-                        tf.range(start_ut, end_ut),
-                    ],
-                    axis=-1,
-                )
-                bs_ids = tf.cast(srv_indices[:, :, 0], tf.int32)[
-                    0
-                ]  # Extract BUT BS IDs
-                indices_bs = tf.stack(
-                    [tf.zeros([end_ut - start_ut], dtype=tf.int32), bs_ids], axis=-1
-                )
-
-                if self.direction == "uplink":
-                    w_ut_dig = tf.tensor_scatter_nd_update(
-                        w_ut_dig, indices_ut, v_s_update
-                    )
-                    w_bs_dig = tf.tensor_scatter_nd_update(
-                        w_bs_dig, indices_bs, u_s_update
-                    )
-                else:
-                    w_ut_dig = tf.tensor_scatter_nd_update(
-                        w_ut_dig, indices_ut, u_s_update
-                    )
-                    w_bs_dig = tf.tensor_scatter_nd_update(
-                        w_bs_dig, indices_bs, v_s_update
-                    )
-
-                s_srv_all = tf.tensor_scatter_nd_update(
-                    s_srv_all, indices_ut, s_s_update
-                )
-
-            # --- Pass 2: Interference Calculation (Port-Domain Loop) ---
-            # Global Interference Buffer (for Uplink)
-            interference_buffer_bs = tf.zeros([B, N_BS, FFT, rank], dtype=self.rdtype)
-
-            for i in range(num_batches_ut_sinr):
-                start_ut = i * batch_size_ut_sinr
-                end_ut = tf.minimum(start_ut + batch_size_ut_sinr, N_UT_Total)
-                current_batch_size = end_ut - start_ut
-
-                # Get Neighbor channels in Port Domain
-                sliced_neighbor_indices = self.neighbor_indices[:, start_ut:end_ut, :]
-                h_batch_port = self.channel_interface.get_neighbor_channel_info(
-                    B,
-                    self.ut_loc[:, start_ut:end_ut, :],
-                    self.bs_loc,
-                    self.ut_orientations[:, start_ut:end_ut, :],
-                    self.bs_orientations,
-                    sliced_neighbor_indices,
-                    self.ut_velocities[:, start_ut:end_ut, :],
-                    self.in_state[:, start_ut:end_ut],
-                    False,
-                    False,
-                )
-
-                # h_batch_port: [B, BUT, K, RxP, TxP, 1, F]
-                # Signal Power (Neighbor 0)
-                p_alloc_batch = tf.reshape(
-                    tf.gather(p_alloc, tf.range(start_ut, end_ut), axis=1),
-                    [B, current_batch_size, 1, 1],
-                )
-                s_p = p_alloc_batch * tf.square(
-                    tf.gather(s_srv_all, tf.range(start_ut, end_ut), axis=1)
-                )
-                s_power_all.append(s_p)
-
-                # Interference (Neighbors 1...)
-                neighbor_ids = sliced_neighbor_indices[:, :, 1:]
-                h_int = tf.transpose(
-                    h_batch_port[:, :, 1:, :, :, 0, :], [0, 1, 2, 5, 3, 4]
-                )  # [B, BUT, K-1, F, RxP, TxP]
-
-                if self.direction == "uplink":
-                    # UL: Leakage to neighbor BSs
-                    # v_self_dig: [B, BUT, F, TxP, Rank]
-                    v_self = tf.gather(w_ut_dig, tf.range(start_ut, end_ut), axis=1)
-                    # u_neighbor_dig: [B, BUT, K-1, F, RxP, Rank]
-                    u_neighbor = tf.gather(
-                        w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
-                    )
-
-                    # Heff_i = U_neighbor^H * H_int * V_self
-                    hv = tf.einsum("bukfpt,buftx->bukfpx", h_int, v_self)
-                    heff = tf.einsum(
-                        "bukfpx,bukfpx->bukfx", tf.math.conj(u_neighbor), hv
-                    )
-                    p_leak = p_alloc_batch[:, :, :, None, None] * tf.square(
-                        tf.abs(heff)
-                    )  # [B, BUT, K-1, F, R]
-
-                    # Accumulate to global buffer
-                    indices = tf.stack(
-                        [
-                            tf.zeros(tf.shape(neighbor_ids), dtype=tf.int32),
-                            tf.cast(neighbor_ids, tf.int32),
-                        ],
-                        axis=-1,
-                    )
-                    interference_buffer_bs = tf.tensor_scatter_nd_add(
-                        interference_buffer_bs,
-                        tf.reshape(indices, [-1, 2]),
-                        tf.reshape(p_leak, [-1, FFT, rank]),
-                    )
-                else:
-                    # DL: Interference from neighbor BSs
-                    # u_self_dig: [B, BUT, F, RxP, Rank]
-                    u_self = tf.gather(w_ut_dig, tf.range(start_ut, end_ut), axis=1)
-                    # v_neighbor_dig: [B, BUT, K-1, F, TxP, Rank]
-                    v_neighbor = tf.gather(
-                        w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
-                    )
-
-                    # Heff_i = U_self^H * H_int * V_neighbor
-                    hv = tf.einsum("bukfpt,bukftx->bukfpx", h_int, v_neighbor)
-                    heff = tf.einsum("bufpx,bukfpx->bukfx", tf.math.conj(u_self), hv)
-                    p_int = tf.expand_dims(p_alloc_batch, 2) * tf.square(tf.abs(heff))
-                    i_total_all.append(tf.reduce_sum(p_int, axis=2))
-
-            # --- Phase 2: Final SINR and Throughput Calculation ---
-            s_power = tf.concat(s_power_all, axis=1)
-
-            if self.direction == "uplink":
-                # Fetch accumulated interference from buffer for each UE's serving BS
-                i_total = tf.gather(
-                    interference_buffer_bs,
-                    tf.cast(self.serving_bs_ids, tf.int32),
-                    axis=1,
-                    batch_dims=1,
-                )
-            else:
-                i_total = tf.concat(i_total_all, axis=1)
-
-            # Final SINR
-            noise_power = self.no  # Scalar or [SC]
-            sinr = s_power / (i_total + noise_power)
-            sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
-
-            # 4. Throughput Calculation (Simple Capacity for now or use MCS)
-            throughput = tf.reduce_mean(
-                tf.math.log(1.0 + sinr) / tf.math.log(2.0), axis=[2, 3]
-            )
-            # [B, U]
-
-            # --- End New SINR Logic ---
-
-            # Expand dimensions to match legacy shape [Batch, UT, OFDM(1), SC, Streams]
-            sinr = tf.expand_dims(sinr, axis=2)  # Add OFDM dim
-
-            # For logging, we might need other metrics, but SINR is key.
-            sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
-            sinr_eff_avg = tf.reduce_mean(sinr, axis=[-1, -2, -3])
-
-            # Recalculate rank_per_user for logging (fixed at 1 for now)
-            num_streams = rank
-            rank_per_user = tf.fill(
-                [self.batch_size, self.num_ut], tf.cast(num_streams, tf.float32)
-            )
-
-            # Use Discrete MCS Table Lookup
-            # Returns Spectral Efficiency (bits/symbol) including BLER penalty
-            capacity_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(
-                sinr_db
-            )
-
-            # If using RBG granularity, each point represents rbg_size_sc subcarriers
-            if self.config.use_rbg_granularity:
-                # Scale capacity by the size of the RBG
-                rbg_scale = tf.cast(self.rbg_size_sc, self.rdtype)
-                capacity_per_re = capacity_per_re * rbg_scale
-
-            throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
-
-            # --- Record Results ---
-            # Prepare metrics for recording
-            # Reshape/Cast as needed to match get_hist expectations
-            # history keys: [batch, num_bs, num_ut_per_sector]
-            # Current variables are [batch, num_ut] where num_ut = num_bs * num_ut_per_sector
-            # We need to reshape [batch, num_ut] -> [batch, num_bs, num_ut_per_sector]
-
-            def match_hist_shape(tensor):
-                # tensor: [batch, num_ut, ...]
-                # Reduce extra dimensions (ofdm, sc, streams) by averaging
-                rank = tensor.shape.rank
-                if rank is not None and rank > 2:
-                    tensor = tf.reduce_mean(tensor, axis=list(range(2, rank)))
-
-                return tf.reshape(
-                    tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector]
-                )
-
-            # Average MCS index over streams/subcarriers
-            mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
-
-            # Record using 'drop_idx' as the time index
-            hist = record_results(
-                hist,
-                drop_idx,
-                sim_failed=False,
-                pathloss_serving_cell=match_hist_shape(pl_db),
-                num_allocated_re=match_hist_shape(
-                    tf.fill(
-                        [self.batch_size, self.num_ut],
-                        float(self.resource_grid.num_effective_subcarriers),
-                    )
-                ),  # Placeholder
-                tx_power_per_ut=match_hist_shape(total_power),
-                num_decoded_bits=match_hist_shape(throughput_per_user),
-                mcs_index=match_hist_shape(mcs_idx_avg),
-                harq_feedback=match_hist_shape(
-                    tf.zeros([self.batch_size, self.num_ut])
-                ),
-                olla_offset=match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
-                sinr_eff=match_hist_shape(sinr_eff_avg),
-                p_cmax_dbm=match_hist_shape(p_cmax_dbm_tensor),
-                rank=match_hist_shape(rank_per_user),
-                mpr_db=match_hist_shape(mpr_db),
-                pf_metric=tf.reshape(
-                    match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
-                    [self.batch_size, self.num_bs, 1, 1, self.num_ut_per_sector],
-                ),  # Reshaped for get_hist.py's axis=[-2, -3] reduction
-            )
-
-            # No time evolution; topology is reset in next iteration
-
-        # Stack history to convert TensorArrays to Tensors
+        # 履歴をTensorに変換
         final_hist = {}
         for key in hist:
             if isinstance(hist[key], tf.TensorArray):

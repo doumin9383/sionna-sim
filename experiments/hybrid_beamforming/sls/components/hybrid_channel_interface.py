@@ -96,10 +96,21 @@ class HybridChannelInterface(Block):
             ut_velocities=ut_velocities,
         )
 
+        # frequency resolution alignment (The "Expand" Fix)
+        # If use_rbg_granularity is True, return channel sampled at RBG centers
+        if self.use_rbg_granularity:
+            # h_channel: [Batch, UT, Neighbor, RxP, TxP, Time, Freq]
+            # Freq is the last dimension
+            h_channel = h_channel[..., :: self.rbg_size_sc]
+
         if return_element_channel or not return_s_u_v:
             return h_channel
 
         # 3. Compute SVD for Digital Beamforming (Return S, U, V)
+        # tf.linalg.svd expects [..., M, N]. h_channel: [B, U, N, RP, TP, T, F]
+        # Transpose to [B, U, N, T, F, RP, TP] for SVD if needed, but wait:
+        # The simulator expects [B, U, N, F, RP, TP] usually for processing.
+        # Actually, get_neighbor_channel_info returns [B, U, N, RP, TP, T, F]
         s, u, v = tf.linalg.svd(h_channel)
         return h_channel, s, u, v
 

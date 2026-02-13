@@ -27,6 +27,8 @@ class SLSConfig(SimulationCommonConfig):
     num_neighbors: int = (
         4  # For spatial masking: num BS per UT to calculate channel for
     )
+    num_layers: int = 4  # Number of layers for spatial multiplexing
+    batch_size_ut: int = 1  # UT batch size for memory management
 
     # Beam Management
     beambook_oversampling_factor: int = 4
