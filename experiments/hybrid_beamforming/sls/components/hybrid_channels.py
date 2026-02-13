@@ -365,21 +365,28 @@ class GenerateHybridBeamformingOFDMChannel(
                 is_uplink = (
                     getattr(self._channel_model, "direction", "uplink") == "uplink"
                 )
-                if len(self.w_rf.shape) == 4:
-                    if is_uplink:
-                        # Tx: UT, Rx: BS
-                        w_local = tf.gather(
-                            self.w_rf, tf.range(start_ut, end_ut), axis=1
-                        )
-                        a_local = tf.gather(self.a_rf, unique_bs, axis=1)
-                    else:
-                        # Tx: BS, Rx: UT
-                        w_local = tf.gather(self.w_rf, unique_bs, axis=1)
-                        a_local = tf.gather(
-                            self.a_rf, tf.range(start_ut, end_ut), axis=1
-                        )
+
+                # Helper to slice weights if they have Entity dimension (Rank 4)
+                def slice_weight(w, indices, is_tx=True):
+                    # BS-side weights: [B, nBS, Ant, Port]
+                    # UT-side weights: [B, nUT, Ant, Port]
+                    # Default weights: [Ant, Port]
+                    if len(w.shape) == 4:
+                        return tf.gather(w, indices, axis=1)
+                    return w
+
+                if is_uplink:
+                    # Tx: UT (start_ut:end_ut), Rx: BS (unique_bs)
+                    w_local = slice_weight(
+                        self.w_rf, tf.range(start_ut, end_ut), is_tx=True
+                    )
+                    a_local = slice_weight(self.a_rf, unique_bs, is_tx=False)
                 else:
-                    w_local, a_local = self.w_rf, self.a_rf
+                    # Tx: BS (unique_bs), Rx: UT (start_ut:end_ut)
+                    w_local = slice_weight(self.w_rf, unique_bs, is_tx=True)
+                    a_local = slice_weight(
+                        self.a_rf, tf.range(start_ut, end_ut), is_tx=False
+                    )
 
                 h_raw = self._get_port_channel_with_weights(
                     batch_size, w_local, a_local, chunk_size=chunk_size

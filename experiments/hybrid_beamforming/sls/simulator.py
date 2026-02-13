@@ -677,6 +677,16 @@ class SystemSimulator(Block):
                 h_srv = tf.transpose(h_srv_port[:, :, 0, :, :, 0, :], [0, 1, 4, 2, 3])
                 s_s, u_s, v_s = tf.linalg.svd(h_srv)
 
+                # Reshape SVD results for scatter update (Remove B and BUT leading dims)
+                # target shape for each update: [FFT, Port, Rank]
+                u_s_update = tf.reshape(
+                    u_s[..., :rank], [end_ut - start_ut, FFT, -1, rank]
+                )
+                v_s_update = tf.reshape(
+                    v_s[..., :rank], [end_ut - start_ut, FFT, -1, rank]
+                )
+                s_s_update = tf.reshape(s_s[..., :rank], [end_ut - start_ut, FFT, rank])
+
                 # Store Weights Mapped by UT/BS ID
                 indices_ut = tf.stack(
                     [
@@ -694,21 +704,21 @@ class SystemSimulator(Block):
 
                 if self.direction == "uplink":
                     w_ut_dig = tf.tensor_scatter_nd_update(
-                        w_ut_dig, indices_ut, v_s[..., :rank]
+                        w_ut_dig, indices_ut, v_s_update
                     )
                     w_bs_dig = tf.tensor_scatter_nd_update(
-                        w_bs_dig, indices_bs, u_s[..., :rank]
+                        w_bs_dig, indices_bs, u_s_update
                     )
                 else:
                     w_ut_dig = tf.tensor_scatter_nd_update(
-                        w_ut_dig, indices_ut, u_s[..., :rank]
+                        w_ut_dig, indices_ut, u_s_update
                     )
                     w_bs_dig = tf.tensor_scatter_nd_update(
-                        w_bs_dig, indices_bs, v_s[..., :rank]
+                        w_bs_dig, indices_bs, v_s_update
                     )
 
                 s_srv_all = tf.tensor_scatter_nd_update(
-                    s_srv_all, indices_ut, s_s[..., :rank]
+                    s_srv_all, indices_ut, s_s_update
                 )
 
             # --- Pass 2: Interference Calculation (Port-Domain Loop) ---
@@ -762,9 +772,9 @@ class SystemSimulator(Block):
                     )
 
                     # Heff_i = U_neighbor^H * H_int * V_self
-                    hv = tf.einsum("bukfpt,bufpk->bukftk", h_int, v_self)
+                    hv = tf.einsum("bukfpt,buftx->bukfpx", h_int, v_self)
                     heff = tf.einsum(
-                        "bukfrk,bukftk->bukfk", tf.math.conj(u_neighbor), hv
+                        "bukfpx,bukfpx->bukfx", tf.math.conj(u_neighbor), hv
                     )
                     p_leak = p_alloc_batch[:, :, :, None, None] * tf.square(
                         tf.abs(heff)
@@ -793,8 +803,8 @@ class SystemSimulator(Block):
                     )
 
                     # Heff_i = U_self^H * H_int * V_neighbor
-                    hv = tf.einsum("bukfpt,bukftk->bukfpk", h_int, v_neighbor)
-                    heff = tf.einsum("bufpk,bukfpk->bukfk", tf.math.conj(u_self), hv)
+                    hv = tf.einsum("bukfpt,bukftx->bukfpx", h_int, v_neighbor)
+                    heff = tf.einsum("bufpx,bukfpx->bukfx", tf.math.conj(u_self), hv)
                     p_int = tf.expand_dims(p_alloc_batch, 2) * tf.square(tf.abs(heff))
                     i_total_all.append(tf.reduce_sum(p_int, axis=2))
 
