@@ -190,6 +190,13 @@ class SystemSimulator(Block):
             dtype=self.rdtype,  # Use simulation precision
         )
 
+    @property
+    def simulation_freq_res(self):
+        """Simulation Frequency Resolution (N_target)"""
+        if self.config.use_rbg_granularity:
+            return self.resource_grid.fft_size // self.rbg_size_sc
+        return self.resource_grid.num_effective_subcarriers
+
     def _setup_channel_model(
         self,
         scenario,
@@ -451,11 +458,7 @@ class SystemSimulator(Block):
         B = self.batch_size
         N_BS = self.num_bs
         N_UT_Total = self.num_ut
-        # Simulation Resolution (Ntarget) alignment
-        if self.config.use_rbg_granularity:
-            N_target = self.resource_grid.fft_size // self.rbg_size_sc
-        else:
-            N_target = self.resource_grid.num_effective_subcarriers
+        N_target = self.simulation_freq_res
 
         rank = self.config.num_layers
 
@@ -518,27 +521,18 @@ class SystemSimulator(Block):
             # [B, BUT, F, RxP, TxP] に変換
             h_srv = tf.transpose(h_srv_port[:, :, 0, :, :, 0, :], [0, 1, 4, 2, 3])
 
-            # 2. 粒度に応じた重み計算（SVD）
-            s, u, v = weight_utils.compute_digital_weights(
+            # 2. 粒度に応じた重み計算（SVD）& ターゲット解像度への展開
+            # use get_digital_precoders orchestration utility
+            u_exp, v_exp, s_exp = weight_utils.get_digital_precoders(
                 h_srv,
-                granularity=granularity,
+                rank,
+                granularity,
+                N_target,
                 rbg_size_sc=self.rbg_size_sc,
                 weight_type="svd",
             )
 
-            # 3. ターゲット解像度に展開
-            # SVDの結果から必要なランク分をスライス
-            s_exp = weight_utils.expand_weights(
-                s[..., :rank], N_target, granularity, self.rbg_size_sc
-            )
-            u_exp = weight_utils.expand_weights(
-                u[..., :rank], N_target, granularity, self.rbg_size_sc
-            )
-            v_exp = weight_utils.expand_weights(
-                v[..., :rank], N_target, granularity, self.rbg_size_sc
-            )
-
-            # 4. バッファに格納
+            # 3. バッファに格納
             # Batch方向も考慮したインデックス作成
             batch_indices = tf.range(B)[:, None]
             batch_indices = tf.broadcast_to(batch_indices, [B, curr_batch_size])
@@ -554,29 +548,36 @@ class SystemSimulator(Block):
             indices_bs = tf.stack([batch_indices, bs_ids_flat], axis=-1)
             indices_bs_flat = tf.reshape(indices_bs, [-1, 2])
 
-            # updates もフラットにする [B*BUT, F, P, Rank]
-            u_exp_flat = tf.reshape(u_exp, [-1, N_target, tf.shape(u_exp)[-2], rank])
-            v_exp_flat = tf.reshape(v_exp, [-1, N_target, tf.shape(v_exp)[-2], rank])
             s_exp_flat = tf.reshape(s_exp, [-1, N_target, rank])
-
-            if self.direction == "uplink":
-                w_ut_dig_full = tf.tensor_scatter_nd_update(
-                    w_ut_dig_full, indices_ut_flat, v_exp_flat
-                )
-                w_bs_dig_full = tf.tensor_scatter_nd_update(
-                    w_bs_dig_full, indices_bs_flat, u_exp_flat
-                )
-            else:
-                w_ut_dig_full = tf.tensor_scatter_nd_update(
-                    w_ut_dig_full, indices_ut_flat, u_exp_flat
-                )
-                w_bs_dig_full = tf.tensor_scatter_nd_update(
-                    w_bs_dig_full, indices_bs_flat, v_exp_flat
-                )
-
             s_srv_full = tf.tensor_scatter_nd_update(
                 s_srv_full, indices_ut_flat, s_exp_flat
             )
+
+            # Assign based on direction
+            # Uplink: UT(Tx)=V, BS(Rx)=U
+            # Downlink: UT(Rx)=U, BS(Tx)=V
+            if self.direction == "uplink":
+                w_ut_batch = v_exp
+                w_bs_batch = u_exp
+            else:
+                w_ut_batch = u_exp
+                w_bs_batch = v_exp
+
+            w_ut_flat = tf.reshape(
+                w_ut_batch, [-1, N_target, tf.shape(w_ut_batch)[-2], rank]
+            )
+            w_bs_flat = tf.reshape(
+                w_bs_batch, [-1, N_target, tf.shape(w_bs_batch)[-2], rank]
+            )
+
+            w_ut_dig_full = tf.tensor_scatter_nd_update(
+                w_ut_dig_full, indices_ut_flat, w_ut_flat
+            )
+            w_bs_dig_full = tf.tensor_scatter_nd_update(
+                w_bs_dig_full, indices_bs_flat, w_bs_flat
+            )
+
+            # s_srv_full update moved up
 
         return w_ut_dig_full, w_bs_dig_full, s_srv_full
 
@@ -636,10 +637,8 @@ class SystemSimulator(Block):
         B = self.batch_size
         N_BS = self.num_bs
         N_UT = self.num_ut
-        if self.config.use_rbg_granularity:
-            N_target = self.resource_grid.fft_size // self.rbg_size_sc
-        else:
-            N_target = self.resource_grid.num_effective_subcarriers
+        N_UT = self.num_ut
+        N_target = self.simulation_freq_res
 
         rank = self.config.num_layers
 
