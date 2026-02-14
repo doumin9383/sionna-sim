@@ -6,11 +6,11 @@ import numpy as np
 # --- Add project root to path ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../"))
-sys.path.append(project_root)
+# sys.path.append(project_root)
 
 from experiments.hybrid_beamforming.sls.simulator import HybridSystemSimulator
 from experiments.hybrid_beamforming.sls.my_configs import HybridSLSConfig
-from libs.my_configs import ResourceGridConfig
+from wsim.rt.configs import ResourceGridConfig
 from sionna.phy.channel.tr38901 import PanelArray
 from sionna.phy.ofdm import ResourceGrid
 

@@ -14,14 +14,14 @@ from sionna.phy.channel.tr38901 import UMi, UMa, RMa, PanelArray
 from sionna.phy.ofdm import ResourceGrid
 
 # Local Components
-from .components.hybrid_channel_interface import HybridChannelInterface
+from wsim.sls.channel.interface import HybridChannelInterface
 from .components.mpr_model import MPRModel
 from .components.power_control import PowerControl
-from .components.link_adaptation import MCSLinkAdaptation
+from wsim.sls.link_adaptation import MCSLinkAdaptation
 from .components.get_hist import init_result_history, record_results
 from .components.precoder_utils import expand_precoder
 from .components.beam_management import BeamSelector
-from ..shared import weight_utils
+from wsim.common import weight_utils
 
 # Set random seed for reproducibility
 sionna.phy.config.seed = 42

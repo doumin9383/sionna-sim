@@ -28,7 +28,7 @@ release = SourceFileLoader("version",
 # -- General configuration ---------------------------------------------------
 
 # Load custom extensions
-sys.path.append(os.path.abspath("./_ext"))
+# sys.path.append(os.path.abspath("./_ext"))
 
 #import sphinx_rtd_theme
 extensions = ["sphinx_rtd_theme",

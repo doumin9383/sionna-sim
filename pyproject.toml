@@ -1,7 +1,7 @@
 [project]
-name = "sionna-sim"
+name = "wsim"
 version = "0.1.0"
-description = "Add your description here"
+description = "Sionna-based Wireless Simulator Extensions"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

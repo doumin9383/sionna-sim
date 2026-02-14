@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Any, Dict, Union
-from libs.my_configs import ResourceGridConfig, PlanarArrayConfig
-from experiments.hybrid_beamforming.shared.configs import (
+from wsim.rt.configs import ResourceGridConfig, PlanarArrayConfig
+from experiments.hybrid_beamforming.global_config import (
     HybridSimulationCommonConfig,
     SYSTEM_MCS_INDICES,
     SYSTEM_WAVEFORMS,

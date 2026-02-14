@@ -2,7 +2,7 @@ print("Start import test")
 import sys
 import os
 
-sys.path.append(os.getcwd())
+# sys.path.append(os.getcwd())
 
 try:
     print("Importing numpy...")
@@ -28,8 +28,8 @@ try:
     import sionna
     from sionna.rt import Scene
 
-    print("Importing libs.external_rt...")
-    from libs.external_rt import HDF5Ingester, ExternalPaths
+    print("Importing wsim.rt.external...")
+    from wsim.rt.external import HDF5Ingester, ExternalPaths
 
     print("All imports successful")
 except Exception as e:

@@ -2,7 +2,7 @@ import os
 import sys
 
 # Add project root to sys.path
-sys.path.append(os.getcwd())
+# sys.path.append(os.getcwd())
 import shutil
 import numpy as np
 import h5py
@@ -17,7 +17,7 @@ try:
 except Exception:
     mi.set_variant("llvm_ad_mono_polarized")
 
-from libs.external_rt import HDF5Ingester, ExternalPaths
+from wsim.rt.external import HDF5Ingester, ExternalPaths
 
 
 def create_dummy_hdf5(path, num_samples=10, num_paths=5):

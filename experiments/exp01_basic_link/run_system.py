@@ -4,11 +4,11 @@ import os
 # --- プロジェクトルートをパスに追加 ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../"))
-sys.path.append(project_root)
+# sys.path.append(project_root)
 # ----------------------------------------
 
-import libs.my_configs as cfg
-from libs.sim_core import SionnaRunner
+import wsim.rt.configs as cfg
+from wsim.rt.runner import SionnaRunner
 
 def get_scenarios():
     """実験シナリオ定義"""

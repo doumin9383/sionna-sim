@@ -3,11 +3,11 @@ from typing import List, Tuple, Optional, Any, Dict, Union
 import numpy as np
 
 # 基底クラスのインポート
-from libs.my_configs import (
+from wsim.rt.configs import (
     ResourceGridConfig,
     PlanarArrayConfig,
 )
-from experiments.hybrid_beamforming.shared.configs import SimulationCommonConfig
+from experiments.hybrid_beamforming.global_config import SimulationCommonConfig
 
 from sionna.phy.channel.tr38901 import PanelArray
 

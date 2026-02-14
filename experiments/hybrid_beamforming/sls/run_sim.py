@@ -5,7 +5,7 @@ import tensorflow as tf
 # --- Add project root to path ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../../"))
-sys.path.append(project_root)
+# sys.path.append(project_root)
 
 # Import Local Components
 from experiments.hybrid_beamforming.sls.simulator import (

@@ -2,13 +2,13 @@ import sys
 import os
 import copy
 # Add project root to sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from libs.my_configs import (
+from wsim.rt.configs import (
     SimulationConfig, SceneConfig, PlanarArrayConfig, TransmitterConfig,
     ReceiverConfig, RayTracingConfig
 )
-from libs.sim_core import SionnaRunner
+from wsim.rt.runner import SionnaRunner
 
 def main():
     # Base Configuration Components

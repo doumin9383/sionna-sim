@@ -3222,36 +3222,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sionna-sim"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "jupyter" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "pandoc" },
-    { name = "pypandoc" },
-    { name = "sionna" },
-    { name = "tensorflow", version = "2.18.1", source = { registry = "https://pypi.org/simple" }, extra = ["and-cuda"], marker = "python_full_version >= '3.13'" },
-    { name = "tensorflow", version = "2.20.0", source = { registry = "https://pypi.org/simple" }, extra = ["and-cuda"], marker = "python_full_version < '3.13'" },
-    { name = "tqdm" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "jupyter", specifier = ">=1.1.1" },
-    { name = "matplotlib", specifier = ">=3.10.8" },
-    { name = "numpy", specifier = ">=1.26.4" },
-    { name = "pandas", specifier = ">=2.3.3" },
-    { name = "pandoc", specifier = ">=2.4" },
-    { name = "pypandoc", specifier = ">=1.16.2" },
-    { name = "sionna", specifier = "==1.2.1" },
-    { name = "tensorflow", extras = ["and-cuda"], specifier = ">=2.18.1" },
-    { name = "tqdm", specifier = ">=4.67.3" },
-]
-
-[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3792,4 +3762,34 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/06/b500bfc38a4f82d89f34a13069e748c82c5430d365d9e6b75afb3ab74457/wrapt-2.1.1-cp314-cp314t-win_amd64.whl", hash = "sha256:f76bc12c583ab01e73ba0ea585465a41e48d968f6d1311b4daec4f8654e356e3", size = 63855, upload-time = "2026-02-03T02:12:15.47Z" },
     { url = "https://files.pythonhosted.org/packages/d9/cc/5f6193c32166faee1d2a613f278608e6f3b95b96589d020f0088459c46c9/wrapt-2.1.1-cp314-cp314t-win_arm64.whl", hash = "sha256:7ea74fc0bec172f1ae5f3505b6655c541786a5cabe4bbc0d9723a56ac32eb9b9", size = 60443, upload-time = "2026-02-03T02:11:30.869Z" },
     { url = "https://files.pythonhosted.org/packages/c4/da/5a086bf4c22a41995312db104ec2ffeee2cf6accca9faaee5315c790377d/wrapt-2.1.1-py3-none-any.whl", hash = "sha256:3b0f4629eb954394a3d7c7a1c8cca25f0b07cefe6aa8545e862e9778152de5b7", size = 43886, upload-time = "2026-02-03T02:11:45.048Z" },
+]
+
+[[package]]
+name = "wsim"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "jupyter" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pandoc" },
+    { name = "pypandoc" },
+    { name = "sionna" },
+    { name = "tensorflow", version = "2.18.1", source = { registry = "https://pypi.org/simple" }, extra = ["and-cuda"], marker = "python_full_version >= '3.13'" },
+    { name = "tensorflow", version = "2.20.0", source = { registry = "https://pypi.org/simple" }, extra = ["and-cuda"], marker = "python_full_version < '3.13'" },
+    { name = "tqdm" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "jupyter", specifier = ">=1.1.1" },
+    { name = "matplotlib", specifier = ">=3.10.8" },
+    { name = "numpy", specifier = ">=1.26.4" },
+    { name = "pandas", specifier = ">=2.3.3" },
+    { name = "pandoc", specifier = ">=2.4" },
+    { name = "pypandoc", specifier = ">=1.16.2" },
+    { name = "sionna", specifier = "==1.2.1" },
+    { name = "tensorflow", extras = ["and-cuda"], specifier = ">=2.18.1" },
+    { name = "tqdm", specifier = ">=4.67.3" },
 ]
