@@ -19,7 +19,6 @@ from .components.mpr_model import MPRModel
 from .components.power_control import PowerControl
 from wsim.sls.link_adaptation import MCSLinkAdaptation
 from .components.get_hist import init_result_history, record_results
-from .components.precoder_utils import expand_precoder
 from .components.beam_management import BeamSelector
 from wsim.common import weight_utils
 
