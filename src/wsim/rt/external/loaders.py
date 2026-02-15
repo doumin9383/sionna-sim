@@ -36,6 +36,10 @@ class ExternalLoaderBase(abc.ABC):
         pass
 
 
+import h5py
+import os
+
+
 class MeshBasedLoader(ExternalLoaderBase):
     """
     Loads pre-computed ray tracing data from a mesh grid (Zarr/HDF5).
@@ -55,18 +59,25 @@ class MeshBasedLoader(ExternalLoaderBase):
         self._scene = scene
         self._use_3d_search = use_3d_search
 
-        # Open store
-        self._store = zarr.open(file_path, mode="r")
+        # Open store based on extension
+        _, ext = os.path.splitext(file_path)
+        if ext.lower() in [".h5", ".hdf5"]:
+            self._dataset = h5py.File(file_path, "r")
+        else:
+            # Default to zarr
+            self._dataset = zarr.open(file_path, mode="r")
 
         # Initialize CoordinateSystem from metadata
-        origin_utm = self._store.attrs.get("origin_utm", (0, 0, 0))
+        # Both h5py and zarr support .attrs (dictionary-like)
+        origin_utm = self._dataset.attrs.get("origin_utm", (0.0, 0.0, 0.0))
         self._geo = CoordinateSystem(origin_utm)
 
         # Load mesh coordinates (UTM) and convert to local
-        if "mesh_coordinates" not in self._store:
-            raise KeyError(f"Zarr store at {file_path} must contain 'mesh_coordinates'")
+        if "mesh_coordinates" not in self._dataset:
+            raise KeyError(f"Dataset at {file_path} must contain 'mesh_coordinates'")
 
-        mesh_utm = np.array(self._store["mesh_coordinates"])
+        # mesh_coordinates is usually small compared to path gains, so we read it all
+        mesh_utm = np.array(self._dataset["mesh_coordinates"])
         self._mesh_local = self._geo.utm_to_local(mesh_utm)
 
         # Build KDTree
@@ -74,11 +85,13 @@ class MeshBasedLoader(ExternalLoaderBase):
         self._tree = cKDTree(search_coords)
 
         # Infer shapes
-        self._num_tx = self._store.attrs.get("num_tx", 1)
-        if "path_gain" in self._store:
-            self._num_tx = self._store["path_gain"].shape[1]
-        elif "path_gains" in self._store:
-            self._num_tx = self._store["path_gains"].shape[1]
+        self._num_tx = self._dataset.attrs.get("num_tx", 1)
+        if "path_gain" in self._dataset:
+            # We assume [RX, TX, Paths]
+            self._num_tx = self._dataset["path_gain"].shape[1]
+        elif "path_gains" in self._dataset:
+            # We assume [RX, TX, Paths, 2, 2]
+            self._num_tx = self._dataset["path_gains"].shape[1]
 
         # Cache for best server mapping
         self._best_server_indices = None
@@ -88,24 +101,29 @@ class MeshBasedLoader(ExternalLoaderBase):
         """Returns the coordinate system."""
         return self._geo
 
-    def get_paths(self, ut_coordinates_local: Union[np.ndarray, tf.Tensor]) -> Paths:
+    def get_paths(self, ut_coordinates_utm: Union[np.ndarray, tf.Tensor]) -> Paths:
         """
         Finds the nearest mesh points and returns an ExternalPaths object.
         """
-        if isinstance(ut_coordinates_local, tf.Tensor):
-            ut_coords = ut_coordinates_local.numpy()
+        if isinstance(ut_coordinates_utm, tf.Tensor):
+            ut_coords = ut_coordinates_utm.numpy()
         else:
-            ut_coords = ut_coordinates_local
+            ut_coords = ut_coordinates_utm
 
-        search_coords = ut_coords if self._use_3d_search else ut_coords[:, :2]
+        # Convert UTM to Local for KDTree query
+        ut_coords_local = self._geo.utm_to_local(ut_coords)
+
+        search_coords = (
+            ut_coords_local if self._use_3d_search else ut_coords_local[:, :2]
+        )
 
         # Find nearest mesh point indices
         _, indices = self._tree.query(search_coords)
 
-        # Instantiate ExternalPaths with mapped indices
-        # We assume sample_index in ExternalPaths handles lists/arrays of indices
+        # Instantiate ExternalPaths with the dataset and mapped indices
+        # ExternalPaths will perform the sliced read using these indices.
         return ExternalPaths(
-            zarr_path=self._file_path,
+            dataset=self._dataset,
             scene=self._scene,
             num_tx=self._num_tx,
             num_rx=len(indices),

@@ -22,7 +22,7 @@ class ExternalPaths(Paths):
 
     def __init__(
         self,
-        zarr_path: str,
+        dataset: any,
         scene: Scene,
         num_tx: int,
         num_rx: int,
@@ -31,81 +31,63 @@ class ExternalPaths(Paths):
         sample_index: int = None,
     ):
         """
-        Initializes the ExternalPaths object by loading data from a Zarr store.
+        Initializes the ExternalPaths object by loading data from a dataset (Zarr/HDF5).
 
         Args:
-            zarr_path (str): Path to the Zarr store containing the ray tracing results.
+            dataset (any): Open dataset or mapping containing the ray tracing results.
             scene (Scene): The Sionna scene object (needed for frequency/wavelength).
             num_tx (int): Number of transmitters.
             num_rx (int): Number of receivers.
             num_tx_ant (int, optional): Number of antennas per transmitter. Defaults to 1.
             num_rx_ant (int, optional): Number of antennas per receiver. Defaults to 1.
-            sample_index (int, optional): Index of the sample/scenario to load if the Zarr store
-                                          contains multiple samples (first dimension). Defaults to None (load all/squeeze).
+            sample_index (int, optional): Index of the sample/scenario to load if the dataset
+                                          contains multiple samples (first dimension). Defaults to None.
         """
 
         # 1. Bypass standard initialization with a dummy buffer
-        # We create a minimal buffer to satisfy the parent constructor
-        # but we will immediately overwrite the internal state.
         dummy_buffer = PathsBuffer(buffer_size=1, max_depth=1, diffraction=False)
 
-        # Pre-initialize attributes required by _load_from_zarr (called via super().__init__ -> _build_from_buffer)
-        self._zarr_path = zarr_path
+        # Pre-initialize attributes required by _load_from_dataset (called via super().__init__ -> _build_from_buffer)
+        self._dataset = dataset
         self._num_tx = num_tx
         self._num_rx = num_rx
         self._sample_index = sample_index
 
         # Call parent generic init with minimal dummy values
-        # Note: We assume synthetic_array=False for direct injection for now,
-        # as we are handling full path data unless specified otherwise.
         super().__init__(
             scene=scene,
             src_positions=mi.Point3f(0, 0, 0),  # Dummy
             tgt_positions=mi.Point3f(0, 0, 0),  # Dummy
             tx_velocities=mi.Vector3f(0, 0, 0),  # Dummy
             rx_velocities=mi.Vector3f(0, 0, 0),  # Dummy
-            synthetic_array=False,
+            synthetic_array=False,  # Set to False to trigger _build_from_buffer (which we override)
             paths_buffer=dummy_buffer,
             rel_ant_positions_tx=None,
             rel_ant_positions_rx=None,
         )
 
-    def _load_from_zarr(self):
+    def _load_from_dataset(self):
         """
-        Loads the path data from Zarr and populates the internal DrJit tensors.
+        Loads the path data from the dataset and populates the internal DrJit tensors.
         """
-        store = zarr.open(self._zarr_path, mode="r")
+        store = self._dataset
 
         try:
-            # Helper to load and convert to DrJit tensor with optional slicing
-            def load_tensor(key, default_val=0.0):
-                if key in store:
-                    data = store[key]
-                    if (
-                        self._sample_index is not None and data.shape[0] > 1
-                    ):  # Assuming dim 0 is sample
-                        # Check if data has enough dimensions to be sliced
-                        if len(data.shape) > 0:
-                            data = data[self._sample_index]
 
-                    data = np.array(data)
-                    return (
-                        dr.cuda.Float(data)
-                        if mi.variant().startswith("cuda")
-                        else dr.llvm.Float(data)
-                    )
-                return dr.full(
-                    mi.TensorXf, default_val, [1]
-                )  # Fallback, likely needs better shape handling
-
-            # Load delay first (required for both)
-            if "delay" in store:
-                delay = store["delay"]
+            def get_data(key):
+                if key not in store:
+                    return None
+                data = store[key]
                 if self._sample_index is not None:
-                    delay = delay[self._sample_index]
-                delay = np.array(delay)
-            else:
-                raise KeyError("Zarr store must contain 'delay'")
+                    # dataset[indices] in h5py/zarr returns the sliced array
+                    data = data[self._sample_index]
+                # Ensure data is a numpy array (important for TF/DrJit from HDF5)
+                return np.array(data)
+
+            # Load delay first (required)
+            delay = get_data("delay")
+            if delay is None:
+                raise KeyError("Dataset must contain 'delay'")
 
             # Helper to reshape 3D [RX, TX, Paths] to 5D [RX, 1, TX, 1, Paths]
             def reshape_to_5d(tensor_data):
@@ -122,12 +104,10 @@ class ExternalPaths(Paths):
             )
             self._tau = dr.reshape(mi.TensorXf, self._tau, delay.shape)
 
-            # Load path gains (Complex Matrix or Scalar + Phase)
+            # Load path gains
+            # Priority: 'path_gains' (polarized [..., 2, 2]) > 'path_gain' (scalar)
             if "path_gains" in store:
-                path_gains = store["path_gains"]
-                if self._sample_index is not None:
-                    path_gains = path_gains[self._sample_index]
-                path_gains = np.array(path_gains)
+                path_gains = get_data("path_gains")  # [..., Paths, 2, 2]
 
                 # Reshape to [num_rx, 1, num_tx, 1, num_paths, 2, 2]
                 if len(path_gains.shape) == 5:
@@ -149,27 +129,20 @@ class ExternalPaths(Paths):
                     else dr.llvm.Float(flat_imag)
                 )
                 self._a_imag = dr.reshape(mi.TensorXf, self._a_imag, path_gains.shape)
+
             elif "path_gain" in store:
-                path_gain = store["path_gain"]
-                if self._sample_index is not None:
-                    path_gain = path_gain[self._sample_index]
-                path_gain = np.array(path_gain)
+                path_gain = get_data("path_gain")
                 path_gain = reshape_to_5d(path_gain)
 
                 # Assuming path_gain is power linear -> amplitude = sqrt(power)
                 amplitude = np.sqrt(path_gain)
 
-                # If phase is available in Zarr
-                if "phase" in store:
-                    phase = store["phase"]
-                    if self._sample_index is not None:
-                        phase = phase[self._sample_index]
-                    phase = np.array(phase)
+                # If phase is available
+                phase = get_data("phase")
+                if phase is not None:
                     phase = reshape_to_5d(phase)
-
-                    # Compute complex amplitude in numpy
+                    # Compute complex amplitude
                     a_complex = amplitude * (np.cos(phase) + 1j * np.sin(phase))
-
                     flat_real = np.real(a_complex).flatten()
                     flat_imag = np.imag(a_complex).flatten()
 
@@ -203,16 +176,13 @@ class ExternalPaths(Paths):
                     self._a_imag = dr.zeros(mi.TensorXf, self._a_real.shape)
             else:
                 raise KeyError(
-                    "Zarr store must contain 'path_gains' (polarized) or 'path_gain' (scalar)."
+                    "Dataset must contain 'path_gains' (polarized) or 'path_gain' (scalar)."
                 )
 
             # Angles
             def load_angle(key):
-                if key in store:
-                    val = store[key]
-                    if self._sample_index is not None:
-                        val = val[self._sample_index]
-                    val = np.array(val)
+                val = get_data(key)
+                if val is not None:
                     val = reshape_to_5d(val)
                     flat_val = val.flatten()
                     t = (
@@ -229,27 +199,20 @@ class ExternalPaths(Paths):
             self._phi_r = load_angle("azimuth_at_rx")
 
             # Doppler (optional)
-            self._doppler = load_angle(
-                "doppler"
-            )  # Assuming scalar doppler per path, reuse load_angle/reshape logic
+            self._doppler = load_angle("doppler")
 
             # Set valid flag
-            # Assume all loaded paths are valid
             self._valid = dr.full(mi.TensorXb, True, self._tau.shape)
-
-            self._paths_components_built = False  # We don't have interaction/shape info
+            self._paths_components_built = False
 
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to load external paths from {self._zarr_path}: {e}"
-            )
+            raise RuntimeError(f"Failed to load external paths from dataset: {e}")
 
     def _build_from_buffer(self):
         """
         Bypass the standard construction of tensors from the paths buffer.
-        Instead, we trigger the Zarr loader here.
         """
-        self._load_from_zarr()
+        self._load_from_dataset()
 
     def _fuse_pattern_array_dims(self):
         """
