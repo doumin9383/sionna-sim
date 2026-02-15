@@ -19,9 +19,9 @@ class TBConfig(_TBConfig):
         """パラメータ変更時に一度だけデコードを走らせる"""
         # 毎回 .numpy() して python float に戻すのはオーバーヘッドが大きいので
         # 必要な時に一括計算してキャッシュする
-        m, r = decode_mcs_index(
-            self._mcs_index,
-            self._mcs_table,
+        m, r, _ = decode_mcs_index(
+            mcs_index=self._mcs_index,
+            table_index=self._mcs_table,
             is_pusch=(self._channel_type == "PUSCH"),
             transform_precoding=self._transform_precoding,
             pi2bpsk=self._pi2bpsk,

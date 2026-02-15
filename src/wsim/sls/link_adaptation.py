@@ -12,42 +12,28 @@ class MCSLinkAdaptation:
     Selects MCS based on effective SINR and calculates Transport Block Size (TBS).
     """
 
-    def __init__(self, target_bler=0.1):
+    def __init__(
+        self,
+        target_bler=0.1,
+        table_index=1,
+        is_pusch=True,
+        transform_precoding=False,
+        pi2bpsk=False,
+    ):
         self.target_bler = target_bler
-        # Table 5.1.3.1-1: MCS index table 1 for PUSCH
-        # Columns: [MCS Index, Modulation Order, Target Code Rate (x1024), Required SINR (dB)]
-        # Approximate required SINR for BLER=10% (Target)
-        self.mcs_table = [
-            [0, 2, 120, -6.0],
-            [1, 2, 157, -4.0],
-            [2, 2, 193, -2.0],
-            [3, 2, 251, -0.0],
-            [4, 2, 308, 2.0],
-            [5, 2, 379, 4.0],
-            [6, 2, 449, 6.0],
-            [7, 2, 526, 8.0],
-            [8, 2, 602, 10.0],
-            [9, 2, 679, 12.0],
-            [10, 4, 340, 13.0],
-            [11, 4, 378, 14.0],
-            [12, 4, 434, 15.0],
-            [13, 4, 490, 16.0],
-            [14, 4, 553, 17.0],
-            [15, 4, 616, 18.0],
-            [16, 4, 658, 19.0],
-            [17, 6, 438, 19.5],
-            [18, 6, 466, 20.0],
-            [19, 6, 517, 21.0],
-            [20, 6, 567, 22.0],
-            [21, 6, 616, 23.0],
-            [22, 6, 666, 24.0],
-            [23, 6, 719, 25.0],
-            [24, 6, 772, 26.0],
-            [25, 6, 822, 27.0],
-            [26, 6, 873, 28.0],
-            [27, 6, 910, 29.0],
-            [28, 6, 948, 30.0],
-        ]
+        self.table_index = table_index
+        self.is_pusch = is_pusch
+        self.transform_precoding = transform_precoding
+        self.pi2bpsk = pi2bpsk
+
+        from wsim.common.phy.mcs import get_mcs_table
+
+        self.mcs_table = get_mcs_table(
+            table_index=self.table_index,
+            is_pusch=self.is_pusch,
+            transform_precoding=self.transform_precoding,
+            pi2bpsk=self.pi2bpsk,
+        )
 
     def select_mcs(self, sinr_db):
         """
@@ -79,10 +65,13 @@ class MCSLinkAdaptation:
         Calculates throughput based on MCS index and resource allocation.
         """
         try:
-            # Use Sionna's utility to get Mod Order and Code Rate
-            # Assuming Table 1 (index 1) and PUSCH as per the class context
-            mod_order, code_rate = decode_mcs_index(
-                mcs_index, table_index=1, channel_type="PUSCH"
+            # Use our utility to get Mod Order and Code Rate
+            mod_order, code_rate, _ = decode_mcs_index(
+                mcs_index=mcs_index,
+                table_index=self.table_index,
+                is_pusch=self.is_pusch,
+                transform_precoding=self.transform_precoding,
+                pi2bpsk=self.pi2bpsk,
             )
 
             tbs = calculate_tb_size(
