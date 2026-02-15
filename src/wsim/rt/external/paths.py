@@ -98,29 +98,14 @@ class ExternalPaths(Paths):
                     mi.TensorXf, default_val, [1]
                 )  # Fallback, likely needs better shape handling
 
-            # Load core path data -> These keys match StandardAdapter
-            # We load as numpy first to check shapes easily
-            if "path_gain" in store:
-                path_gain = store["path_gain"]
-            else:
-                raise KeyError("Zarr store must contain 'path_gain'")
-
+            # Load delay first (required for both)
             if "delay" in store:
                 delay = store["delay"]
+                if self._sample_index is not None:
+                    delay = delay[self._sample_index]
+                delay = np.array(delay)
             else:
                 raise KeyError("Zarr store must contain 'delay'")
-
-            # Slice if needed
-            if self._sample_index is not None:
-                path_gain = path_gain[self._sample_index]
-                delay = delay[self._sample_index]
-
-            path_gain = np.array(path_gain)
-            delay = np.array(delay)
-
-            # Expected shape assumption: [num_rx, num_tx, num_paths] (SISO default)
-            # We need to reshape to [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
-            # Assuming 1 antenna for now as per defaults in standard HDF5 ingestion
 
             # Helper to reshape 3D [RX, TX, Paths] to 5D [RX, 1, TX, 1, Paths]
             def reshape_to_5d(tensor_data):
@@ -128,11 +113,7 @@ class ExternalPaths(Paths):
                     return tensor_data[:, np.newaxis, :, np.newaxis, :]
                 return tensor_data
 
-            path_gain = reshape_to_5d(path_gain)
             delay = reshape_to_5d(delay)
-
-            # Populating internal state
-            # DrJit often needs flat input for efficient copy from numpy
             flat_delay = delay.flatten()
             self._tau = (
                 dr.cuda.Float(flat_delay)
@@ -141,45 +122,89 @@ class ExternalPaths(Paths):
             )
             self._tau = dr.reshape(mi.TensorXf, self._tau, delay.shape)
 
-            # Assuming path_gain is power linear -> amplitude = sqrt(power)
-            amplitude = np.sqrt(path_gain)
-
-            # If phase is available in Zarr
-            if "phase" in store:
-                phase = store["phase"]
+            # Load path gains (Complex Matrix or Scalar + Phase)
+            if "path_gains" in store:
+                path_gains = store["path_gains"]
                 if self._sample_index is not None:
-                    phase = phase[self._sample_index]
-                phase = np.array(phase)
-                phase = reshape_to_5d(phase)
+                    path_gains = path_gains[self._sample_index]
+                path_gains = np.array(path_gains)
 
-                # Compute complex amplitude in numpy to avoid repeated flat/reshape for cos/sin
-                a_complex = amplitude * (np.cos(phase) + 1j * np.sin(phase))
+                # Reshape to [num_rx, 1, num_tx, 1, num_paths, 2, 2]
+                if len(path_gains.shape) == 5:
+                    path_gains = path_gains[:, np.newaxis, :, np.newaxis, :, :, :]
 
-                flat_real = np.real(a_complex).flatten()
-                flat_imag = np.imag(a_complex).flatten()
+                flat_real = np.real(path_gains).flatten()
+                flat_imag = np.imag(path_gains).flatten()
 
                 self._a_real = (
                     dr.cuda.Float(flat_real)
                     if mi.variant().startswith("cuda")
                     else dr.llvm.Float(flat_real)
                 )
-                self._a_real = dr.reshape(mi.TensorXf, self._a_real, path_gain.shape)
+                self._a_real = dr.reshape(mi.TensorXf, self._a_real, path_gains.shape)
 
                 self._a_imag = (
                     dr.cuda.Float(flat_imag)
                     if mi.variant().startswith("cuda")
                     else dr.llvm.Float(flat_imag)
                 )
-                self._a_imag = dr.reshape(mi.TensorXf, self._a_imag, path_gain.shape)
+                self._a_imag = dr.reshape(mi.TensorXf, self._a_imag, path_gains.shape)
+            elif "path_gain" in store:
+                path_gain = store["path_gain"]
+                if self._sample_index is not None:
+                    path_gain = path_gain[self._sample_index]
+                path_gain = np.array(path_gain)
+                path_gain = reshape_to_5d(path_gain)
+
+                # Assuming path_gain is power linear -> amplitude = sqrt(power)
+                amplitude = np.sqrt(path_gain)
+
+                # If phase is available in Zarr
+                if "phase" in store:
+                    phase = store["phase"]
+                    if self._sample_index is not None:
+                        phase = phase[self._sample_index]
+                    phase = np.array(phase)
+                    phase = reshape_to_5d(phase)
+
+                    # Compute complex amplitude in numpy
+                    a_complex = amplitude * (np.cos(phase) + 1j * np.sin(phase))
+
+                    flat_real = np.real(a_complex).flatten()
+                    flat_imag = np.imag(a_complex).flatten()
+
+                    self._a_real = (
+                        dr.cuda.Float(flat_real)
+                        if mi.variant().startswith("cuda")
+                        else dr.llvm.Float(flat_real)
+                    )
+                    self._a_real = dr.reshape(
+                        mi.TensorXf, self._a_real, path_gain.shape
+                    )
+
+                    self._a_imag = (
+                        dr.cuda.Float(flat_imag)
+                        if mi.variant().startswith("cuda")
+                        else dr.llvm.Float(flat_imag)
+                    )
+                    self._a_imag = dr.reshape(
+                        mi.TensorXf, self._a_imag, path_gain.shape
+                    )
+                else:
+                    flat_amp = amplitude.flatten()
+                    self._a_real = (
+                        dr.cuda.Float(flat_amp)
+                        if mi.variant().startswith("cuda")
+                        else dr.llvm.Float(flat_amp)
+                    )
+                    self._a_real = dr.reshape(
+                        mi.TensorXf, self._a_real, path_gain.shape
+                    )
+                    self._a_imag = dr.zeros(mi.TensorXf, self._a_real.shape)
             else:
-                flat_amp = amplitude.flatten()
-                self._a_real = (
-                    dr.cuda.Float(flat_amp)
-                    if mi.variant().startswith("cuda")
-                    else dr.llvm.Float(flat_amp)
+                raise KeyError(
+                    "Zarr store must contain 'path_gains' (polarized) or 'path_gain' (scalar)."
                 )
-                self._a_real = dr.reshape(mi.TensorXf, self._a_real, path_gain.shape)
-                self._a_imag = dr.zeros(mi.TensorXf, self._a_real.shape)
 
             # Angles
             def load_angle(key):
