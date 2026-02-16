@@ -37,10 +37,16 @@ sionna.phy.config.seed = 42
 sionna.phy.config.precision = "single"  # 'single' or 'double'
 
 
-def init_result_history(batch_size, num_slots, num_bs, num_ut_per_sector):
-    """Initialize dictionary containing history of results"""
+def init_result_history(
+    batch_size, num_records, num_bs, num_ut_per_sector, num_ut, max_la_iterations
+):
+    """Initialize dictionary containing history of results
+    num_records: Total number of records (e.g., num_slots * max_la_iterations)
+    """
     hist = {}
-    for key in [
+
+    # Per-link metrics: [batch, num_bs, num_ut_per_sector]
+    link_metric_keys = [
         "pathloss_serving_cell",
         "tx_power",
         "olla_offset",
@@ -48,19 +54,21 @@ def init_result_history(batch_size, num_slots, num_bs, num_ut_per_sector):
         "pf_metric",
         "num_decoded_bits",
         "mcs_index",
-        "harq",
+        # "harq", # Removed as per plan
         "num_allocated_re",
         "p_cmax_dbm",
         "rank",
         "mpr_db",
         "beam_idx",
         "interference_power",
-    ]:
-        hist[key] = tf.TensorArray(
-            size=num_slots,
-            element_shape=[batch_size, num_bs, num_ut_per_sector],
-            dtype=tf.float32,
-        )
+    ]
+
+    for key in link_metric_keys:
+        hist[key] = []
+
+    # Topology metrics
+    hist["ut_loc"] = []
+    hist["bs_loc"] = []
     return hist
 
 
@@ -82,6 +90,8 @@ def record_results(
     mpr_db=None,
     beam_idx=None,
     interference_power=None,
+    ut_loc=None,
+    bs_loc=None,
     shape=None,
 ):
     """Record results of last slot"""
@@ -95,12 +105,14 @@ def record_results(
                 "tx_power",
                 "num_decoded_bits",
                 "mcs_index",
-                "harq",
+                # "harq",
                 "p_cmax_dbm",
                 "rank",
                 "mpr_db",
                 "beam_idx",
                 "interference_power",
+                "ut_loc",
+                "bs_loc",
             ],
             [
                 pathloss_serving_cell,
@@ -110,26 +122,27 @@ def record_results(
                 tx_power_per_ut,
                 num_decoded_bits,
                 mcs_index,
-                harq_feedback,
+                # harq_feedback,
                 p_cmax_dbm,
                 rank,
                 mpr_db,
                 beam_idx,
                 interference_power,
+                ut_loc,
+                bs_loc,
             ],
         ):
             if value is not None:
-                hist[key] = hist[key].write(slot, tf.cast(value, tf.float32))
+                # Use append for list
+                hist[key].append(tf.cast(value, tf.float32))
 
         # Average PF metric across resources
         if pf_metric is not None:
-            hist["pf_metric"] = hist["pf_metric"].write(
-                slot, tf.reduce_mean(pf_metric, axis=[-2, -3])
-            )
+            hist["pf_metric"].append(tf.reduce_mean(pf_metric, axis=[-2, -3]))
     else:
         nan_tensor = tf.cast(tf.fill(shape, float("nan")), dtype=tf.float32)
         for key in hist:
-            hist[key] = hist[key].write(slot, nan_tensor)
+            hist[key].append(nan_tensor)
     return hist
 
 

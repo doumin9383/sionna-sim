@@ -50,16 +50,15 @@ def run_test():
     # num_decoded_bits: [slots, batch, bs, ut_per_sector]
     if "num_decoded_bits" in history:
         bits = history["num_decoded_bits"]
-        # history["num_decoded_bits"] は 1スロット分（14シンボル等）にスケール済み
-        # 1スロットの期間 = (1シンボル期間) * (シンボル数/スロット)
-        actual_slot_duration = sim.slot_duration * (
-            config.num_symbols_per_slot / 1.0
-        )  # sim.slot_durationは1シンボル分
+        # history["num_decoded_bits"] is scaled by num_data_symbols in simulator
+        # We need the physical duration of the slot (including DMRS/overhead symbols)
+        # assuming sim.slot_duration is the duration of ONE OFDM symbol (including CP)
+        slot_time_duration = sim.slot_duration * config.num_symbols_per_slot
 
         # Mbps単位のスループット計算: (全UEの合計ビット数 / スロット期間[s]) / 1e6
         total_bits_per_slot = tf.reduce_sum(bits, axis=[1, 2, 3])
         avg_throughput_mbps = (
-            tf.reduce_mean(total_bits_per_slot / actual_slot_duration) / 1e6
+            tf.reduce_mean(total_bits_per_slot / slot_time_duration) / 1e6
         )
         print(f"平均ネットワークスループット: {avg_throughput_mbps:.2f} Mbps")
 
@@ -73,12 +72,54 @@ def run_test():
     )
 
     # CSV出力と可視化
-    export_sls_data(history, config.output_dir, slot_duration=actual_slot_duration)
+    export_sls_data(
+        history,
+        config.output_dir,
+        slot_duration=slot_time_duration,
+        max_la_iterations=config.max_la_iterations,
+    )
+
+    # パラメータの保存
+    export_config_to_csv(config, config.output_dir)
+
     plot_sls_metrics(
         os.path.join(config.output_dir, "detailed_results.csv"), config.output_dir
     )
 
     print(f"\nすべての結果が {config.output_dir} に保存されました。")
+
+
+def export_config_to_csv(config, output_dir):
+    """
+    設定パラメータをCSVに保存する
+    """
+    import csv
+    from dataclasses import asdict
+
+    csv_path = os.path.join(output_dir, "simulation_parameters.csv")
+    try:
+        # dataclassから辞書へ変換（再帰的ではないが、Configはフラットに近い）
+        # SimulationCommonConfigの継承分も含めるため asdict が便利
+        config_dict = asdict(config)
+
+        # 不要なオブジェクト（PanelArray等）は除外または文字列表現にする
+        # PanelArrayはシリアライズできない可能性が高いので、文字列表現にするか除外
+        filtered_dict = {}
+        for k, v in config_dict.items():
+            if k in ["bs_array", "ut_array"]:
+                filtered_dict[k] = str(v)
+            else:
+                filtered_dict[k] = v
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Parameter", "Value"])
+            for key, value in filtered_dict.items():
+                writer.writerow([key, value])
+        print(f"パラメータCSVを保存しました: {csv_path}")
+
+    except Exception as e:
+        print(f"Warning: Failed to export config to CSV: {e}")
 
 
 if __name__ == "__main__":

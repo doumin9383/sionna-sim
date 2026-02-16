@@ -6,105 +6,122 @@ import numpy as np
 
 def plot_sls_metrics(csv_path, output_dir):
     """
-    csv_path: detailed_results.csv へのパス
-    output_dir: 図の保存先
+    SLSシミュレーション結果（CSV）から各種メトリクスをプロットする (Matplotlib版)
     """
-    print(f"可視化を実行中... 保存先: {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    if not os.path.exists(csv_path):
-        print(f"Error: {csv_path} not found.")
+    print(f"Plotting metrics from {csv_path}...")
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print("CSV file not found.")
         return
 
-    df = pd.read_csv(csv_path)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Throughput & SINR CDF
-    plt.figure(figsize=(12, 5))
-
-    plt.subplot(1, 2, 1)
-    if "Throughput_Mbps" in df:
-        sorted_data = np.sort(df["Throughput_Mbps"])
+    # 1. CDF Plots
+    def plot_cdf(data, label, filename, xlabel):
+        sorted_data = np.sort(data)
         yvals = np.arange(len(sorted_data)) / float(len(sorted_data))
+        plt.figure(figsize=(10, 6))
         plt.plot(sorted_data, yvals)
-        plt.title("Throughput CDF")
-        plt.xlabel("Throughput [Mbps]")
+        plt.title(f"CDF of {label}")
+        plt.xlabel(xlabel)
         plt.ylabel("CDF")
         plt.grid(True)
+        plt.savefig(os.path.join(output_dir, filename))
+        plt.close()
 
-    plt.subplot(1, 2, 2)
-    if "SINR_dB" in df:
-        sorted_data = np.sort(df["SINR_dB"])
-        yvals = np.arange(len(sorted_data)) / float(len(sorted_data))
-        plt.plot(sorted_data, yvals)
-        plt.axvline(x=0, color="r", linestyle="--", label="0dB")
-        plt.title("SINR CDF")
-        plt.xlabel("SINR [dB]")
-        plt.ylabel("CDF")
+    if "Throughput_Mbps" in df.columns:
+        plot_cdf(
+            df["Throughput_Mbps"],
+            "Throughput",
+            "cdf_throughput.png",
+            "Throughput [Mbps]",
+        )
+
+    if "SINR_dB" in df.columns:
+        plot_cdf(df["SINR_dB"], "SINR", "cdf_sinr.png", "SINR [dB]")
+
+    # 2. Topology Visualization
+    if "UE_Pos_X" in df.columns and "BS_Pos_X" in df.columns:
+        plt.figure(figsize=(10, 10))
+        # BS Positions (Unique)
+        bs_df = df[["BS_Pos_X", "BS_Pos_Y", "BS_ID"]].drop_duplicates()
+        plt.scatter(
+            bs_df["BS_Pos_X"], bs_df["BS_Pos_Y"], marker="^", s=100, c="red", label="BS"
+        )
+
+        # UE Positions (Drop 0)
+        drop0_df = df[df["Drop_ID"] == 0]
+        plt.scatter(
+            drop0_df["UE_Pos_X"],
+            drop0_df["UE_Pos_Y"],
+            marker="o",
+            s=30,
+            alpha=0.5,
+            label="UE",
+        )
+
+        plt.title("Node Topology (Drop 0)")
+        plt.xlabel("X Position [m]")
+        plt.ylabel("Y Position [m]")
+        plt.axis("equal")
+        plt.legend()
         plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "topology_drop0.png"))
+        plt.close()
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "cdf_metrics.png"))
-    plt.close()
-
-    # 2. MCS & Beam Distribution
-    plt.figure(figsize=(12, 5))
-
-    plt.subplot(1, 2, 1)
-    if "MCS_Index" in df:
-        df["MCS_Index"].hist(bins=range(30), rwidth=0.8, align="left")
+    # 3. Box Plots
+    if "MCS_Index" in df.columns:
+        plt.figure(figsize=(12, 6))
+        plt.boxplot([df["MCS_Index"]], vert=False)  # Simple single boxplot
         plt.title("MCS Index Distribution")
         plt.xlabel("MCS Index")
+        plt.savefig(os.path.join(output_dir, "box_mcs.png"))
+        plt.close()
+
+    if "Rank" in df.columns:
+        plt.figure(figsize=(8, 6))
+        counts = df["Rank"].value_counts().sort_index()
+        plt.bar(counts.index, counts.values)
+        plt.title("Rank Distribution")
+        plt.xlabel("Rank")
         plt.ylabel("Count")
+        plt.savefig(os.path.join(output_dir, "hist_rank.png"))
+        plt.close()
+
+    # 4. Scatter Plots
+    if "SINR_dB" in df.columns and "Throughput_Mbps" in df.columns:
+        plt.figure(figsize=(10, 6))
+        plt.scatter(df["SINR_dB"], df["Throughput_Mbps"], alpha=0.3)
+        plt.title("SINR vs Throughput")
+        plt.xlabel("SINR [dB]")
+        plt.ylabel("Throughput [Mbps]")
         plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "scatter_sinr_throughput.png"))
+        plt.close()
 
-    plt.subplot(1, 2, 2)
-    if "Beam_Index" in df:
-        df["Beam_Index"].value_counts().sort_index().plot(kind="bar")
-        plt.title("Beam Usage Distribution")
-        plt.xlabel("Beam Index")
-        plt.ylabel("Count")
+    # LA Convergence
+    if "LA_Iter_ID" in df.columns:
+        iter_metrics = (
+            df.groupby("LA_Iter_ID")[["SINR_dB", "Throughput_Mbps"]]
+            .mean()
+            .reset_index()
+        )
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(iter_metrics["LA_Iter_ID"], iter_metrics["SINR_dB"], marker="o")
+        plt.title("Average SINR Convergence over LA Iterations")
+        plt.xlabel("LA Iteration")
+        plt.ylabel("Average SINR [dB]")
         plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "convergence_sinr.png"))
+        plt.close()
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "distribution_metrics.png"))
-    plt.close()
-
-    # 3. Simple Analysis Report
-    report_path = os.path.join(output_dir, "analysis_summary.txt")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("=== SLS Simulation Analysis Summary ===\n")
-        f.write(f"Total Samples: {len(df)}\n")
-        f.write(f"Avg Throughput: {df['Throughput_Mbps'].mean():.4f} Mbps\n")
-        if "SINR_dB" in df:
-            f.write(f"Avg SINR: {df['SINR_dB'].mean():.2f} dB\n")
-            f.write(f"5th percentile SINR: {df['SINR_dB'].quantile(0.05):.2f} dB\n")
-
-        f.write("\n--- Potential Issues ---\n")
-        if df["Throughput_Mbps"].mean() < 1.0:
-            f.write("[CAUTION] Throughput is very low (< 1 Mbps).\n")
-            if df["SINR_dB"].mean() < 5:
-                f.write(" -> Reason: SINR seems to be the bottleneck (Avg < 5dB).\n")
-                if "Interference_Power_dBm" in df:
-                    avg_i = df["Interference_Power_dBm"].mean()
-                    f.write(f" -> Avg Interference Power: {avg_i:.2f} dBm\n")
-            elif df["MCS_Index"].mean() < 2:
-                f.write(" -> Reason: MCS is stuck at 0 or 1 despite OK SINR.\n")
-
-        if "Beam_Index" in df:
-            unique_beams = df["Beam_Index"].nunique()
-            f.write(f"\nUnique Beams used: {unique_beams}\n")
-            if unique_beams == 1:
-                f.write(
-                    "[WARNING] Only 1 beam type is used. Beam management might be stuck.\n"
-                )
-
-    print(f"簡易解析レポートを保存しました: {report_path}")
+    print(f"Plots saved to {output_dir}")
 
 
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1:
-        csv_path = sys.argv[1]
-        output_dir = os.path.dirname(csv_path)
-        plot_sls_metrics(csv_path, output_dir)
+    if len(sys.argv) > 2:
+        plot_sls_metrics(sys.argv[1], sys.argv[2])
