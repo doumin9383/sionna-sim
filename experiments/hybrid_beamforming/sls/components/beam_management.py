@@ -283,11 +283,30 @@ class BeamSelector(Block):
             # [B, U, ant_per_panel, 1]
             w_panel_per_ut = tf.expand_dims(w_selected, axis=-1)
 
-        # 3. ユーザーをパネルにマッピング
-        eye_ut = tf.eye(num_ut, num_columns=num_panels, dtype=self.cdtype)
+        # 3. ユーザーをパネルにマッピング (Round-robin)
+        # ユーザー k は パネル j に割り当てられる (k = j % num_ut)
+        # つまり、パネル j は ユーザー (j % num_ut) を向く
+        # eye_ut: [num_ut, num_panels] -> パネル列に対応するユーザー行が1
+        # 以前: eye(num_ut, num_panels) -> users > panels の場合におかしくなる、users < panels の場合にパネルが余る
+
+        # Round-robin mapping matrix [num_ut, num_panels]
+        # map[u, p] = 1 if u == p % num_ut else 0
+        panel_indices = tf.range(num_panels)
+        user_indices_for_panel = panel_indices % num_ut
+
+        # indices to updates
+        indices = tf.stack([user_indices_for_panel, panel_indices], axis=1)  # [P, 2]
+        updates = tf.ones([num_panels], dtype=self.cdtype)
+        map_matrix = tf.scatter_nd(indices, updates, [num_ut, num_panels])
+
+        # w_diag: [Batch, U, P, Ant_p, 2]
+        # w_panel_per_ut: [B, U, Ant_p, 2]
+        # map_matrix: [U, P] -> reshape [1, U, P, 1, 1]
         w_diag = tf.expand_dims(w_panel_per_ut, 2) * tf.reshape(
-            eye_ut, [1, num_ut, num_panels, 1, 1]
+            map_matrix, [1, num_ut, num_panels, 1, 1]
         )
+
+        # ユーザー次元を縮約 -> 各パネルが担当する重みが残る
         w_per_panel = tf.reduce_sum(w_diag, axis=1)  # [B, P, Ant_p, 2]
 
         # 4. 全パネルを結合して巨大な行列にする
