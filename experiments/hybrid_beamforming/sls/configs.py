@@ -29,6 +29,8 @@ class SLSConfig(SimulationCommonConfig):
     )
     num_layers: int = 4  # Number of layers for spatial multiplexing
     batch_size_ut: int = 1  # UT batch size for memory management
+    max_la_iterations: int = 5  # Max iterations for MPR/LA convergence
+    num_symbols_per_slot: int = 14  # Number of symbols in a slot for throughput scaling
 
     # Beam Management
     beambook_oversampling_factor: int = 4

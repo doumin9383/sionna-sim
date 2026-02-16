@@ -55,19 +55,22 @@ def run_test():
         avg_throughput_mbps = tf.reduce_mean(total_throughput_bps) / 1e6
         print(f"平均ネットワークスループット: {avg_throughput_mbps:.2f} Mbps")
 
-    # Simple CSV export for legacy plotting compatibility
-    try:
-        csv_path = os.path.join(config.output_dir, "simulation_results.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Slot", "Average_Throughput_bps"])
-            # Writing total network throughput per slot
-            tput_vals = total_throughput_bps.numpy()
-            for i, val in enumerate(tput_vals):
-                writer.writerow([i, val])
-        print(f"サマリーCSVを保存しました: {csv_path}")
-    except Exception as e:
-        print(f"サマリーCSVの保存に失敗しました: {e}")
+    # Advanced Analysis and Visualization
+    print("\n詳細解析を実行します...")
+    from experiments.hybrid_beamforming.sls.analysis.export_detailed import (
+        export_sls_data,
+    )
+    from experiments.hybrid_beamforming.sls.analysis.visualize_sls import (
+        plot_sls_metrics,
+    )
+
+    # CSV出力と可視化
+    export_sls_data(history, config.output_dir)
+    plot_sls_metrics(
+        os.path.join(config.output_dir, "detailed_results.csv"), config.output_dir
+    )
+
+    print(f"\nすべての結果が {config.output_dir} に保存されました。")
 
 
 if __name__ == "__main__":

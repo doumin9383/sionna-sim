@@ -238,7 +238,8 @@ class BeamSelector(Block):
         best_beam_idx = tf.argmax(beam_power, axis=-1, output_type=tf.int32)
 
         # --- 5. 全パネルへのマッピング (BS単位の行列生成) ---
-        return self._construct_full_precoder(best_beam_idx)
+        w_rf = self._construct_full_precoder(best_beam_idx)
+        return w_rf, best_beam_idx
 
     def _construct_full_precoder(self, best_beam_idx):
         """

@@ -53,6 +53,8 @@ def init_result_history(batch_size, num_slots, num_bs, num_ut_per_sector):
         "p_cmax_dbm",
         "rank",
         "mpr_db",
+        "beam_idx",
+        "interference_power",
     ]:
         hist[key] = tf.TensorArray(
             size=num_slots,
@@ -78,6 +80,8 @@ def record_results(
     p_cmax_dbm=None,
     rank=None,
     mpr_db=None,
+    beam_idx=None,
+    interference_power=None,
     shape=None,
 ):
     """Record results of last slot"""
@@ -95,6 +99,8 @@ def record_results(
                 "p_cmax_dbm",
                 "rank",
                 "mpr_db",
+                "beam_idx",
+                "interference_power",
             ],
             [
                 pathloss_serving_cell,
@@ -108,6 +114,8 @@ def record_results(
                 p_cmax_dbm,
                 rank,
                 mpr_db,
+                beam_idx,
+                interference_power,
             ],
         ):
             if value is not None:

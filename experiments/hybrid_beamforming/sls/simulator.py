@@ -436,8 +436,13 @@ class SystemSimulator(Block):
             h_bs_permuted,
             [-1, N_UT_Sec, tf.shape(h_bs_permuted)[3], self.num_bs_ant, FFT],
         )
-        w_rf_bs_flat = self.beam_selector(h_selector_input, self.config.bs_array)
+        w_rf_bs_flat, best_beam_idx = self.beam_selector(
+            h_selector_input, self.config.bs_array
+        )
         w_rf_bs = tf.reshape(w_rf_bs_flat, [B, N_BS, self.num_bs_ant, -1])
+
+        # Store best_beam_idx for recording
+        self.last_best_beam_idx = best_beam_idx
 
         # UE側のアナログビーム（Identity）
         ue_ports = (
@@ -450,7 +455,7 @@ class SystemSimulator(Block):
         else:
             self.channel_interface.set_analog_weights(w_rf=w_rf_bs, a_rf=a_rf_ue)
 
-        return w_rf_bs
+        return w_rf_bs, best_beam_idx
 
     def _compute_digital_weights(self, granularity="subband"):
         """SVDベースのデジタル重みを粒度（granularity）に応じて計算する"""
@@ -792,10 +797,11 @@ class SystemSimulator(Block):
             "throughput_per_user": throughput_per_user,
             "mcs_idx_avg": mcs_idx_avg,
             "rank": tf.fill([B, N_UT], tf.cast(rank, tf.float32)),
+            "interference_power": tf.reduce_mean(i_total, axis=[-1, -2]),
         }
 
     def _record_drop(
-        self, hist, drop_idx, results, pl_db, p_tx_watt, p_cmax_dbm, mpr_db
+        self, hist, drop_idx, results, pl_db, p_tx_watt, p_cmax_dbm, mpr_db, beam_idx
     ):
         """ドロップごとの結果を履歴に記録する"""
 
@@ -827,6 +833,8 @@ class SystemSimulator(Block):
             p_cmax_dbm=match_hist_shape(p_cmax_dbm),
             rank=match_hist_shape(results["rank"]),
             mpr_db=match_hist_shape(mpr_db),
+            beam_idx=match_hist_shape(beam_idx),
+            interference_power=match_hist_shape(results["interference_power"]),
             pf_metric=tf.reshape(
                 match_hist_shape(tf.zeros([self.batch_size, self.num_ut])),
                 [self.batch_size, self.num_bs, 1, 1, self.num_ut_per_sector],
@@ -845,7 +853,7 @@ class SystemSimulator(Block):
             self._setup_drop_topology(drop_idx)
 
             # 2. アナログビーム選択
-            self._select_analog_beams()
+            w_rf_bs, w_rf_bs_idx = self._select_analog_beams()
 
             # 3. デジタル重み計算 (SVD)
             # 粒度は self.precoding_granularity を使用
@@ -863,7 +871,14 @@ class SystemSimulator(Block):
 
             # 6. 結果の記録
             hist = self._record_drop(
-                hist, drop_idx, results, pl_db, p_tx_watt, p_cmax_dbm, mpr_db
+                hist,
+                drop_idx,
+                results,
+                pl_db,
+                p_tx_watt,
+                p_cmax_dbm,
+                mpr_db,
+                w_rf_bs_idx,
             )
 
         # 履歴をTensorに変換
