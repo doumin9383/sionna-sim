@@ -201,12 +201,51 @@ class ExternalPaths(Paths):
             # Doppler (optional)
             self._doppler = load_angle("doppler")
 
+            # --- LSP Loading/Calculation ---
+            # SLS needs explicit LSPs (Pathloss, Shadowing, K-Factor)
+            self._lsps = {}
+
+            # 1. Try to load explicit LSPs from dataset
+            for key in ["pathloss", "shadow_fading", "k_factor"]:
+                data = get_data(key)
+                if data is not None:
+                    # LSPs are usually [RX, TX] or [1, RX, TX]
+                    # We keep them as numpy for now to match SLS expectations
+                    self._lsps[key] = data
+
+            # 2. Fallback for pathloss if missing
+            # According to spec.md, path_gains or path_gain are based on Ptx = 1W (30dBm)
+            if "pathloss" not in self._lsps:
+                if "path_gains" in store:
+                    # path_gains: [RX, TX, Paths, 2, 2]
+                    # Total Rx power (normalized to 1W Tx) = Sum(|path_gains|^2)
+                    pg = get_data("path_gains")
+                    rx_power_linear = np.sum(np.abs(pg) ** 2, axis=(-3, -2, -1))
+                elif "path_gain" in store:
+                    # path_gain: [RX, TX, Paths]
+                    # path_gain is assumed to be power linear
+                    pg = get_data("path_gain")
+                    rx_power_linear = np.sum(pg, axis=-1)
+                else:
+                    rx_power_linear = None
+
+                if rx_power_linear is not None:
+                    # Pathloss [dB] = Ptx[dBm] - Prx[dBm] = 30 - 10*log10(Prx)
+                    # Use a small epsilon to avoid log(0)
+                    pl_db = 30.0 - 10.0 * np.log10(np.maximum(rx_power_linear, 1e-15))
+                    self._lsps["pathloss"] = pl_db
+
             # Set valid flag
             self._valid = dr.full(mi.TensorXb, True, self._tau.shape)
             self._paths_components_built = False
 
         except Exception as e:
             raise RuntimeError(f"Failed to load external paths from dataset: {e}")
+
+    @property
+    def lsps(self) -> dict:
+        """Returns the dictionary of LSPs (Pathloss, Shadowing, K-Factor, etc.)"""
+        return self._lsps
 
     def _build_from_buffer(self):
         """

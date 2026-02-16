@@ -101,27 +101,43 @@ class MeshBasedLoader(ExternalLoaderBase):
         """Returns the coordinate system."""
         return self._geo
 
-    def get_paths(self, ut_coordinates_utm: Union[np.ndarray, tf.Tensor]) -> Paths:
+    def get_paths(self, ut_info: Union[np.ndarray, tf.Tensor, List[int]]) -> Paths:
         """
-        Finds the nearest mesh points and returns an ExternalPaths object.
+        Finds the nearest mesh points (if coordinates given) or uses indices directly,
+        and returns an ExternalPaths object.
+
+        Args:
+            ut_info (Union[np.ndarray, tf.Tensor, List[int]]):
+                Either:
+                - User terminal coordinates [num_rx, 3] (float)
+                - Mesh indices [num_rx] (int)
         """
-        if isinstance(ut_coordinates_utm, tf.Tensor):
-            ut_coords = ut_coordinates_utm.numpy()
+        if isinstance(ut_info, tf.Tensor):
+            ut_info = ut_info.numpy()
         else:
-            ut_coords = ut_coordinates_utm
+            ut_info = np.array(ut_info)
 
-        # Convert UTM to Local for KDTree query
-        ut_coords_local = self._geo.utm_to_local(ut_coords)
+        # 1. Determine if input is indices or coordinates
+        # If 1D and integer, assume indices
+        if ut_info.ndim == 1 and np.issubdtype(ut_info.dtype, np.integer):
+            indices = ut_info
+        # If 2D [N, 3], assume coordinates
+        elif ut_info.ndim == 2 and ut_info.shape[1] == 3:
+            # Convert UTM to Local for KDTree query
+            ut_coords_local = self._geo.utm_to_local(ut_info)
 
-        search_coords = (
-            ut_coords_local if self._use_3d_search else ut_coords_local[:, :2]
-        )
+            search_coords = (
+                ut_coords_local if self._use_3d_search else ut_coords_local[:, :2]
+            )
 
-        # Find nearest mesh point indices
-        _, indices = self._tree.query(search_coords)
+            # Find nearest mesh point indices
+            _, indices = self._tree.query(search_coords)
+        else:
+            raise ValueError(
+                f"ut_info must be either [N, 3] coordinates or [N] indices. Got shape {ut_info.shape}"
+            )
 
         # Instantiate ExternalPaths with the dataset and mapped indices
-        # ExternalPaths will perform the sliced read using these indices.
         return ExternalPaths(
             dataset=self._dataset,
             scene=self._scene,
