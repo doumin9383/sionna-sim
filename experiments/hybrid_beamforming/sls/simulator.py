@@ -72,6 +72,7 @@ class SystemSimulator(Block):
             num_ofdm_symbols=1,  # チャネル生成のためだけに使うので1でOK
             fft_size=self.config.num_subcarriers,
             subcarrier_spacing=self.config.subcarrier_spacing,
+            cyclic_prefix_length=config.cyclic_prefix_length,
             # pilot_pattern=rg_config.pilot_pattern,
             # pilot_ofdm_symbol_indices=rg_config.pilot_ofdm_symbol_indices,
         )
@@ -176,7 +177,20 @@ class SystemSimulator(Block):
         # Instantiate SLS components
         self.mpr_model = MPRModel(csv_path=config.mpr_table_path)
         self.power_control = PowerControl(p_power_class=config.ut_max_power_dbm)
-        self.mcs_adapter = MCSLinkAdaptation()
+
+        is_dfts = config.waveform == "DFT-s-OFDM"
+        # DFT-s-OFDM かつ 専用テーブルフラグTrue の場合のみ TP用テーブルを使用
+        use_tp_table = is_dfts and config.use_transform_precoding_mcs_table
+
+        self.mcs_adapter = MCSLinkAdaptation(
+            table_index=config.mcs_table,
+            is_pusch=(config.direction == "uplink"),
+            transform_precoding=use_tp_table,
+            pi2bpsk=config.transform_precoding_pi2bpsk,
+        )
+
+        # Detailed logs buffer
+        self.detailed_logs = []
 
         # Instantiate Beam Manager
         self.beam_selector = BeamSelector(
@@ -586,7 +600,13 @@ class SystemSimulator(Block):
         return w_ut_dig_full, w_bs_dig_full, s_srv_full
 
     def _optimize_rank_allocation(
-        self, w_ut_dig_full, w_bs_dig_full, s_srv_full, tx_power_dbm_base
+        self,
+        w_ut_dig_full,
+        w_bs_dig_full,
+        s_srv_full,
+        tx_power_dbm_base,
+        drop_idx=0,
+        la_iter=0,
     ):
         """
         反復的なランク選択を実行し、最適なランクと有効なデジタル重みを決定する。
@@ -629,57 +649,79 @@ class SystemSimulator(Block):
                 # ランク r を仮定
                 rank_tensor = tf.fill([B, N_UT], r)
 
-                # 信号電力計算 (SVDの特異値を使用)
-                # s_srv_full: [B, N_UT, N_target, MaxRank]
-                # 先頭 r 個の特異値の二乗和がチャネルゲイン
-                # 実際にはレイヤーごとのSINRが必要
-
                 # 電力割り当て (Equal Power Allocation with MPR Backoff)
-                p_tx_watt, _, _, _ = self._apply_power_control(
+                p_tx_watt, pl_db, mpr_db, p_cmax_dbm = self._apply_power_control(
                     tx_power_dbm_base, rank_tensor
                 )
                 p_layer = p_tx_watt / tf.cast(r, self.rdtype)  # [B, N_UT]
-                p_layer = p_layer[:, :, None, None]  # Broadcasting for [B, N_UT, F, r]
+                p_layer_expanded = p_layer[
+                    :, :, None, None
+                ]  # Broadcasting for [B, N_UT, F, r]
 
                 # 信号電力: P_layer * |s|^2
-                # s_srv_r: [B, N_UT, N_target, r]
                 s_srv_r = s_srv_full[..., :r]
-                s_power = p_layer * tf.square(s_srv_r)
-
-                # SINR計算
-                # 干渉 i_total は現在のネットワーク状態に基づく固定値を使用
-                # i_total: [B, N_UT, N_target] (全レイヤー合計干渉? いや、interference calculationによる)
-                # _compute_interference は [B, N_UT, N_target] を返すと仮定（レイヤー合成後）
-                # 簡易化: 干渉はレイヤー間でwhiteと仮定するか、 worst case をとるか
-                # ここでは i_total をレイヤーあたりに平均化して使用
-
-                # Re-evaluating interference logic:
-                # Interference depends on the Beamforming vectors of interfering UEs.
-                # Since interfering UEs' weights are fixed (w_ut_eff), i_total is fixed per RE.
-                # However, i_total structure in _process_sinr_la was [B, N_UT, N_target] (sum across layers).
-                # To calculate PER-LAYER SINR, we need per-layer interference probability?
-                # Usually standard approximation is i_total_per_layer = i_total / r_interferer? No.
-                # We simply treat i_total as noise+interference floor for all layers.
+                s_power = p_layer_expanded * tf.square(s_srv_r)
 
                 i_floor = i_total + self.no
-                i_floor = tf.expand_dims(i_floor, -1)  # [B, N_UT, N_target, 1]
+                i_floor_expanded = tf.expand_dims(i_floor, -1)  # [B, N_UT, N_target, 1]
 
-                sinr = s_power / i_floor
+                sinr = s_power / i_floor_expanded
                 sinr_db = (
                     10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
                 )
 
                 # MCS & Throughput
-                # MCS adapter vectorization
-                # sinr_db: [B, N_UT, N_target, r]
-                tp_per_re, _ = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+                tp_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(sinr_db)
 
                 # Sum throughput across layers and frequency
-                # tp_per_re: [B, N_UT, N_target, r]
                 total_tp_r = tf.reduce_sum(tp_per_re, axis=[-1, -2])
 
                 if self.config.use_rbg_granularity:
                     total_tp_r *= tf.cast(self.rbg_size_sc, self.rdtype)
+
+                # Scale by data symbols
+                total_tp_r *= tf.cast(self.config.num_data_symbols, self.rdtype)
+
+                # Detailed Logging
+                if self.config.export_detailed_logs:
+                    # Collect metrics for each UT in the batch
+                    # This is slightly slow due to python conversion, but intended for debugging
+                    for b in range(B):
+                        for u in range(N_UT):
+                            self.detailed_logs.append(
+                                {
+                                    "drop_idx": drop_idx,
+                                    "la_iter": la_iter,
+                                    "rank_iter": i,
+                                    "ut_idx": u,
+                                    "batch_idx": b,
+                                    "candidate_rank": r,
+                                    "tx_power_dbm": (
+                                        float(10 * np.log10(p_tx_watt[b, u]) + 30)
+                                        if p_tx_watt[b, u] > 0
+                                        else -100
+                                    ),
+                                    "mpr_db": float(mpr_db[b, u]),
+                                    "pathloss_db": float(pl_db[b, u]),
+                                    "sinr_db_avg": float(
+                                        tf.reduce_mean(sinr_db[b, u, :, :])
+                                    ),
+                                    "mcs_idx_avg": float(
+                                        tf.reduce_mean(
+                                            tf.cast(mcs_idx[b, u, :, :], tf.float32)
+                                        )
+                                    ),
+                                    "throughput_bits": float(total_tp_r[b, u]),
+                                    "interference_power_dbm": (
+                                        float(
+                                            10 * np.log10(tf.reduce_mean(i_total[b, u]))
+                                            + 30
+                                        )
+                                        if tf.reduce_mean(i_total[b, u]) > 0
+                                        else -100
+                                    ),
+                                }
+                            )
 
                 # Update best rank
                 is_better = total_tp_r > max_throughput
@@ -894,7 +936,7 @@ class SystemSimulator(Block):
             )
 
         # 3. MPR (Maximum Power Reduction)
-        mpr_db = self.mpr_model.get_mpr("CP-OFDM", rank)
+        mpr_db = self.mpr_model.get_mpr(self.config.waveform, rank)
         if not tf.is_tensor(mpr_db):
             mpr_db = tf.fill([B, N_UT], tf.cast(mpr_db, tf.float32))
 
@@ -917,12 +959,19 @@ class SystemSimulator(Block):
 
         return p_tx_watt, pl_db, mpr_db, p_cmax_dbm_tensor
 
-    def _process_sinr_and_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt_base):
+    def _process_sinr_and_la(
+        self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt_base, drop_idx=0, la_iter=0
+    ):
         """SINR計算、干渉計算、Link Adaptationを実行する (Rank Adaptation含む)"""
 
         # Iterative Rank Optimization
         final_rank, w_ut_opt, w_bs_opt = self._optimize_rank_allocation(
-            w_ut_dig, w_bs_dig, s_srv, p_tx_watt_base
+            w_ut_dig,
+            w_bs_dig,
+            s_srv,
+            p_tx_watt_base,
+            drop_idx=drop_idx,
+            la_iter=la_iter,
         )
 
         # 最終的なパフォーマンス評価 (Optimize済みランクと重みを使用)
@@ -1208,7 +1257,12 @@ class SystemSimulator(Block):
                 # 5. SINR計算 & Link Adaptation (Rank自律選択)
                 # ※ 現在の実装ではRankは固定だが、スループット計算は修正済み
                 results_iter = self._process_sinr_and_la(
-                    w_ut_dig, w_bs_dig, s_srv, p_tx_watt_iter
+                    w_ut_dig,
+                    w_bs_dig,
+                    s_srv,
+                    p_tx_watt_iter,
+                    drop_idx=drop_idx,
+                    la_iter=la_iter,
                 )
 
                 # ランクの更新 (MPRに影響を与えるため、次回の反復で使用)

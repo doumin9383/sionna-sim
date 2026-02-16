@@ -24,6 +24,9 @@ class SLSConfig(SimulationCommonConfig):
 
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
+    waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
+    cyclic_prefix_length: int = 0  # CP length for ResourceGrid
+    export_detailed_logs: bool = False  # If True, export detailed rank selection logs
     num_neighbors: int = (
         4  # For spatial masking: num BS per UT to calculate channel for
     )

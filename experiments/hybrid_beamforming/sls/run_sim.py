@@ -82,6 +82,17 @@ def run_test():
     # パラメータの保存
     export_config_to_csv(config, config.output_dir)
 
+    # 詳細ログ（総当り結果）の保存
+    if hasattr(sim, "detailed_logs") and sim.detailed_logs:
+        import pandas as pd
+
+        detailed_log_path = os.path.join(
+            config.output_dir, "detailed_rank_selection.csv"
+        )
+        df_detailed = pd.DataFrame(sim.detailed_logs)
+        df_detailed.to_csv(detailed_log_path, index=False)
+        print(f"詳細なランク選択ログを保存しました: {detailed_log_path}")
+
     plot_sls_metrics(
         os.path.join(config.output_dir, "detailed_results.csv"), config.output_dir
     )
