@@ -5,10 +5,11 @@ import pandas as pd
 import tensorflow as tf
 
 
-def export_sls_data(history, output_dir):
+def export_sls_data(history, output_dir, slot_duration=1e-3):
     """
     history: シミュレータから返された辞書（Tensorの集合）
     output_dir: CSV出力先のディレクトリ
+    slot_duration: スループット計算用のスロット期間 [sec]
     """
     print(f"詳細データをエクスポート中... 出力先: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
@@ -43,7 +44,7 @@ def export_sls_data(history, output_dir):
 
     df = pd.DataFrame(
         {
-            "Slot_ID": slots_idx,
+            "Drop_ID": slots_idx,
             "Batch_ID": batch_idx,
             "BS_ID": bs_idx,
             "UE_Sector_ID": ut_sector_idx,
@@ -83,8 +84,8 @@ def export_sls_data(history, output_dir):
         )
 
     if "Throughput_Bits" in df:
-        # スロットあたりのスループット (Mbps) - 仮に1msスロットとする
-        df["Throughput_Mbps"] = df["Throughput_Bits"] / 1e6 * 1000.0
+        # Mbps単位に変換: (Bits / Duration) / 1e6
+        df["Throughput_Mbps"] = (df["Throughput_Bits"] / slot_duration) / 1e6
 
     # CSV保存
     csv_path = os.path.join(output_dir, "detailed_results.csv")

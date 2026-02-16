@@ -32,28 +32,27 @@ class MPRModel:
     def get_mpr(self, waveform, rank):
         """
         Returns MPR in dB for the given waveform and rank.
-
-        Args:
-            waveform (str): "CP-OFDM" or "DFT-s-OFDM"
-            rank (int): Transmission rank
-
-        Returns:
-            float: MPR value in dB
+        Supports both scalar and tensor inputs for rank.
         """
         if not self.mpr_table:
-            return 0.0
+            return tf.zeros_like(rank, dtype=tf.float32) if tf.is_tensor(rank) else 0.0
 
-        # Implement lookup logic based on table structure
-        # Expected columns: "waveform", "rank", "mpr_db"
-        try:
-            rank_str = str(rank)
+        def lookup_mpr(r):
+            rank_str = str(int(r))
             for row in self.mpr_table:
-                # Check match (assuming case-insensitive for waveform might be safer, but exact for now)
                 if row.get("waveform") == waveform and row.get("rank") == rank_str:
                     return float(row.get("mpr_db", 0.0))
+            return 0.0
 
-            # Fallback if specific entry not found
-            return 0.0
-        except Exception as e:
-            print(f"Error querying MPR table: {e}")
-            return 0.0
+        if tf.is_tensor(rank):
+            # Use tf.map_fn or simply vectorize the lookup if table is small
+            # For simplicity with the existing CSV-based table, we use tf.py_function
+            mpr = tf.py_function(
+                func=lambda r: np.vectorize(lookup_mpr)(r.numpy()),
+                inp=[rank],
+                Tout=tf.float32,
+            )
+            mpr.set_shape(rank.shape)
+            return mpr
+        else:
+            return lookup_mpr(rank)

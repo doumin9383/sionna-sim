@@ -50,9 +50,17 @@ def run_test():
     # num_decoded_bits: [slots, batch, bs, ut_per_sector]
     if "num_decoded_bits" in history:
         bits = history["num_decoded_bits"]
-        # bps単位のスループット合計
-        total_throughput_bps = tf.reduce_sum(bits, axis=[1, 2, 3])
-        avg_throughput_mbps = tf.reduce_mean(total_throughput_bps) / 1e6
+        # history["num_decoded_bits"] は 1スロット分（14シンボル等）にスケール済み
+        # 1スロットの期間 = (1シンボル期間) * (シンボル数/スロット)
+        actual_slot_duration = sim.slot_duration * (
+            config.num_symbols_per_slot / 1.0
+        )  # sim.slot_durationは1シンボル分
+
+        # Mbps単位のスループット計算: (全UEの合計ビット数 / スロット期間[s]) / 1e6
+        total_bits_per_slot = tf.reduce_sum(bits, axis=[1, 2, 3])
+        avg_throughput_mbps = (
+            tf.reduce_mean(total_bits_per_slot / actual_slot_duration) / 1e6
+        )
         print(f"平均ネットワークスループット: {avg_throughput_mbps:.2f} Mbps")
 
     # Advanced Analysis and Visualization
@@ -65,7 +73,7 @@ def run_test():
     )
 
     # CSV出力と可視化
-    export_sls_data(history, config.output_dir)
+    export_sls_data(history, config.output_dir, slot_duration=actual_slot_duration)
     plot_sls_metrics(
         os.path.join(config.output_dir, "detailed_results.csv"), config.output_dir
     )

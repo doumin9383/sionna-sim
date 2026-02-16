@@ -585,7 +585,7 @@ class SystemSimulator(Block):
 
         return w_ut_dig_full, w_bs_dig_full, s_srv_full
 
-    def _apply_power_control(self, tx_power_dbm):
+    def _apply_power_control(self, tx_power_dbm, rank):
         """パスロスと最大電力制約を考慮した送信電力を計算する"""
         B = self.batch_size
         N_UT = self.num_ut
@@ -617,19 +617,23 @@ class SystemSimulator(Block):
             )
 
         # 3. MPR (Maximum Power Reduction)
-        mpr_val = self.mpr_model.get_mpr("CP-OFDM", self.config.num_layers)
-        mpr_db = tf.fill([B, N_UT], tf.cast(mpr_val, tf.float32))
+        mpr_db = self.mpr_model.get_mpr("CP-OFDM", rank)
+        if not tf.is_tensor(mpr_db):
+            mpr_db = tf.fill([B, N_UT], tf.cast(mpr_db, tf.float32))
 
         # 4. Tx Power 計算
         if self.direction == "uplink":
             num_rbs = self.resource_grid.num_effective_subcarriers / 12.0
-            p_tx_dbm = self.power_control.calculate_tx_power(pl_db, num_rbs, mpr_val)
-            p_cmax_dbm = self.ut_max_power_dbm - mpr_val
+            p_tx_dbm = self.power_control.calculate_tx_power(pl_db, num_rbs, mpr_db)
+            p_cmax_dbm = self.ut_max_power_dbm - mpr_db
         else:
             p_tx_dbm = tx_power_dbm
             p_cmax_dbm = self.bs_max_power_dbm
 
-        p_cmax_dbm_tensor = tf.fill([B, N_UT], tf.cast(p_cmax_dbm, tf.float32))
+        if not tf.is_tensor(p_cmax_dbm):
+            p_cmax_dbm_tensor = tf.fill([B, N_UT], tf.cast(p_cmax_dbm, tf.float32))
+        else:
+            p_cmax_dbm_tensor = tf.cast(p_cmax_dbm, tf.float32)
         p_tx_watt = dbm_to_watt(p_tx_dbm)
         if len(p_tx_watt.shape) == 0:
             p_tx_watt = tf.broadcast_to(p_tx_watt, [B, N_UT])
@@ -638,13 +642,22 @@ class SystemSimulator(Block):
 
     def _process_sinr_and_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt):
         """SINR計算、干渉計算、Link Adaptationを実行する"""
+        rank = self.config.num_layers
+        res = self._process_single_rank_la(w_ut_dig, w_bs_dig, s_srv, p_tx_watt, rank)
+
+        # 修正: 1シンボルあたりのビット数 -> 1スロット分にスケール
+        res["throughput_per_user"] *= tf.cast(
+            self.config.num_symbols_per_slot, self.rdtype
+        )
+
+        return res
+
+    def _process_single_rank_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt, rank):
+        """指定されたRankでのSINR計算とLAを実行するコアロジック"""
         B = self.batch_size
         N_BS = self.num_bs
         N_UT = self.num_ut
-        N_UT = self.num_ut
         N_target = self.simulation_freq_res
-
-        rank = self.config.num_layers
 
         # 1. 電力割り当て: レイヤーごとに均等分配
         p_layer = p_tx_watt / tf.cast(rank, self.rdtype)
@@ -652,7 +665,6 @@ class SystemSimulator(Block):
 
         s_power_all = []
         i_total_all = []
-        # [B, N_BS, N_target, rank]
         interference_buffer_bs = tf.zeros([B, N_BS, N_target, rank], dtype=self.rdtype)
 
         batch_size_ut = self.config.batch_size_ut
@@ -662,7 +674,6 @@ class SystemSimulator(Block):
             sliced_neigh_inds = self.neighbor_indices[:, start_ut:end_ut, :]
 
             # 隣接チャネル（ポートドメイン）取得
-            # h_batch_port: [B, BUT, Neighbor, RxP, TxP, Time(1), N_target]
             h_batch_port = self.channel_interface.get_neighbor_channel_info(
                 B,
                 self.ut_loc[:, start_ut:end_ut, :],
@@ -676,50 +687,32 @@ class SystemSimulator(Block):
                 False,
             )
 
-            # 希望信号電力 (Serving link is neighbor 0)
-            # s_srv: [B, N_UT, N_target, rank]
-            # p_layer_expanded: [B, N_UT, 1, 1] -> [B, BUT, 1, rank]
-            s_p = p_layer_expanded[:, start_ut:end_ut] * tf.square(
-                s_srv[:, start_ut:end_ut]
-            )
+            # 希望信号電力
+            s_srv_r = s_srv[:, start_ut:end_ut, :, :rank]
+            s_p = p_layer_expanded[:, start_ut:end_ut] * tf.square(s_srv_r)
             s_power_all.append(s_p)
 
-            # 干渉計算 (Neighbor 1+)
+            # 干渉計算
             neighbor_ids = sliced_neigh_inds[:, :, 1:]
-            # [B, BUT, K-1, f, RxP, TxP]
             h_int = tf.transpose(h_batch_port[:, :, 1:, :, :, 0, :], [0, 1, 2, 5, 3, 4])
 
             if self.direction == "uplink":
-                # v_self: [B, BUT, f, TxP, rank]
-                v_self = w_ut_dig[:, start_ut:end_ut]
-                # u_neighbor: [B, BUT, K-1, f, RxP, rank]
+                v_self = w_ut_dig[:, start_ut:end_ut, :, :, :rank]
                 u_neighbor = tf.gather(
                     w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
                 )
+                u_neighbor = u_neighbor[..., :rank]
 
-                # Heff = U^H * H * V
-                # hv = H * V -> [B, BUT, K-1, f, RxP, rank_tx]
                 hv = tf.einsum("bukfpt,buftx->bukfpx", h_int, v_self)
-                # heff = U^H * hv -> [B, BUT, K-1, f, rank_rx, rank_tx]
-                heff = tf.einsum("bukfpx,bukfpx->bukfx", tf.math.conj(u_neighbor), hv)
-                # Wait, the above einsum reduces RX axis but also Rank axis?
-                # heff should be per-layer.
-                # heff_full = conj(u_neighbor) [B, BUT, K-1, f, RxP, rank_rx] * hv [B, BUT, K-1, f, RxP, rank_tx]
-                # -> [B, BUT, K-1, f, rank_rx, rank_tx]
                 heff_matrix = tf.einsum(
                     "bukfpr,bukfpt->bukfrt", tf.math.conj(u_neighbor), hv
                 )
 
-                # p_leak: layer l of neighbor BS is affected by all layers of this UE
-                # p_leak_l = sum_m |heff_l,m|^2 * p_layer
                 p_leak = p_layer_expanded[
                     :, start_ut:end_ut, :, None, None
                 ] * tf.square(tf.abs(heff_matrix))
-                p_leak_per_layer = tf.reduce_sum(
-                    p_leak, axis=-1
-                )  # [B, BUT, K-1, f, rank_rx]
+                p_leak_per_layer = tf.reduce_sum(p_leak, axis=-1)
 
-                # 干渉の蓄積
                 batch_indices = tf.range(B)[:, None, None]
                 batch_indices = tf.broadcast_to(batch_indices, tf.shape(neighbor_ids))
                 indices = tf.stack(
@@ -732,61 +725,42 @@ class SystemSimulator(Block):
                     tf.reshape(p_leak_per_layer, [-1, N_target, rank]),
                 )
             else:
-                # u_self: [B, BUT, f, RxP, rank]
-                u_self = w_ut_dig[:, start_ut:end_ut]
-                # v_neighbor: [B, BUT, K-1, f, TxP, rank]
+                u_self = w_ut_dig[:, start_ut:end_ut, :, :, :rank]
                 v_neighbor = tf.gather(
                     w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
                 )
+                v_neighbor = v_neighbor[..., :rank]
 
-                # hv = H * V -> [B, BUT, K-1, f, RxP, rank_tx]
                 hv = tf.einsum("bukfpt,bukftx->bukfpx", h_int, v_neighbor)
-                # heff_matrix: [B, BUT, K-1, f, rank_rx, rank_tx]
                 heff_matrix = tf.einsum(
                     "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
                 )
 
-                # p_int_l = sum_m |heff_l,m|^2 * p_layer
                 p_int = p_layer_expanded[:, start_ut:end_ut, :, None, None] * tf.square(
                     tf.abs(heff_matrix)
                 )
-                p_int_per_layer = tf.reduce_sum(
-                    p_int, axis=-1
-                )  # [B, BUT, K-1, f, rank_rx]
+                p_int_per_layer = tf.reduce_sum(p_int, axis=-1)
+                i_total_all.append(tf.reduce_sum(p_int_per_layer, axis=2))
 
-                # UT側での干渉合算: 全ての近隣BSからの干渉を合算
-                i_total_all.append(
-                    tf.reduce_sum(p_int_per_layer, axis=2)
-                )  # [B, BUT, f, rank]
-
-        # 最終SINR
-        s_power = tf.concat(s_power_all, axis=1)  # [B, N_UT, N_target, rank]
+        s_power = tf.concat(s_power_all, axis=1)
         if self.direction == "uplink":
             i_total = tf.gather(
                 interference_buffer_bs,
                 tf.cast(self.serving_bs_ids, tf.int32),
                 axis=1,
                 batch_dims=1,
-            )  # [B, N_UT, N_target, rank]
+            )
         else:
-            i_total = tf.concat(i_total_all, axis=1)  # [B, N_UT, N_target, rank]
+            i_total = tf.concat(i_total_all, axis=1)
 
         sinr = s_power / (i_total + self.no)
         sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
-
-        # Link Adaptation
-        # throughput_vectorized は [sinr] を受け取りスペクトル効率とMCSを返す
-        # sinr: [B, N_UT, N_target, rank]
         capacity_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(sinr_db)
 
-        # RBG単位での計算の場合、各点の容量をRBG全体に適用
         if self.config.use_rbg_granularity:
             capacity_per_re *= tf.cast(self.rbg_size_sc, self.rdtype)
 
-        # 全レイヤー・全サブキャリアの容量を合算
-        # capacity_per_re: [B, N_UT, N_target, rank]
         throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
-        # MCSとSINRの平均を記録
         mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
         sinr_eff_avg = tf.reduce_mean(sinr, axis=[-1, -2])
 
@@ -861,13 +835,36 @@ class SystemSimulator(Block):
                 granularity=self.precoding_granularity
             )
 
-            # 4. 送信電力制御
-            p_tx_watt, pl_db, mpr_db, p_cmax_dbm = self._apply_power_control(
-                tx_power_dbm
+            # --- LA / MPR 反復ループ ---
+            # 初期ランクをセット
+            rank = tf.fill(
+                [self.batch_size, self.num_ut],
+                tf.cast(self.config.num_layers, tf.float32),
             )
 
-            # 5. SINR計算 & Link Adaptation
-            results = self._process_sinr_and_la(w_ut_dig, w_bs_dig, s_srv, p_tx_watt)
+            for la_iter in range(self.config.max_la_iterations):
+                # 4. 送信電力制御 (直前の反復のRankに基づくMPRを適用)
+                p_tx_watt_iter, pl_db_iter, mpr_db_iter, p_cmax_dbm_iter = (
+                    self._apply_power_control(tx_power_dbm, rank)
+                )
+
+                # 5. SINR計算 & Link Adaptation (Rank自律選択)
+                # ※ 現在の実装ではRankは固定だが、スループット計算は修正済み
+                results_iter = self._process_sinr_and_la(
+                    w_ut_dig, w_bs_dig, s_srv, p_tx_watt_iter
+                )
+
+                # ランクの更新 (MPRに影響を与えるため、次回の反復で使用)
+                rank = results_iter["rank"]
+
+                # 収束判定 (RankやMCSに変化がなければ終了、現状は最大回数回すか、簡易的な判定を入れる)
+
+            # 最後の反復結果を保存
+            results = results_iter
+            p_tx_watt = p_tx_watt_iter
+            pl_db = pl_db_iter
+            mpr_db = mpr_db_iter
+            p_cmax_dbm = p_cmax_dbm_iter
 
             # 6. 結果の記録
             hist = self._record_drop(
