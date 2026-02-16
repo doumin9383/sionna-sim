@@ -7,13 +7,16 @@ import zarr
 from tqdm import tqdm
 
 # Add project root to path
+# Add project root to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, "../../../"))
-# sys.path.append(project_root)
+project_root = os.path.abspath(os.path.join(current_dir, "../"))
+sys.path.append(project_root)
 
 from sionna.sys import gen_hexgrid_topology
 from sionna.phy.channel.tr38901 import UMi, UMa, RMa
-from experiments.hybrid_beamforming.sls.my_configs import HybridSLSConfig
+
+# Update import path from experiments...
+from experiments.hybrid_beamforming.sls.configs import SLSConfig
 
 
 def generate_dataset(output_path, num_drops=10):
@@ -214,4 +217,27 @@ def generate_dataset(output_path, num_drops=10):
 
 
 if __name__ == "__main__":
-    generate_dataset("data/processed/calibration_sls.zarr", num_drops=2)
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic channel dataset using Sionna."
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="data/processed/calibration_sls.zarr",
+        help="Path to save the generated Zarr dataset.",
+    )
+    parser.add_argument(
+        "--num_drops",
+        type=int,
+        default=2,
+        help="Number of drops (snapshots) to generate.",
+    )
+
+    args = parser.parse_args()
+
+    # Ensure output directory exists
+    output_dir = os.path.dirname(args.output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    generate_dataset(args.output_path, num_drops=args.num_drops)
