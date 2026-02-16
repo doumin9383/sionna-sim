@@ -861,6 +861,8 @@ class SystemSimulator(Block):
             i_total = tf.concat(i_total_all, axis=1)
 
         return i_total
+
+    def _apply_power_control(self, tx_power_dbm, rank):
         """パスロスと最大電力制約を考慮した送信電力を計算する"""
         B = self.batch_size
         N_UT = self.num_ut
@@ -912,8 +914,6 @@ class SystemSimulator(Block):
         p_tx_watt = dbm_to_watt(p_tx_dbm)
         if len(p_tx_watt.shape) == 0:
             p_tx_watt = tf.broadcast_to(p_tx_watt, [B, N_UT])
-
-        return p_tx_watt, pl_db, mpr_db, p_cmax_dbm_tensor
 
         return p_tx_watt, pl_db, mpr_db, p_cmax_dbm_tensor
 
@@ -990,9 +990,6 @@ class SystemSimulator(Block):
             "rank": tf.cast(final_rank, tf.float32),
             "interference_power": tf.reduce_mean(i_total, axis=[-1]),
         }
-
-    def _process_single_rank_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt, rank):
-        """Deprecated: Single Rank internal processing"""
 
     def _process_single_rank_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt, rank):
         """指定されたRankでのSINR計算とLAを実行するコアロジック"""

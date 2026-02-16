@@ -19,7 +19,7 @@ class SLSConfig(SimulationCommonConfig):
     # Simulation Control
     batch_size: int = 1  # Debug: 1
 
-    num_ut_drops: int = 2  # Debug: 2. Number of random topology drops.
+    num_ut_drops: int = 1  # Debug: 1. Number of random topology drops.
     num_slots: int = 1  # Fixed to 1 for snapshot simulation
 
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
@@ -29,8 +29,8 @@ class SLSConfig(SimulationCommonConfig):
     )
     num_layers: int = 4  # Number of layers for spatial multiplexing
     batch_size_ut: int = 1  # UT batch size for memory management
-    max_la_iterations: int = 5  # Max iterations for MPR/LA convergence
-    max_rank_selection_iterations: int = 3  # Max iterations for Rank Selection loop
+    max_la_iterations: int = 2  # Max iterations for MPR/LA convergence
+    max_rank_selection_iterations: int = 2  # Max iterations for Rank Selection loop
     num_symbols_per_slot: int = 14  # Number of symbols in a slot for throughput scaling
     num_data_symbols: int = 12  # Number of effective data symbols (excluding DMRS)
 
@@ -79,7 +79,9 @@ class SLSConfig(SimulationCommonConfig):
 
     # Results
     output_dir: str = "experiments/hybrid_beamforming/sls/results"
-    mpr_table_path: str = "experiments/hybrid_beamforming/lls/results/mpr_table.csv"
+    mpr_table_path: str = (
+        "experiments/hybrid_beamforming/make_papr_table/results/mpr_table.csv"
+    )
 
     def __init__(self):
         super().__init__()
