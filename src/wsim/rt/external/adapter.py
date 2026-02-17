@@ -48,12 +48,17 @@ class StandardAdapter(BaseAdapter):
 
         # Default potential names for each standard key
         self.default_lookups = {
-            "path_gain": ["path_gain", "path_loss", "gain", "power"],
+            "path_gains": ["path_gains", "path_gain"],
             "delay": ["delay", "tau", "time_of_arrival"],
             "zenith_at_tx": ["zenith_at_tx", "theta_t", "aod_theta"],
             "azimuth_at_tx": ["azimuth_at_tx", "phi_t", "aod_phi"],
             "zenith_at_rx": ["zenith_at_rx", "theta_r", "aoa_theta"],
             "azimuth_at_rx": ["azimuth_at_rx", "phi_r", "aoa_phi"],
+            "pathloss": ["pathloss", "pl"],
+            "tx_positions": ["tx_positions", "tx_pos"],
+            "tx_orientations": ["tx_orientations", "tx_ypr"],
+            "tx_antenna_gains": ["tx_antenna_gains", "tx_gain"],
+            "tx_names": ["tx_names", "bs_names"],
             # Velocities might be optional or in specific locations
             "velocity_tx": ["velocity_tx", "v_tx", "tx_vel"],
             "velocity_rx": ["velocity_rx", "v_rx", "rx_vel"],
@@ -62,7 +67,7 @@ class StandardAdapter(BaseAdapter):
     @property
     def required_keys(self) -> List[str]:
         return [
-            "path_gain",
+            "path_gains",
             "delay",
             "zenith_at_tx",
             "azimuth_at_tx",
@@ -100,7 +105,16 @@ class StandardAdapter(BaseAdapter):
                     )
 
         # 3. Look for optional keys
-        for std_key in ["velocity_tx", "velocity_rx"]:
+        optional_keys = [
+            "velocity_tx",
+            "velocity_rx",
+            "pathloss",
+            "tx_positions",
+            "tx_orientations",
+            "tx_antenna_gains",
+            "tx_names",
+        ]
+        for std_key in optional_keys:
             if std_key not in mapping:
                 found_path = find_key(self.default_lookups.get(std_key, []), h5_file)
                 if found_path:

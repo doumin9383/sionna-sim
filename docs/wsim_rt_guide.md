@@ -50,17 +50,45 @@ paths = tracer.get_paths(ut_loc)
 
 ## データフォーマット (Zarr/HDF5)
 
-`MeshBasedLoader` が期待するデータ構造は以下の通りです。
-`src/wsim/rt/external/ingester.py` を使用して変換・生成することが推奨されます。
+`MeshBasedLoader` は、Volcano等のレイトレーシングシミュレータから出力されたHDF5/Zarr形式のデータを読み込みます。
+Sionnaとの互換性を確保するため、以下のデータ構造と仕様を採用しています。
 
-| Key | Shape | 説明 |
-| :--- | :--- | :--- |
-| `mesh_coordinates` | `[NumPoints, 3]` | メッシュポイントのUTM座標 (またはローカル座標) |
-| `path_gains` | `[NumPoints, NumTx, NumPaths, 2, 2]` | 偏波込みの複素パスゲイン |
-| `delay` | `[NumPoints, NumTx, NumPaths]` | 遅延時間 [s] |
-| `zenith_at_rx` | `[NumPoints, NumTx, NumPaths]` | 受信天頂角 [rad] |
-| `azimuth_at_rx` | `[NumPoints, NumTx, NumPaths]` | 受信方位角 [rad] |
-| ... | ... | (Tx側の角度も同様) |
+### 1. データ構造とマッピング
+
+| HDF5 キー / 属性 | 次元 | 単位 | Sionna 対応 | 備考 |
+| :--- | :--- | :--- | :--- | :--- |
+| **path_gains** | `[N_Mesh, N_TX, MaxP, 2, 2]` | 無次元 (複素振幅) | `Paths.a` | 偏波行列。1W送信・0dBi受信基準で正規化済み。 |
+| **delay** | `[N_Mesh, N_TX, MaxP]` | [s] | `Paths.tau` | 遅延。 |
+| **zenith_at_tx** | `[N_Mesh, N_TX, MaxP]` | [rad] | `Paths.theta_t` | 送信側(BS) 天頂角 (Global座標)。 |
+| **azimuth_at_tx** | `[N_Mesh, N_TX, MaxP]` | [rad] | `Paths.phi_t` | 送信側(BS) 方位角 (Global座標)。 |
+| **zenith_at_rx** | `[N_Mesh, N_TX, MaxP]` | [rad] | `Paths.theta_r` | 受信側(UE) 天頂角 (Global座標)。 |
+| **azimuth_at_rx** | `[N_Mesh, N_TX, MaxP]` | [rad] | `Paths.phi_r` | 受信側(UE) 方位角 (Global座標)。 |
+| **pathloss** | `[N_TX, N_Mesh]` | [dB] | `Paths.lsps['pathloss']` | 広域パスロス (Best Server判定用)。 |
+| **tx_positions** | `[N_TX, 3]` | [m] (UTM) | `Transmitter.position` | 基地局/セクタの設置座標。 |
+| **tx_orientations** | `[N_TX, 3]` | [deg] | `Transmitter.orientation` | `[Yaw, Pitch, Roll]`. Yaw=Offset, Pitch=Tilt. |
+| **tx_antenna_gains** | `[N_TX, 1]` | [dBi] | `AntennaArray.gain` | アンテナのピーク利得。 |
+| **tx_names** | `[N_TX, len]` | uint8 | - | 基地局識別名 (ASCII/UTF8バイト列)。 |
+| **origin_utm** (Attr) | `[1, 3]` | [m] | `Scene.origin` | シミュレーション空間のUTM原点。 |
+| **mesh_step_m** (Attr) | scalar | [m] | `Loader.step` | メッシュ解像度。 |
+| **mesh_coordinates** | `[N_Mesh, 3]` | [m] | - | メッシュポイントのUTM座標 (またはローカル座標) |
+
+### 2. 重要な設計仕様
+
+#### 1W 送信電力正規化 (Normalization)
+`path_gains` の複素振幅は、**送信電力 1W (30dBm)** で正規化されています。
+Sionnaでシミュレーションを実行する際は、`tx_power` を **1.0 (W)** に設定することで、意図した受信電力レベルが再現されます。
+
+#### アンテナ利得の分離 (Isotropic Data)
+`path_gains` にはアンテナパターンや指向性利得を含んでいません（Isotropicなデータ）。
+Sionnaにロード後、`ExternalPaths` で生成されたパスオブジェクトに対して `apply_antenna_pattern()` を呼び出すことで、Sionna上で定義したアンテナ構成を適用します。
+`tx_antenna_gains` や `tx_orientations` のメタデータを使用して `Scene` や `Transmitter` を構成することが推奨されます。
+
+#### 送受信の役割スワップ
+Volcano (Uplink) のデータをSionna (Downlink) に合わせるため、データ変換時に **BS側の角度情報をTx、UE側の角度情報をRx** としてマッピングし直されています。
+
+#### 角度体系の変換
+Volcanoの角度系（北=0, 水平=0）から、Sionnaの角度系（東=0, 天頂=0）への変換は、データ生成時（HDF5作成時）に行われています。
+したがって、`StandardAdapter` は値をそのまま読み込みます。
 
 ## インテグレーションのヒント
 

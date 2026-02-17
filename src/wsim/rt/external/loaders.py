@@ -14,6 +14,7 @@ import mitsuba as mi
 from sionna.rt import Paths, Scene
 from .paths import ExternalPaths
 from ...common.geo import CoordinateSystem
+from .adapter import BaseAdapter, StandardAdapter
 
 
 class ExternalLoaderBase(abc.ABC):
@@ -47,17 +48,26 @@ class MeshBasedLoader(ExternalLoaderBase):
     Uses KDTree for nearest neighbor search between query points and mesh points.
     """
 
-    def __init__(self, file_path: str, scene: Scene, use_3d_search: bool = False):
+    def __init__(
+        self,
+        file_path: str,
+        scene: Scene,
+        use_3d_search: bool = False,
+        adapter: BaseAdapter = None,
+    ):
         """
         Args:
             file_path (str): Path to the Zarr store or HDF5 file.
             scene (Scene): The Sionna scene context.
             use_3d_search (bool): Whether to use (x, y, z) for nearest neighbor search.
                                   If False, only (x, y) is used.
+            adapter (BaseAdapter, optional): Adapter to map HDF5 keys to standard keys.
+                                             Defaults to StandardAdapter.
         """
         self._file_path = file_path
         self._scene = scene
         self._use_3d_search = use_3d_search
+        self._adapter = adapter or StandardAdapter()
 
         # Open store based on extension
         _, ext = os.path.splitext(file_path)
@@ -67,12 +77,17 @@ class MeshBasedLoader(ExternalLoaderBase):
             # Default to zarr
             self._dataset = zarr.open(file_path, mode="r")
 
+        # Map keys using the adapter
+        self._key_mapping = self._adapter.map_keys(self._dataset)
+
         # Initialize CoordinateSystem from metadata
         # Both h5py and zarr support .attrs (dictionary-like)
         origin_utm = self._dataset.attrs.get("origin_utm", (0.0, 0.0, 0.0))
         self._geo = CoordinateSystem(origin_utm)
 
         # Load mesh coordinates (UTM) and convert to local
+        # mesh_coordinates is fundamental, so we look for it directly or via adapter if added later
+        # For now, we assume it's "mesh_coordinates" as per spec
         if "mesh_coordinates" not in self._dataset:
             raise KeyError(f"Dataset at {file_path} must contain 'mesh_coordinates'")
 
@@ -86,15 +101,57 @@ class MeshBasedLoader(ExternalLoaderBase):
 
         # Infer shapes
         self._num_tx = self._dataset.attrs.get("num_tx", 1)
-        if "path_gain" in self._dataset:
-            # We assume [RX, TX, Paths]
-            self._num_tx = self._dataset["path_gain"].shape[1]
-        elif "path_gains" in self._dataset:
-            # We assume [RX, TX, Paths, 2, 2]
-            self._num_tx = self._dataset["path_gains"].shape[1]
+        # Try to infer num_tx from path_gains if available
+        pg_key = self._key_mapping.get("path_gains") or self._key_mapping.get(
+            "path_gain"
+        )
+        if pg_key and pg_key in self._dataset:
+            # path_gains: [RX, TX, ...]
+            self._num_tx = self._dataset[pg_key].shape[1]
+
+        # Load Metadata
+        self._tx_positions = self._load_metadata("tx_positions")
+        self._tx_orientations = self._load_metadata("tx_orientations")
+        self._tx_antenna_gains = self._load_metadata("tx_antenna_gains")
+        self._tx_names = self._load_metadata("tx_names")
 
         # Cache for best server mapping
         self._best_server_indices = None
+
+    def _load_metadata(self, standard_key: str):
+        """Helper to load metadata arrays if mapped."""
+        key = self._key_mapping.get(standard_key)
+        if key and key in self._dataset:
+            return np.array(self._dataset[key])
+        return None
+
+    @property
+    def tx_positions(self) -> Optional[np.ndarray]:
+        """Returns the transmitter positions if available [NumTx, 3]."""
+        return self._tx_positions
+
+    @property
+    def tx_orientations(self) -> Optional[np.ndarray]:
+        """Returns the transmitter orientations if available [NumTx, 3] (Yaw, Pitch, Roll)."""
+        return self._tx_orientations
+
+    @property
+    def tx_antenna_gains(self) -> Optional[np.ndarray]:
+        """Returns the transmitter antenna gains if available [NumTx, 1]."""
+        return self._tx_antenna_gains
+
+    @property
+    def tx_names(self) -> Optional[List[str]]:
+        """Returns the transmitter names if available."""
+        # Convert bytes to string if necessary
+        if self._tx_names is not None:
+            if self._tx_names.dtype.kind == "S" or self._tx_names.dtype.kind == "O":
+                return [
+                    n.decode("utf-8") if isinstance(n, bytes) else str(n)
+                    for n in self._tx_names
+                ]
+            return self._tx_names
+        return None
 
     @property
     def geo(self) -> CoordinateSystem:
@@ -144,6 +201,7 @@ class MeshBasedLoader(ExternalLoaderBase):
             num_tx=self._num_tx,
             num_rx=len(indices),
             sample_index=indices,
+            key_mapping=self._key_mapping,
         )
 
     def get_random_mesh_coordinates(self, num_uts: int) -> np.ndarray:
