@@ -607,6 +607,7 @@ class SystemSimulator(Block):
         tx_power_dbm_base,
         drop_idx=0,
         la_iter=0,
+        mcs_index_hint=None,
     ):
         """
         反復的なランク選択を実行し、最適なランクと有効なデジタル重みを決定する。
@@ -644,89 +645,131 @@ class SystemSimulator(Block):
                 tf.zeros([B, N_UT], dtype=self.rdtype) - 1.0
             )  # Initialize with -1
 
-            # 候補ランク 1 〜 MaxRank
-            for r in range(1, max_rank + 1):
+            # 候補ランク
+            # for r in range(1, max_rank + 1):
+            for r in self.config.available_layers:
+                if r > max_rank:
+                    continue
+
                 # ランク r を仮定
-                rank_tensor = tf.fill([B, N_UT], r)
+                rank_tensor_full = tf.fill([B, N_UT], r)
 
                 # 電力割り当て (Equal Power Allocation with MPR Backoff)
-                p_tx_watt, pl_db, mpr_db, p_cmax_dbm = self._apply_power_control(
-                    tx_power_dbm_base, rank_tensor
-                )
-                p_layer = p_tx_watt / tf.cast(r, self.rdtype)  # [B, N_UT]
-                p_layer_expanded = p_layer[
-                    :, :, None, None
-                ]  # Broadcasting for [B, N_UT, F, r]
-
-                # 信号電力: P_layer * |s|^2
-                s_srv_r = s_srv_full[..., :r]
-                s_power = p_layer_expanded * tf.square(s_srv_r)
-
-                i_floor = i_total + self.no
-                i_floor_expanded = tf.expand_dims(i_floor, -1)  # [B, N_UT, N_target, 1]
-
-                sinr = s_power / i_floor_expanded
-                sinr_db = (
-                    10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
+                # 全UE一括計算 (B, N_UT サイズなのでメモリ負荷は低い)
+                p_tx_watt_full, pl_db_full, mpr_db_full, _ = self._apply_power_control(
+                    tx_power_dbm_base, rank_tensor_full, mcs_index=mcs_index_hint
                 )
 
-                # MCS & Throughput
-                tp_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+                # スループット計算を batch_size_ut で分割実行 (VRAM節約)
+                total_tp_r_list = []
+                batch_size_ut = self.config.batch_size_ut
 
-                # Sum throughput across layers and frequency
-                total_tp_r = tf.reduce_sum(tp_per_re, axis=[-1, -2])
+                for start_ut in range(0, N_UT, batch_size_ut):
+                    end_ut = min(start_ut + batch_size_ut, N_UT)
 
-                if self.config.use_rbg_granularity:
-                    total_tp_r *= tf.cast(self.rbg_size_sc, self.rdtype)
+                    # Slice inputs
+                    p_tx_watt_slice = p_tx_watt_full[:, start_ut:end_ut]
+                    s_srv_slice = s_srv_full[:, start_ut:end_ut, :, :r]
+                    i_floor_slice = i_total[:, start_ut:end_ut, :] + self.no
 
-                # Scale by data symbols
-                total_tp_r *= tf.cast(self.config.num_data_symbols, self.rdtype)
+                    # Metrics Calculation -----------------------
+                    p_layer = p_tx_watt_slice / tf.cast(r, self.rdtype)  # [B, U_sub]
+                    p_layer_expanded = p_layer[:, :, None, None]  # [B, U_sub, 1, 1]
 
-                # Detailed Logging
-                if self.config.export_detailed_logs:
-                    # Collect metrics for each UT in the batch
-                    # This is slightly slow due to python conversion, but intended for debugging
-                    for b in range(B):
-                        for u in range(N_UT):
-                            self.detailed_logs.append(
-                                {
-                                    "drop_idx": drop_idx,
-                                    "la_iter": la_iter,
-                                    "rank_iter": i,
-                                    "ut_idx": u,
-                                    "batch_idx": b,
-                                    "candidate_rank": r,
-                                    "tx_power_dbm": (
-                                        float(10 * np.log10(p_tx_watt[b, u]) + 30)
-                                        if p_tx_watt[b, u] > 0
-                                        else -100
-                                    ),
-                                    "mpr_db": float(mpr_db[b, u]),
-                                    "pathloss_db": float(pl_db[b, u]),
-                                    "sinr_db_avg": float(
-                                        tf.reduce_mean(sinr_db[b, u, :, :])
-                                    ),
-                                    "mcs_idx_avg": float(
-                                        tf.reduce_mean(
-                                            tf.cast(mcs_idx[b, u, :, :], tf.float32)
-                                        )
-                                    ),
-                                    "throughput_bits": float(total_tp_r[b, u]),
-                                    "interference_power_dbm": (
-                                        float(
-                                            10 * np.log10(tf.reduce_mean(i_total[b, u]))
-                                            + 30
-                                        )
-                                        if tf.reduce_mean(i_total[b, u]) > 0
-                                        else -100
-                                    ),
-                                }
-                            )
+                    # 信号電力: P_layer * |s|^2
+                    s_power = p_layer_expanded * tf.square(
+                        s_srv_slice
+                    )  # [B, U_sub, F, r]
+
+                    i_floor_expanded = tf.expand_dims(
+                        i_floor_slice, -1
+                    )  # [B, U_sub, F, 1]
+
+                    sinr = s_power / i_floor_expanded
+                    sinr_db = (
+                        10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
+                    )
+
+                    # MCS & Throughput
+                    tp_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(
+                        sinr_db
+                    )
+
+                    # Sum throughput across layers and frequency
+                    tp_sum = tf.reduce_sum(tp_per_re, axis=[-1, -2])  # [B, U_sub]
+
+                    if self.config.use_rbg_granularity:
+                        tp_sum *= tf.cast(self.rbg_size_sc, self.rdtype)
+
+                    # Scale by data symbols
+                    tp_sum *= tf.cast(self.config.num_data_symbols, self.rdtype)
+
+                    total_tp_r_list.append(tp_sum)
+
+                    # Detailed Logging (Chunk内で行う)
+                    if self.config.export_detailed_logs:
+                        # Collect metrics for each UT in the batch
+                        for b in range(B):
+                            for u_local in range(end_ut - start_ut):
+                                u_global = start_ut + u_local
+                                self.detailed_logs.append(
+                                    {
+                                        "drop_idx": drop_idx,
+                                        "la_iter": la_iter,
+                                        "rank_iter": i,
+                                        "ut_idx": u_global,
+                                        "batch_idx": b,
+                                        "candidate_rank": r,
+                                        "tx_power_dbm": (
+                                            float(
+                                                10
+                                                * np.log10(p_tx_watt_slice[b, u_local])
+                                                + 30
+                                            )
+                                            if p_tx_watt_slice[b, u_local] > 0
+                                            else -100
+                                        ),
+                                        "mpr_db": float(mpr_db_full[b, u_global]),
+                                        "pathloss_db": float(pl_db_full[b, u_global]),
+                                        "sinr_db_avg": float(
+                                            tf.reduce_mean(sinr_db[b, u_local, :, :])
+                                        ),
+                                        "mcs_idx_avg": float(
+                                            tf.reduce_mean(
+                                                tf.cast(
+                                                    mcs_idx[b, u_local, :, :],
+                                                    tf.float32,
+                                                )
+                                            )
+                                        ),
+                                        "throughput_bits": float(tp_sum[b, u_local]),
+                                        "interference_power_dbm": (
+                                            float(
+                                                10
+                                                * np.log10(
+                                                    tf.reduce_mean(
+                                                        i_floor_slice[b, u_local]
+                                                        - self.no
+                                                    )
+                                                )
+                                                + 30
+                                            )
+                                            if tf.reduce_mean(
+                                                i_floor_slice[b, u_local] - self.no
+                                            )
+                                            > 0
+                                            else -100
+                                        ),
+                                    }
+                                )
+
+                # Combine results
+                total_tp_r = tf.concat(total_tp_r_list, axis=1)
 
                 # Update best rank
                 is_better = total_tp_r > max_throughput
                 max_throughput = tf.where(is_better, total_tp_r, max_throughput)
-                best_rank = tf.where(is_better, rank_tensor, best_rank)
+                best_rank = tf.where(is_better, rank_tensor_full, best_rank)
 
             # 4. ランク更新
             current_rank = best_rank
@@ -746,7 +789,7 @@ class SystemSimulator(Block):
         max_rank = tf.shape(w_ut_dig_full)[-1]
 
         # Mask creation: [B, N_UT, 1, 1, MaxRank]
-        rank_expanded = rank_tensor[:, :, None, None, None]
+        rank_expanded = tf.cast(rank_tensor[:, :, None, None, None], tf.int32)
         layer_indices = tf.range(max_rank)[None, None, None, None, :]
         mask = layer_indices < rank_expanded
 
@@ -755,7 +798,9 @@ class SystemSimulator(Block):
 
         return w_ut_eff, w_bs_eff
 
-    def _compute_interference(self, w_ut, w_bs, rank_tensor, tx_power_dbm_base=None):
+    def _compute_interference(
+        self, w_ut, w_bs, rank_tensor, tx_power_dbm_base=None, mcs_index_hint=None
+    ):
         """
         現在の有効重みリストに基づいて全干渉電力を計算する。
         """
@@ -772,7 +817,9 @@ class SystemSimulator(Block):
                 else self.bs_max_power_dbm
             )
 
-        p_tx_watt, _, _, _ = self._apply_power_control(tx_power_dbm_base, rank_tensor)
+        p_tx_watt, _, _, _ = self._apply_power_control(
+            tx_power_dbm_base, rank_tensor, mcs_index=mcs_index_hint
+        )
 
         # Layerごとの電力に分配
         p_layer = p_tx_watt / tf.cast(rank_tensor, self.rdtype)
@@ -835,15 +882,18 @@ class SystemSimulator(Block):
                     "bukfpr,bukfpt->bukfrt", tf.math.conj(u_neighbor), hv
                 )
 
-                # Power = P_self * |Heff|^2
                 # Sum over self layers (last dim t), sum over neighbor layers (dim r)
-                # Since w is masked, we can just sum over all dimensions
-                p_leak = p_layer_expanded[:, start_ut:end_ut, ...] * tf.square(
-                    tf.abs(heff_matrix)
-                )
-                p_leak_sum = tf.reduce_sum(
-                    p_leak, axis=[-1, -2]
+                # Avoid Rank 6 mult: Sum sq abs first
+                heff_sq = tf.square(tf.abs(heff_matrix))
+                heff_sq_sum = tf.reduce_sum(
+                    heff_sq, axis=[-1, -2]
                 )  # [B, U, Neighbors, F]
+
+                # p_layer slice: [B, BatchUT] -> [B, BatchUT, 1, 1]
+                p_layer_slice = p_layer[:, start_ut:end_ut]
+                p_layer_slice = p_layer_slice[:, :, None, None]
+
+                p_leak_sum = p_layer_slice * heff_sq_sum
 
                 # Scatter add to BS buffer
                 # indices setup (same as existing)
@@ -885,8 +935,23 @@ class SystemSimulator(Block):
                     "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
                 )
 
-                p_int = p_neigh_layer * tf.square(tf.abs(heff_matrix))
-                p_int_sum = tf.reduce_sum(p_int, axis=[-1, -2])  # [B, U, Neighbors, F]
+                # Need p_neigh_layer [B, Neighbors, 1, 1, 1] to become [B, 1, Neighbors, 1]
+                # for multiplication with heff_sq_sum [B, U, Neighbors, F]
+
+                heff_sq = tf.square(tf.abs(heff_matrix))
+                heff_sq_sum = tf.reduce_sum(heff_sq, axis=[-1, -2])  # [B, U, N, F]
+
+                # p_neigh_layer was: p_tx_neighbor_watt / rank [B, N_neighbors]
+                # We need to broadcast it to [B, U, N, F]
+                # p_neigh_layer_Bc = p_neigh_layer[:, None, :, None] # [B, 1, N, 1]
+
+                # Re-extract p_neigh_layer from source
+                p_neigh_layer_base = p_tx_neighbor_watt / tf.cast(
+                    rank_neighbor, self.rdtype
+                )
+                p_neigh_layer_bc = p_neigh_layer_base[:, None, :, None]
+
+                p_int_sum = p_neigh_layer_bc * heff_sq_sum
 
                 i_total_all.append(
                     tf.reduce_sum(p_int_sum, axis=2)
@@ -904,7 +969,7 @@ class SystemSimulator(Block):
 
         return i_total
 
-    def _apply_power_control(self, tx_power_dbm, rank):
+    def _apply_power_control(self, tx_power_dbm, rank, mcs_index=None):
         """パスロスと最大電力制約を考慮した送信電力を計算する"""
         B = self.batch_size
         N_UT = self.num_ut
@@ -936,7 +1001,22 @@ class SystemSimulator(Block):
             )
 
         # 3. MPR (Maximum Power Reduction)
-        mpr_db = self.mpr_model.get_mpr(self.config.waveform, rank)
+        mod_name = self._get_modulation_name(mcs_index)
+        num_rb = self.config.num_rb
+        granularity = self.config.precoding_granularity
+        transform_precoding = (
+            self.config.waveform == "DFT-s-OFDM"
+            and self.config.use_transform_precoding_mcs_table
+        )
+
+        mpr_db = self.mpr_model.get_mpr(
+            self.config.waveform,
+            rank,
+            transform_precoding,
+            mod_name,
+            num_rb,
+            granularity,
+        )
         if not tf.is_tensor(mpr_db):
             mpr_db = tf.fill([B, N_UT], tf.cast(mpr_db, tf.float32))
 
@@ -959,8 +1039,49 @@ class SystemSimulator(Block):
 
         return p_tx_watt, pl_db, mpr_db, p_cmax_dbm_tensor
 
+    def _get_modulation_name(self, mcs_index):
+        """Decode MCS index and return modulation name string matches MPR table"""
+        B = self.batch_size
+        N_UT = self.num_ut
+
+        if mcs_index is None:
+            return tf.fill([B, N_UT], "QPSK")
+
+        table = self.mcs_adapter.mcs_table  # [[mcs_idx, mod, rate, sinr], ...]
+        mapping = {row[0]: row[1] for row in table}
+
+        # mod_order to name
+        name_map = {
+            1: "BPSK",
+            2: "QPSK",
+            4: "16QAM",
+            6: "64QAM",
+            8: "256QAM",
+            10: "1024QAM",
+        }
+
+        full_mapping = {idx: name_map.get(mod, "QPSK") for idx, mod in mapping.items()}
+
+        # Vectorized lookup using tf.gather
+        mapping_list = [full_mapping.get(i, "QPSK") for i in range(32)]
+        mapping_tensor = tf.constant(mapping_list, dtype=tf.string)
+
+        # Convert mcs_index to int if it's float (due to averaging)
+        mcs_int = tf.cast(tf.round(mcs_index), tf.int32)
+        mcs_int = tf.clip_by_value(mcs_int, 0, 31)
+
+        mod_names = tf.gather(mapping_tensor, mcs_int)
+        return mod_names
+
     def _process_sinr_and_la(
-        self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt_base, drop_idx=0, la_iter=0
+        self,
+        w_ut_dig,
+        w_bs_dig,
+        s_srv,
+        p_tx_watt_base,
+        drop_idx=0,
+        la_iter=0,
+        mcs_index_hint=None,
     ):
         """SINR計算、干渉計算、Link Adaptationを実行する (Rank Adaptation含む)"""
 
@@ -972,15 +1093,22 @@ class SystemSimulator(Block):
             p_tx_watt_base,
             drop_idx=drop_idx,
             la_iter=la_iter,
+            mcs_index_hint=mcs_index_hint,
         )
 
         # 最終的なパフォーマンス評価 (Optimize済みランクと重みを使用)
         # 最終送信電力計算
-        p_tx_watt, _, _, _ = self._apply_power_control(p_tx_watt_base, final_rank)
+        p_tx_watt, _, _, _ = self._apply_power_control(
+            p_tx_watt_base, final_rank, mcs_index=mcs_index_hint
+        )
 
         # 干渉計算 (最終重みで)
         i_total = self._compute_interference(
-            w_ut_opt, w_bs_opt, final_rank, p_tx_watt_base
+            w_ut_opt,
+            w_bs_opt,
+            final_rank,
+            p_tx_watt_base,
+            mcs_index_hint=mcs_index_hint,
         )
 
         # 信号電力 (最終ランクで)
@@ -1124,10 +1252,52 @@ class SystemSimulator(Block):
                     "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
                 )
 
-                p_int = p_layer_expanded[:, start_ut:end_ut, :, None, None] * tf.square(
-                    tf.abs(heff_matrix)
-                )
-                p_int_per_layer = tf.reduce_sum(p_int, axis=-1)
+                # p_int = p_layer_expanded[:, start_ut:end_ut, :, None, None] * tf.square(
+                #     tf.abs(heff_matrix)
+                # )
+                # p_int_per_layer = tf.reduce_sum(p_int, axis=-1)
+
+                # Rank reduction optimization
+                heff_sq = tf.square(tf.abs(heff_matrix))
+                heff_sq_sum = tf.reduce_sum(
+                    heff_sq, axis=-1
+                )  # Sum over neighbor tx layers? No.
+                # In _process_single_rank_la (UL/DL mixed logic above line 1112?)
+                # Wait, this chunk targets _process_single_rank_la at ~1195.
+                # Let's check _process_single_rank_la logic first.
+
+                # In _process_single_rank_la:
+                # DL: heff [B, U, N, F, Rx(self), Tx(neigh)]
+                # p_layer is SELF power in previous logic? No, this function arguments p_tx_watt is total power?
+                # _process_single_rank_la tries to calculate SINR for a SPECIFIC rank.
+                # If DL: User U receives desired signal. Interference comes from Neighbor BSs.
+                # Argument p_tx_watt is usually for the transmitter.
+                # In _process_single_rank_la, p_tx_watt is passed.
+                # If UL: Tx is UT. p_tx_watt is UT power.
+                # If DL: Tx is BS. p_tx_watt is BS power?
+
+                # The code at 1195 is for `else` block of `if self.direction == "uplink"`. So it is DL.
+                # p_layer_expanded is used as interference source power??
+                # p_layer = p_tx_watt / rank. p_tx_watt is from argument.
+                # In DL, neighbors are BSs. We need neighbor BS power.
+                # But _process_single_rank_la uses `p_layer` derived from `p_tx_watt`.
+                # If `p_tx_watt` is uniform across all BSs/UTs or passed as full batch...
+                # The logic at 1195 seems to assume `p_layer` corresponds to neighbor power?
+                # Actually, looking at 1120: `p_layer_expanded = tf.reshape(p_layer, [B, N_UT, 1, 1])`
+                # And 1195: `p_int = p_layer_expanded[...] * ...`
+                # This seems WRONG for DL interference if p_layer is Self UT power (or Serving BS power).
+                # Interference source is Neighbor BS.
+                # However, this function is `_process_single_rank_la`, maybe it assumes uniform power or something?
+                # Or maybe `p_tx_watt` contains [B, N_BS] for DL?
+                # But `p_layer` is divided by `rank`.
+
+                # ANYWAY, to fix Rank error:
+                p_layer_slice = p_layer_expanded[:, start_ut:end_ut, :, None, None]
+                heff_sq = tf.square(tf.abs(heff_matrix))
+                # Sum over neighbor layers (last dim)
+                heff_sq_sum = tf.reduce_sum(heff_sq, axis=-1)
+
+                p_int_per_layer = p_layer_slice * heff_sq_sum
                 i_total_all.append(tf.reduce_sum(p_int_per_layer, axis=2))
 
         s_power = tf.concat(s_power_all, axis=1)
@@ -1247,11 +1417,12 @@ class SystemSimulator(Block):
                 [self.batch_size, self.num_ut],
                 tf.cast(self.config.num_layers, tf.float32),
             )
+            mcs_index = None
 
             for la_iter in range(self.config.max_la_iterations):
                 # 4. 送信電力制御 (直前の反復のRankに基づくMPRを適用)
                 p_tx_watt_iter, pl_db_iter, mpr_db_iter, p_cmax_dbm_iter = (
-                    self._apply_power_control(tx_power_dbm, rank)
+                    self._apply_power_control(tx_power_dbm, rank, mcs_index=mcs_index)
                 )
 
                 # 5. SINR計算 & Link Adaptation (Rank自律選択)
@@ -1260,13 +1431,15 @@ class SystemSimulator(Block):
                     w_ut_dig,
                     w_bs_dig,
                     s_srv,
-                    p_tx_watt_iter,
+                    tx_power_dbm,
                     drop_idx=drop_idx,
                     la_iter=la_iter,
+                    mcs_index_hint=mcs_index,
                 )
 
                 # ランクの更新 (MPRに影響を与えるため、次回の反復で使用)
                 rank = results_iter["rank"]
+                mcs_index = results_iter["mcs_idx_avg"]
 
                 # 収束判定 (RankやMCSに変化がなければ終了、現状は最大回数回すか、簡易的な判定を入れる)
 
