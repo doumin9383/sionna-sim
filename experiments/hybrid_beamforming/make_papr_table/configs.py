@@ -15,12 +15,12 @@ class HybridLLSConfig(SimulationCommonConfig):
     """Link Level Simulation Configuration for experiments/hybrid_beamforming/lls"""
 
     def __post_init__(self):
-        super().__init__()
+        super().__post_init__()
 
     # Simulation Control
     batch_size: int = 100
     num_batches: int = 5
-    min_total_samples: int = 1000
+    min_total_samples: int = 100
 
     # Sweep Parameters
     modulations: Dict[str, int] = field(
@@ -36,6 +36,7 @@ class HybridLLSConfig(SimulationCommonConfig):
     granularities: List[Union[int, str]] = field(
         default_factory=lambda: ["Subcarrer-wise", "Narrowband", "Subband", "Wideband"]
     )
+    precoding_strategies: List[str] = field(default_factory=lambda: ["SVD", "Identity"])
 
     papr_oversampling_factor: int = 4
 

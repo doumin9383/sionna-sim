@@ -41,18 +41,20 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         for mod_name, mcs_idx in config.modulations.items():
             for rank in config.ranks:
                 for num_rb in config.rb_counts:
-                    for gran in config.granularities:
-                        scenarios.append(
-                            {
-                                "waveform": wf_name,
-                                "transform_precoding": is_dft_s,
-                                "modulation": mod_name,
-                                "mcs_index": mcs_idx,
-                                "rank": rank,
-                                "num_rb": num_rb,
-                                "granularity": gran,
-                            }
-                        )
+                    for strat in config.precoding_strategies:
+                        for gran in config.granularities:
+                            scenarios.append(
+                                {
+                                    "waveform": wf_name,
+                                    "transform_precoding": is_dft_s,
+                                    "modulation": mod_name,
+                                    "mcs_index": mcs_idx,
+                                    "rank": rank,
+                                    "num_rb": num_rb,
+                                    "granularity": gran,
+                                    "strategy": strat,
+                                }
+                            )
 
     results = []
     all_papr_data = {}
@@ -85,7 +87,9 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
             gran_str = "GSB"
         else:
             gran_str = "GWB"
-        scenario_id = f"{sc['waveform']}_{sc['modulation']}_R{sc['rank']}_RB{sc['num_rb']}_{gran_str}"
+
+        strat_str = "SVD" if sc["strategy"] == "SVD" else "ID"
+        scenario_id = f"{sc['waveform']}_{sc['modulation']}_R{sc['rank']}_RB{sc['num_rb']}_{strat_str}_{gran_str}"
 
         # try:
         model = PUSCHCommunicationModel(
@@ -94,6 +98,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
             enable_transform_precoding=sc["transform_precoding"],
             precoding_granularity=sc["granularity"],
             num_rb=sc["num_rb"],
+            precoding_strategy=sc["strategy"],
         )
 
         papr_values = []
@@ -112,8 +117,8 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
 
         # Store for global comparison
         if sc["num_rb"] in representative_rb:
-            # Use a structured key to allow parsing later: Waveform|Modulation|Rank|num_rb|Granularity
-            data_key = f"{sc['waveform']}|{sc['modulation']}|{sc['rank']}|{sc['num_rb']}|{sc['granularity']}"
+            # Use a structured key to allow parsing later: Waveform|Modulation|Rank|num_rb|Strategy|Granularity
+            data_key = f"{sc['waveform']}|{sc['modulation']}|{sc['rank']}|{sc['num_rb']}|{sc['strategy']}|{sc['granularity']}"
             if data_key not in all_papr_data:
                 all_papr_data[data_key] = []
             all_papr_data[data_key].extend(papr_values)
@@ -285,25 +290,41 @@ def plot_summary_ccdf(all_papr_data, results_dir):
     for key in sorted_keys:
         values = np.sort(all_papr_data[key])
 
-        # Parse key: Waveform|Modulation|Rank|num_rb|Granularity
+        # Parse key: Waveform|Modulation|Rank|num_rb|Strategy|Granularity
         parts = key.split("|")
         # waveform = parts[0]
         modulation = parts[1]
         rank = int(parts[2])
         # num_rb = parts[3]
-        granularity = parts[4]  # String "Wideband", "Subband", etc. or int
+        strategy = parts[4]
+        granularity = parts[5]
 
         # Determine styles
         color = rank_colors.get(rank, "black")
 
         ls = gran_styles.get(str(granularity), "-")
+
+        # If strategy is Identity (Non-coherent), maybe use a different line style or marker?
+        # Or just label it as "Non-coherent" in the legend?
+        # Let's use a specific style for Non-coherent if needed, or just rely on Granularity/Rank.
+        # User asked for "Non-coherent" category.
+        # If strategy is Identity, we can override label or style.
+        # Let's say: SVD -> solid/dashed based on gran. Identity -> maybe dashdot?
+
+        if strategy == "Identity":
+            ls = "-."
+            granularity_label = "Non-coherent"
+        else:
+            granularity_label = granularity
+
         # specific check if granularity is "G...RB" string from previous logic or raw value
         # In this updated code we passed raw values in key
         # If it was an integer in config (e.g. 2, 4), handle it
         if granularity.isdigit():
             # If it's a number (RBG size), usually treat as Subband-like or separate style?
             # For now, let's treat numbers as dashed
-            ls = "--"
+            if strategy != "Identity":
+                ls = "--"
 
         marker = mod_markers.get(modulation, "x")
 
@@ -319,7 +340,7 @@ def plot_summary_ccdf(all_papr_data, results_dir):
             marker=marker,
             markevery=0.1,  # Show marker every 10% of points to avoid clutter
             markersize=6,
-            label=f"{modulation} R{rank} {granularity}",  # internal label, not used for custom legend
+            label=f"{modulation} R{rank} {strategy} {granularity}",  # internal label
         )
 
     plt.grid(True, which="both", ls="-", alpha=0.5)

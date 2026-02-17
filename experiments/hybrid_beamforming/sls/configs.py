@@ -23,6 +23,7 @@ class SLSConfig(SimulationCommonConfig):
     num_slots: int = 1  # Fixed to 1 for snapshot simulation
 
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
+    precoding_strategy: str = "SVD"  # "SVD", "Identity" (Non-coherent)
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
     waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
     cyclic_prefix_length: int = 0  # CP length for ResourceGrid
@@ -62,6 +63,10 @@ class SLSConfig(SimulationCommonConfig):
     max_bs_ut_dist: Optional[float] = (
         None  # Max distance, None means infinite/cell edge
     )
+
+    @property
+    def force_tx_identity(self):
+        return self.precoding_strategy == "Identity"
 
     @property
     def num_bs(self):

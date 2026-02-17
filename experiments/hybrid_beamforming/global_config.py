@@ -71,7 +71,8 @@ class SimulationCommonConfig:
         n = (
             self.bs_num_rows_per_panel
             * self.bs_num_cols_per_panel
-            * self.bs_num_panel_ports
+            * self.bs_num_rows_panel
+            * self.bs_num_cols_panel
         )
         return n * 2 if self.bs_polarization == "dual" else n
 
@@ -80,7 +81,8 @@ class SimulationCommonConfig:
         n = (
             self.ut_num_rows_per_panel
             * self.ut_num_cols_per_panel
-            * self.ut_num_panel_ports
+            * self.ut_num_rows_panel
+            * self.ut_num_cols_panel
         )
         return n * 2 if self.ut_polarization == "dual" else n
 

@@ -7,7 +7,7 @@ from sionna.phy.nr import PUSCHTransmitter as _PUSCHTransmitter
 from sionna.phy.ofdm import OFDMModulator
 
 
-class PUSCHTransmitter(_PUSCHTransmitter):
+class HybridPUSCHTransmitter(_PUSCHTransmitter):
     """
     Wraps standard PUSCHTransmitter to provide manual control over Transform Precoding (DFT-s-OFDM).
 
@@ -29,6 +29,7 @@ class PUSCHTransmitter(_PUSCHTransmitter):
         num_tx_ant=4,
         precoding_granularity=None,
         rbg_size_rb=6,
+        force_tx_identity=False,
         **kwargs,
     ):
         super().__init__(pusch_config, output_domain=output_domain, **kwargs)
@@ -38,6 +39,7 @@ class PUSCHTransmitter(_PUSCHTransmitter):
         )  # Ensure enough antennas for layers
         self.precoding_granularity = precoding_granularity
         self.rbg_size_rb = rbg_size_rb
+        self.force_tx_identity = force_tx_identity
 
     def call(self, batch_size=1):
         """
@@ -158,6 +160,28 @@ class PUSCHTransmitter(_PUSCHTransmitter):
 
         # Take first num_layers columns
         W = q[..., : self._num_layers]
+
+        if self.force_tx_identity:
+            # Override with Identity [batch, blocks, tx, tx] -> [..., tx, layers]
+            # Assumes num_layers <= num_tx_ant
+            # We want columns of Identity matrix corresponding to layers?
+            # Or just Identity?
+            # The prompt says "force_tx_identity=True: v -> Identity (NxN)"
+            # get_digital_precoders logic in weight_utils was:
+            # v = Identity [Tx, Tx]
+            # But here W is [Tx, Layers].
+            # If Rank < Tx, we should probably take first Rank columns of Identity?
+            # Or is it "Spatial Multiplexing without CSI" -> mapped 1-to-1?
+            # Yes, usually layer n -> ant n.
+
+            eye = tf.eye(self.num_tx_ant, dtype=z.dtype)  # [Tx, Tx]
+            # Expand to [batch, blocks, Tx, Tx]
+            eye_expanded = tf.reshape(eye, [1, 1, self.num_tx_ant, self.num_tx_ant])
+            eye_tiled = tf.tile(eye_expanded, [batch_size, num_blocks, 1, 1])
+
+            # Slice to [..., Tx, Layers]
+            W = eye_tiled[..., : self._num_layers]
+
         return W
 
     def _apply_dft_spreading(self, x):

@@ -27,6 +27,7 @@ class PUSCHCommunicationModel(tf.keras.Model):
         enable_transform_precoding,
         precoding_granularity,
         num_rb,
+        precoding_strategy="SVD",
         domain="time",
     ):
         super().__init__()
@@ -38,12 +39,9 @@ class PUSCHCommunicationModel(tf.keras.Model):
         self.pusch_config.output_domain = domain
 
         # Adjust config based on inputs
-        # In Sionna NR, num_antenna_ports must match num_layers for PUSCHConfig
-        # when using it to map layers to ports.
-        # We will handle precoding (port to antenna) in our wrapper if needed.
-        self.pusch_config.num_antenna_ports = config.num_ut_ports
+        self.pusch_config.num_antenna_ports = num_layers
         self.pusch_config.num_layers = num_layers
-        self.pusch_config.precoding = "none"
+        self.pusch_config.precoding = "non-coherent"
 
         # Set Bandwidth Part size (controls FFT size and num_subcarriers)
         self.pusch_config.n_size_bwp = num_rb
@@ -60,6 +58,7 @@ class PUSCHCommunicationModel(tf.keras.Model):
             num_tx_ant=config.num_ut_ant,
             precoding_granularity=precoding_granularity,
             rbg_size_rb=config.rbg_size_rb,
+            force_tx_identity=(precoding_strategy == "Identity"),
         )
 
         # 4. Receiver

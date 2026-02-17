@@ -548,6 +548,7 @@ class SystemSimulator(Block):
                 N_target,
                 rbg_size_sc=self.rbg_size_sc,
                 weight_type="svd",
+                force_tx_identity=self.config.force_tx_identity,
             )
 
             # 3. バッファに格納

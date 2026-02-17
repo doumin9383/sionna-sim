@@ -13,7 +13,10 @@ class PUSCHConfig(_PUSCHConfig):
         self, carrier_config=None, pusch_dmrs_config=None, tb_config=None, **kwargs
     ):
         super().__init__(
-            carrier_config=None, pusch_dmrs_config=None, tb_config=None, **kwargs
+            carrier_config=carrier_config,
+            pusch_dmrs_config=pusch_dmrs_config,
+            tb_config=tb_config,
+            **kwargs,
         )
         self._external_precoding_matrix = None  # non-codebook用
 
@@ -105,7 +108,7 @@ class PUSCHConfig(_PUSCHConfig):
     def transform_precoding(self, value):
         self._transform_precoding = value
         # ぶら下がっている tb_config にも教えてあげる
-        self.tb_config.transform_precoding = value
+        self.tb.transform_precoding = value
 
     def _check_tpmi_validity(self):
         """TPMIのバリデーション (元の check_config 内のロジックを分離)"""
