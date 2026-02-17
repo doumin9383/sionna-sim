@@ -4,9 +4,9 @@
 
 import tensorflow as tf
 from sionna.phy.nr import PUSCHReceiver, CarrierConfig
-from ..shared.pusch_config import PUSCHConfig
+from wsim.common.phy.pusch import PUSCHConfig
 from .pusch_transmitter_wrapper import HybridPUSCHTransmitter
-from experiments.hybrid_beamforming.shared.channel_models import (
+from wsim.sls.channel.models import (
     GeneratHybridBeamformingTimeChannel,
 )
 

@@ -49,7 +49,7 @@ class SimulationCommonConfig:
         ut_num_rows_panel * ut_num_cols_panel * (2 if ut_polarization == "dual" else 1)
     )  # Total Digital Ports (RF Chains) for Hybrid BF 偏波込みなら2倍
 
-    def __init__(self):
+    def __post_init__(self):
         self.mcs_decoder = lambda mcs: decode_mcs_index(
             mcs,
             table_index=self.mcs_table,

@@ -86,8 +86,8 @@ class SLSConfig(SimulationCommonConfig):
         "experiments/hybrid_beamforming/make_papr_table/results/mpr_table.csv"
     )
 
-    def __init__(self):
-        super().__init__()
+    def __post_init__(self):
+        super().__post_init__()
 
         # Instantiate Antenna Arrays from config
         self.bs_array = PanelArray(

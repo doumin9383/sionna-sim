@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Any, Dict, Union
 from wsim.rt.configs import ResourceGridConfig, PlanarArrayConfig
 from experiments.hybrid_beamforming.global_config import (
-    HybridSimulationCommonConfig,
+    SimulationCommonConfig,
     SYSTEM_MCS_INDICES,
     SYSTEM_WAVEFORMS,
 )
@@ -11,7 +11,7 @@ import numpy as np
 
 
 @dataclass
-class HybridLLSConfig(HybridSimulationCommonConfig):
+class HybridLLSConfig(SimulationCommonConfig):
     """Link Level Simulation Configuration for experiments/hybrid_beamforming/lls"""
 
     def __post_init__(self):

@@ -8,14 +8,14 @@ import sys
 # Add project root to sys.path to allow importing 'experiments' module
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
 if project_root not in sys.path:
-    # sys.path.append(project_root)
+    sys.path.append(project_root)
 
 import tensorflow as tf
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from experiments.hybrid_beamforming.lls.configs import HybridLLSConfig
-from experiments.hybrid_beamforming.lls.components.pusch_model import (
+from .configs import HybridLLSConfig
+from .components.pusch_model import (
     PUSCHCommunicationModel,
 )
 
