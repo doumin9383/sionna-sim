@@ -138,7 +138,21 @@ class GenerateHybridBeamformingOFDMChannel(
             data = loader.get_rays(ut_indices=ut_indices_slice, bs_indices=None)
 
             def gather_neighbor_data(tensor):
-                return tf.gather(tensor, neighbor_indices_slice, axis=2, batch_dims=2)
+                # Standard Sionna order is [Batch, TX, RX, Clusters, Rays]
+                # neighbor_indices_slice is [Batch, RX, Neighbors]
+                # To use batch_dims=2, we need RX at axis 1 and TX at axis 2.
+
+                rank = tf.rank(tensor)
+                # [0, 2, 1, 3, 4, ...]
+                perm = tf.concat([[0, 2, 1], tf.range(3, rank)], axis=0)
+                t_trans = tf.transpose(tensor, perm)
+
+                # Gather neighbors (TX) for each UT (RX)
+                # Result: [Batch, RX, Neighbors, Clusters, ...]
+                g = tf.gather(t_trans, neighbor_indices_slice, axis=2, batch_dims=2)
+
+                # Transpose back: [Batch, Neighbors, RX, Clusters, ...]
+                return tf.transpose(g, perm)
 
             # Unpack Rays
             rays_obj = Rays(
@@ -223,7 +237,19 @@ class GenerateHybridBeamformingOFDMChannel(
             # Call Engine Sampler
             # Note: _cir_sampler is internal to TR38901 models.
             # We assume self._channel_model is a TR38901 instance.
-            h_element, _ = self._channel_model._cir_sampler(
+            # DEBUG: Check shapes
+            print(
+                f"[DEBUG] rays_flat.delays shape: {rays_flat.delays.shape}", flush=True
+            )
+            print(
+                f"[DEBUG] topo_flat.velocities shape: {topo_flat.velocities.shape}",
+                flush=True,
+            )
+            print(
+                f"[DEBUG] kf reshaped shape: {tf.reshape(kf, [-1]).shape}", flush=True
+            )
+
+            h_element, delays_expanded = self._channel_model._cir_sampler(
                 1,
                 30e3,
                 tf.reshape(kf, [-1]),
@@ -232,31 +258,50 @@ class GenerateHybridBeamformingOFDMChannel(
                 tf.zeros([total_links, 1, 1]),
             )
 
-            # Apply Pathloss
+            # Apply Pathloss and Squeeze to Rank 4: [Links, Paths, RxAnt, TxAnt]
+            # h_element: [Links, 1, 1, Paths, RxAnt, TxAnt, Time]
+            # delays_expanded: [Links, 1, 1, Paths]
+            a_red = tf.squeeze(h_element, axis=[1, 2, 6])
+            tau_red = tf.squeeze(delays_expanded, axis=[1, 2])  # [Links, Paths]
+
             gain = tf.sqrt(tf.reshape(sf, [-1])) * tf.pow(
                 10.0, -tf.reshape(pl, [-1]) / 20.0
             )
-            h_element *= tf.complex(gain, 0.0)[
-                :,
-                tf.newaxis,
-                tf.newaxis,
-                tf.newaxis,
-                tf.newaxis,
-                tf.newaxis,
-                tf.newaxis,
-            ]
+            a_red *= tf.complex(gain[:, tf.newaxis, tf.newaxis, tf.newaxis], 0.0)
 
-            # CIR to OFDM (Chunked)
-            a = tf.squeeze(h_element, axis=[1, 3])  # [Links, RxA, TxA, P, T]
-            tau = rays_flat.delays  # [Links, 1, 1, P]
+            # CIR to OFDM conversion (Manual implementation to stay within Rank 5 for TF/GPU context)
 
             h_ports_chunks = []
             for s_idx in range(0, self._num_active_sc, chunk_size):
                 num_c = min(chunk_size, self._num_active_sc - s_idx)
-                # Call Engine Core
-                h_elem_chunk = self.get_h_freq_chunk(
-                    a, tau, s_idx, num_c, self._active_frequencies
-                )
+
+                # Frequency vector for this chunk
+                freqs = self._active_frequencies[s_idx : s_idx + num_c]
+
+                # Expand dims for broadcasting: [Links, Paths, RxA, TxA, Freq]
+                # a: [L, P, RA, TA, 1]
+                # tau: [L, P, 1, 1, 1]
+                # f: [1, 1, 1, 1, Freq]
+                a_exp = a_red[..., tf.newaxis]
+                tau_exp = tau_red[:, :, tf.newaxis, tf.newaxis, tf.newaxis]
+                f_exp = freqs[tf.newaxis, tf.newaxis, tf.newaxis, tf.newaxis, :]
+
+                # DEBUG
+                if s_idx == 0:
+                    print(f"[DEBUG] a_exp shape: {a_exp.shape}", flush=True)
+                    print(f"[DEBUG] tau_exp shape: {tau_exp.shape}", flush=True)
+                    print(f"[DEBUG] f_exp shape: {f_exp.shape}", flush=True)
+
+                # exp(-j*2*pi*f*tau)
+                phase = tf.complex(0.0, -2.0 * np.pi * f_exp * tau_exp)
+                h_elem_chunk = tf.reduce_sum(
+                    a_exp * tf.exp(phase), axis=1
+                )  # [Links, RxA, TxA, Freq]
+
+                # Restore Time dimension: [Links, RxA, TxA, 1, Freq]
+                h_elem_chunk = tf.expand_dims(h_elem_chunk, axis=-2)
+
+                # Apply weights
 
                 if return_element_channel:
                     h_ports_chunks.append(h_elem_chunk)

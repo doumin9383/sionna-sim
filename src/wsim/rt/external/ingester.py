@@ -97,6 +97,14 @@ class HDF5Ingester:
             store.attrs["adapter_class"] = self.adapter.__class__.__name__
             store.attrs["original_file"] = self.h5_path
 
+            # Copy all attributes from HDF5 source to Zarr store
+            for key, val in source.attrs.items():
+                if isinstance(val, np.ndarray):
+                    val = val.tolist()
+                elif isinstance(val, np.generic):
+                    val = val.item()
+                store.attrs[key] = val
+
         print(f"Ingestion complete. Data stored at: {output_path}")
 
     @staticmethod

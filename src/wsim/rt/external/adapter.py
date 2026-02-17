@@ -62,6 +62,7 @@ class StandardAdapter(BaseAdapter):
             # Velocities might be optional or in specific locations
             "velocity_tx": ["velocity_tx", "v_tx", "tx_vel"],
             "velocity_rx": ["velocity_rx", "v_rx", "rx_vel"],
+            "mesh_coordinates": ["mesh_coordinates", "mesh_coords", "rx_positions"],
         }
 
     @property
@@ -112,7 +113,9 @@ class StandardAdapter(BaseAdapter):
             "tx_positions",
             "tx_orientations",
             "tx_antenna_gains",
+            "tx_antenna_gains",
             "tx_names",
+            "mesh_coordinates",
         ]
         for std_key in optional_keys:
             if std_key not in mapping:

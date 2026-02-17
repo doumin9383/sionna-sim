@@ -1,0 +1,12 @@
+{
+    "adapter_class": "StandardAdapter",
+    "mesh_step_m": 5.0,
+    "num_rx": 200,
+    "num_tx": 3,
+    "origin_utm": [
+        500000.0,
+        4000000.0,
+        30.0
+    ],
+    "original_file": "integration_test_data.h5"
+}

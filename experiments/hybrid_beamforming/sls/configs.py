@@ -93,6 +93,7 @@ class SLSConfig(SimulationCommonConfig):
     mpr_table_path: str = (
         "experiments/hybrid_beamforming/make_papr_table/results/mpr_table.csv"
     )
+    external_data_path: Optional[str] = None  # Path to external HDF5/Zarr data
 
     def __post_init__(self):
         super().__post_init__()

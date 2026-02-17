@@ -102,8 +102,15 @@ class SystemSimulator(Block):
         )
 
         # Initialize channel model based on scenario
+        # Initialize channel model based on scenario
+        self.loader_instance = None
         if external_loader is not None:
-            self.channel_model = external_loader(config)
+            # Instantiate the loader using the config
+            self.loader_instance = external_loader(config)
+            # Update external_loader reference to the instance
+            self.external_loader = self.loader_instance
+            # Use the loader instance as the channel model (polymorphism)
+            self.channel_model = self.loader_instance
         else:
             self._setup_channel_model(
                 config.scenario,
@@ -171,7 +178,7 @@ class SystemSimulator(Block):
             use_rbg_granularity=config.use_rbg_granularity,
             rbg_size_sc=self.rbg_size_sc if self.rbg_size_sc else 1,
             neighbor_indices=None,  # Topology is set in the loop and updated dynamically
-            external_loader=self.external_loader,
+            external_loader=self.loader_instance,  # Pass the instance, not the class
         )
 
         # Instantiate SLS components
@@ -246,8 +253,8 @@ class SystemSimulator(Block):
         """Generate and set up network topology"""
 
         # 0. Load Topology from External Loader if available
-        if self.external_loader is not None:
-            topo = self.external_loader.get_topology()
+        if self.loader_instance is not None:
+            topo = self.loader_instance.get_topology()
             self.ut_loc = topo["ut_loc"]
             self.bs_loc = topo["bs_loc"]
             self.ut_orientations = topo["ut_orient"]
@@ -261,7 +268,7 @@ class SystemSimulator(Block):
             else:
                 self.serving_cell_id = None
 
-            self.ut_mesh_indices = self.external_loader.find_nearest_mesh(self.ut_loc)
+            self.ut_mesh_indices = self.loader_instance.find_nearest_mesh(self.ut_loc)
 
             # BS Virtual Loc needs to be derived or loaded?
             # gen_hexgrid_topology returns it.
@@ -354,7 +361,7 @@ class SystemSimulator(Block):
         # 3. Set topology in channel model
 
         # Determine LoS argument
-        if self.external_loader is not None:
+        if self.loader_instance is not None:
             # Pass None for 'los' to avoid validation error/re-generation when using external Rays
             los_arg = None
         else:
@@ -373,8 +380,8 @@ class SystemSimulator(Block):
 
     def _setup_drop_topology(self, drop_idx):
         """シミュレーションの1ドロップ分のトポロジーセットアップ"""
-        if self.external_loader is not None:
-            self.external_loader.load_drop(drop_idx)
+        if self.loader_instance is not None:
+            self.loader_instance.load_drop(drop_idx)
 
         # 新しいUT位置、チャネル等の生成
         self._setup_topology(
@@ -464,6 +471,11 @@ class SystemSimulator(Block):
         )
         a_rf_ue = tf.eye(self.num_ut_ant, num_columns=ue_ports, dtype=tf.complex64)
 
+        # Broadcast to [B, N_UT_Total, Ant, Port]
+        a_rf_ue = tf.broadcast_to(
+            a_rf_ue[None, None, ...], [B, N_UT_Total, self.num_ut_ant, ue_ports]
+        )
+
         if self.direction == "uplink":
             self.channel_interface.set_analog_weights(w_rf=a_rf_ue, a_rf=w_rf_bs)
         else:
@@ -499,11 +511,11 @@ class SystemSimulator(Block):
             ],
             dtype=self.cdtype,
         )
-        # BS側 (Sector)
+        # BS側 (Sector) -> Change to Per-UT (Precoder/Combiner for each UT link)
         w_bs_dig_full = tf.zeros(
             [
                 B,
-                N_BS,
+                N_UT_Total,  # Changed from N_BS to N_UT_Total
                 N_target,
                 (
                     self.num_rx_ports
@@ -536,8 +548,19 @@ class SystemSimulator(Block):
                 return_s_u_v=False,
             )
             # h_srv_port: [B, BUT, Neighbor(1), RxP, TxP, Time(1), F]
+            # Handle potential extra dimensions (Rank 8 case observed in debug: [B, U, N, RxP, TxP, Extra, T, F])
+
+            if h_srv_port is not None and len(h_srv_port.shape) == 8:
+                # Remove Neighbor(2), Extra(5), Time(6)
+                # Sliced: [B, U, RxP, TxP, F]
+                h_srv_sliced = h_srv_port[:, :, 0, :, :, 0, 0, :]
+            else:
+                # Standard Rank 7: [B, U, N, RxP, TxP, T, F]
+                # Remove Neighbor(2), Time(5)
+                h_srv_sliced = h_srv_port[:, :, 0, :, :, 0, :]
+
             # [B, BUT, F, RxP, TxP] に変換
-            h_srv = tf.transpose(h_srv_port[:, :, 0, :, :, 0, :], [0, 1, 4, 2, 3])
+            h_srv = tf.transpose(h_srv_sliced, [0, 1, 4, 2, 3])
 
             # 2. 粒度に応じた重み計算（SVD）& ターゲット解像度への展開
             # use get_digital_precoders orchestration utility
@@ -593,7 +616,7 @@ class SystemSimulator(Block):
                 w_ut_dig_full, indices_ut_flat, w_ut_flat
             )
             w_bs_dig_full = tf.tensor_scatter_nd_update(
-                w_bs_dig_full, indices_bs_flat, w_bs_flat
+                w_bs_dig_full, indices_ut_flat, w_bs_flat  # Use indices_ut_flat
             )
 
             # s_srv_full update moved up
@@ -794,6 +817,10 @@ class SystemSimulator(Block):
         layer_indices = tf.range(max_rank)[None, None, None, None, :]
         mask = layer_indices < rank_expanded
 
+        if self.config.export_detailed_logs:
+            # Debugging rank selection shapes if needed
+            pass
+
         w_ut_eff = tf.where(mask, w_ut_dig_full, tf.zeros_like(w_ut_dig_full))
         w_bs_eff = tf.where(mask, w_bs_dig_full, tf.zeros_like(w_bs_dig_full))
 
@@ -860,8 +887,19 @@ class SystemSimulator(Block):
             )
 
             neighbor_ids = curr_neigh_inds[:, :, 1:]
+
+            # Handle potential extra dimensions (Rank 8: [B, U, N, RxP, TxP, Extra, T, F])
+            if len(h_batch_port.shape) == 8:
+                # Remove Extra(5), Time(6). Keep Neighbors(1: at dim 2)
+                # Sliced: [B, U, N(1:), RxP, TxP, F]
+                h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, 0, :]
+            else:
+                # Standard Rank 7: [B, U, N, RxP, TxP, T, F]
+                # Remove Time(5)
+                h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, :]
+
             h_int = tf.transpose(
-                h_batch_port[:, :, 1:, :, :, 0, :], [0, 1, 2, 5, 3, 4]
+                h_int_sliced, [0, 1, 2, 5, 3, 4]
             )  # [B, U_batch, Neighbors, F, RxP, TxP]
 
             if self.direction == "uplink":

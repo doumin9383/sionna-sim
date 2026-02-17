@@ -17,8 +17,16 @@ def run_test():
     config = SLSConfig()
 
     # 4. Instantiate Simulator
+    # Check for external data configuration
+    external_loader_cls = None
+    if config.external_data_path:
+        print(f"External Data Path found: {config.external_data_path}")
+        from experiments.hybrid_beamforming.sls.external_loader import SLSExternalLoader
+
+        external_loader_cls = SLSExternalLoader
+
     # ResourceGridやPanelArrayはSimulator内部でConfigから生成される
-    sim = SystemSimulator(config=config)
+    sim = SystemSimulator(config=config, external_loader=external_loader_cls)
 
     # 5. Run Simulation
     print(
