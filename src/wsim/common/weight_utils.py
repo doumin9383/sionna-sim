@@ -1,7 +1,14 @@
 import tensorflow as tf
 
 
-def compute_digital_weights(h, granularity, rbg_size_sc=None, weight_type="svd"):
+def compute_digital_weights(
+    h,
+    granularity,
+    rbg_size_sc=None,
+    weight_type="svd",
+    force_tx_identity=False,
+    force_rx_identity=False,
+):
     """
     粒度に応じたデジタル重み（プリコーダ/コンバイナ）を計算する。
 
@@ -63,6 +70,38 @@ def compute_digital_weights(h, granularity, rbg_size_sc=None, weight_type="svd")
         # h_coarse: [..., Coarse_Freq, RxP, TxP]
         # Transpose for SVD: tf.linalg.svd expects [..., M, N]
         s, u, v = tf.linalg.svd(h_coarse)
+
+        # Non-coherent support (Identity overwrite)
+        if force_tx_identity:
+            # v: [..., Coarse_Freq, TxP, TxP] Identity
+            # v from SVD is [..., TxP, TxP] (if full matrices) or [..., TxP, Rank]
+            # Here we want full identity [..., TxP, TxP]
+            # Shape of h_coarse: [..., RxP, TxP]
+            tx_p = tf.shape(h_coarse)[-1]
+            batch_shape = tf.shape(h_coarse)[:-2]
+            eye_tx = tf.eye(tx_p, dtype=h_coarse.dtype)
+            # Expand to batch shape
+            # eye_tx: [TxP, TxP] -> [1, ..., 1, TxP, TxP]
+            reshape_shape = tf.concat(
+                [tf.ones(tf.shape(batch_shape), dtype=tf.int32), [tx_p, tx_p]], axis=0
+            )
+            v_identity = tf.reshape(eye_tx, reshape_shape)
+            # Tile to match batch
+            tile_multiples = tf.concat([batch_shape, [1, 1]], axis=0)
+            v = tf.tile(v_identity, tile_multiples)
+
+        if force_rx_identity:
+            # u: [..., Coarse_Freq, RxP, RxP] Identity
+            rx_p = tf.shape(h_coarse)[-2]
+            batch_shape = tf.shape(h_coarse)[:-2]
+            eye_rx = tf.eye(rx_p, dtype=h_coarse.dtype)
+            reshape_shape = tf.concat(
+                [tf.ones(tf.shape(batch_shape), dtype=tf.int32), [rx_p, rx_p]], axis=0
+            )
+            u_identity = tf.reshape(eye_rx, reshape_shape)
+            tile_multiples = tf.concat([batch_shape, [1, 1]], axis=0)
+            u = tf.tile(u_identity, tile_multiples)
+
         return s, u, v
     else:
         raise NotImplementedError(f"Weight type {weight_type} not implemented")
@@ -101,7 +140,14 @@ def expand_weights(w, target_fft_size, granularity, rbg_size_sc=None):
 
 
 def get_digital_precoders(
-    h, num_layers, granularity, target_res, rbg_size_sc=None, weight_type="svd"
+    h,
+    num_layers,
+    granularity,
+    target_res,
+    rbg_size_sc=None,
+    weight_type="svd",
+    force_tx_identity=False,
+    force_rx_identity=False,
 ):
     """
     Computes and expands digital precoders/combiners for the target simulation resolution.
@@ -122,7 +168,12 @@ def get_digital_precoders(
     # 1. 粒度に応じた重み計算 (Aggregation & SVD)
     # s: [..., Coarse_F, Rank_Full], u: [..., Coarse_F, RxP, Rank_Full], v: [..., Coarse_F, TxP, Rank_Full]
     s, u, v = compute_digital_weights(
-        h, granularity, rbg_size_sc=rbg_size_sc, weight_type=weight_type
+        h,
+        granularity,
+        rbg_size_sc=rbg_size_sc,
+        weight_type=weight_type,
+        force_tx_identity=force_tx_identity,
+        force_rx_identity=force_rx_identity,
     )
 
     # 2. Slicing (上位 num_layers を抽出)
