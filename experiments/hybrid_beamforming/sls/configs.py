@@ -31,6 +31,9 @@ class SLSConfig(SimulationCommonConfig):
         4  # For spatial masking: num BS per UT to calculate channel for
     )
     num_layers: int = 4  # Number of layers for spatial multiplexing
+    available_layers: List[int] = field(
+        default_factory=lambda: [1, 2, 4]
+    )  # Ranks to sweep in link adaptation
     batch_size_ut: int = 1  # UT batch size for memory management
     max_la_iterations: int = 2  # Max iterations for MPR/LA convergence
     max_rank_selection_iterations: int = 2  # Max iterations for Rank Selection loop
