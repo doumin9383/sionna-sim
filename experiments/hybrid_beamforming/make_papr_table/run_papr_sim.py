@@ -102,6 +102,7 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         )
 
         papr_values = []
+        cm_values = []
 
         for i in range(current_num_batches):
             # Generate signal
@@ -111,9 +112,21 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
             if i == 0 and sc["num_rb"] in representative_rb:
                 plot_individual_waveform(x, scenario_id, results_dir)
 
+            # Determine active antennas (Inactive Antenna Filtering)
+            # Compute power per antenna [batch, tx]
+            power = tf.reduce_mean(tf.abs(x) ** 2, axis=-1)
+            threshold = 1e-6  # Power threshold for active antenna
+            active_mask = power > threshold
+
             # Compute PAPR
             papr_db_batch = model.compute_papr(x)
-            papr_values.extend(papr_db_batch.numpy().flatten())
+            # Filter inactive antennas
+            valid_papr = tf.boolean_mask(papr_db_batch, active_mask)
+            papr_values.extend(valid_papr.numpy().flatten())
+
+            # Compute CM
+            cm_values_batch = compute_cm(x, active_mask)
+            cm_values.extend(cm_values_batch.numpy().flatten())
 
         # Store for global comparison
         if sc["num_rb"] in representative_rb:
@@ -128,13 +141,30 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
         if sc["num_rb"] in representative_rb:
             plot_individual_ccdf(papr_sorted, scenario_id, results_dir)
 
-        # Compute 10e-3 CCDF
+        # Compute 10e-3 CCDF and CM stats
         idx = int(0.999 * len(papr_sorted))
-        papr_10e_3 = papr_sorted[idx]
+        papr_10e_3 = papr_sorted[idx] if len(papr_sorted) > 0 else 0.0
+
+        # CM Calculation (Average CM is typical, but we can also store raw if needed)
+        # For MPR table, we usually use a representative CM value.
+        # 3GPP defines CM as a property of the signal, so mean or worst-case?
+        # Typically the CM itself is a scalar metric per signal.
+        # We have a distribution of CMs (one per slot/antenna).
+        # We can take the mean CM or 99% CM?
+        # 3GPP TS 38.101 usually refers to CM as a single value for a configuration.
+        # Let's take the mean of the calculated CMs.
+        if len(cm_values) > 0:
+            cm_mean = np.mean(cm_values)
+            cm_99 = np.percentile(cm_values, 99)
+        else:
+            cm_mean = 0.0
+            cm_99 = 0.0
 
         # Record result
         res = sc.copy()
         res["papr_db_10e-3"] = papr_10e_3
+        res["cm_db"] = cm_mean
+        res["cm_db_99"] = cm_99
         results.append(res)
 
         # --- Memory Management ---
@@ -157,6 +187,44 @@ def run_papr_simulation(config: HybridLLSConfig = HybridLLSConfig()):
     npz_file = output_file.replace(".csv", ".npz")
     np.savez_compressed(npz_file, **all_papr_data)
     print(f"Raw PAPR data saved to {npz_file}")
+
+
+def compute_cm(x, mask=None):
+    """
+    Computes Cubic Metric (CM) of time-domain signal x.
+    x: [batch, tx, time]
+    mask: [batch, tx] boolean mask of active antennas. If None, all assumed active.
+    """
+    # Normalize signal
+    # 3GPP defines CM for the signal. We calculate it per antenna active port.
+
+    if mask is not None:
+        # Mask x to get only active signals.
+        valid_x = tf.boolean_mask(x, mask)  # [num_valid_samples, time]
+
+        if tf.size(valid_x) == 0:
+            return tf.constant([], dtype=tf.float32)
+
+        # Normalize
+        # Rms of each active signal
+        rms = tf.sqrt(tf.reduce_mean(tf.abs(valid_x) ** 2, axis=-1, keepdims=True))
+        x_norm = valid_x / tf.cast(rms + 1e-12, valid_x.dtype)
+
+        # CM calculation
+        # v_rms3 = sqrt(mean(|x|^6))
+        v_pow6_mean = tf.reduce_mean(tf.abs(x_norm) ** 6, axis=-1)
+        # cm = 20 * log10(v_rms3) / 1.56 = 10 * log10(v_pow6_mean) / 1.56
+        cm_values = 10.0 * tf.math.log(v_pow6_mean) / tf.math.log(10.0) / 1.56
+
+        return cm_values  # [num_valid_samples]
+
+    else:
+        # Standard calculation preserving shape
+        rms = tf.sqrt(tf.reduce_mean(tf.abs(x) ** 2, axis=-1, keepdims=True))
+        x_norm = x / tf.cast(rms + 1e-12, x.dtype)
+        v_pow6_mean = tf.reduce_mean(tf.abs(x_norm) ** 6, axis=-1)
+        cm_values = 10.0 * tf.math.log(v_pow6_mean) / tf.math.log(10.0) / 1.56
+        return cm_values
 
 
 def plot_individual_waveform(x, scenario_id, results_dir):

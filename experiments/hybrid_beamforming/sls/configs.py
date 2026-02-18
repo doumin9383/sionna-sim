@@ -41,6 +41,13 @@ class SLSConfig(SimulationCommonConfig):
     num_symbols_per_slot: int = 14  # Number of symbols in a slot for throughput scaling
     num_data_symbols: int = 12  # Number of effective data symbols (excluding DMRS)
 
+    # MPR Model
+    mpr_model_type: str = "linear"  # "linear" or "table"
+    mpr_linear_slope: float = 0.5
+    mpr_linear_ref_papr: float = 9.6
+    mpr_linear_ref_backoff: float = 0.5
+    mpr_table_mode_column: str = "cm_db"
+
     # Beam Management
     beambook_oversampling_factor: int = 4
     beam_selection_method: str = (

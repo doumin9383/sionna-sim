@@ -182,7 +182,8 @@ class SystemSimulator(Block):
         )
 
         # Instantiate SLS components
-        self.mpr_model = MPRModel(csv_path=config.mpr_table_path)
+        # Instantiate SLS components
+        self.mpr_model = MPRModel(config=config)
         self.power_control = PowerControl(
             p_power_class=config.ut_max_power_dbm, method=config.power_control_method
         )
