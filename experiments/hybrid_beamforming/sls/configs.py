@@ -53,6 +53,7 @@ class SLSConfig(SimulationCommonConfig):
     # Power Settings
     bs_max_power_dbm: float = 43.0
     ut_max_power_dbm: float = 23.0
+    power_control_method: str = "sionna"  # "sionna" or "custom"
 
     # Topology
     topology_type: str = "HexGrid"  # "HexGrid", "Custom", etc.

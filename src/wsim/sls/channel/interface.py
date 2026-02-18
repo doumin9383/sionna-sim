@@ -141,42 +141,92 @@ class HybridChannelInterface(Block):
             return_s_u_v=False,
         )
 
-    def approximate_distant_interference(
-        self, ut_loc, bs_loc, neighbor_indices_to_mask, p_tx_watt=0.251
-    ):
+    def get_serving_pathloss(self, batch_size, serving_bs_ids=None):
         """
-        Phase 3.6: Calculate approximate interference from non-neighbor BSs.
-        Computes distance-based Path Loss and returns estimated interference power [Watt].
+        Computes pathloss from the serving BS to each UT based on the generated channel.
+        Uses sionna.sys.utils.get_pathloss to extract pathloss from channel coefficients.
+
+        Args:
+            batch_size (int): Batch size
+            serving_bs_ids (tf.Tensor): [batch_size, num_ut] IDs of serving BSs.
+                                      If None, assumes Neighbor 0 is always the serving BS.
+
+        Returns:
+            tf.Tensor: Pathloss in dB [batch_size, num_ut]
         """
-        # (Simplified distance-based model)
-        # ut_loc: [Batch, UT, 3], bs_loc: [Batch, BS, 3]
-        # 1. Distances
-        diff = tf.expand_dims(ut_loc, 2) - tf.expand_dims(bs_loc, 1)  # [B, U, BS, 3]
-        dist_3d = tf.norm(diff, axis=-1)  # [B, U, BS]
+        # 1. External Loader Case
+        if self.external_loader is not None:
+            # If external loader has explicit power map, use it
+            if (
+                hasattr(self.external_loader, "get_power_map")
+                and self.hybrid_channel._global_topology
+            ):
+                # Need mesh indices. This might be tricky if not stored.
+                # Assuming simulator handles this call or we reuse stored topology?
+                # Actually simulator calls external_loader.get_power_map directly currently.
+                # We should try to support it here if possible, but simulator.py has the mesh indices.
+                # For now, let's rely on standard 'get_neighbor_channel_info' path which works for both.
+                pass
 
-        # 2. Simplified Path Loss (3GPP UMi style logic or generic)
-        # pl = 32.4 + 21*log10(d) + 20*log10(fc)
-        # Using a very simple alpha=3.5 exponent for placeholder
-        # p_rx = p_tx / (dist^alpha)
-        int_power = p_tx_watt / tf.pow(tf.maximum(dist_3d, 1.0), 3.5)
+        # 2. Get Serving Channel (Neighbor 0)
+        # We assume Neighbor 0 is the Serving BS as per simulator logic
+        # But to be safe, if serving_bs_ids is provided, we should ensure we get that.
+        # However, 'get_neighbor_channel_info' relies on 'neighbor_indices'.
+        # In Simulator.py, neighbor_indices[:,:,0] IS the serving BS.
 
-        # 3. Mask neighbors
-        # neighbor_indices_to_mask: [Batch, UT, NeighborCount]
-        # Create a mask for all BSs
-        num_bs = tf.shape(bs_loc)[1]
-        bs_ids = tf.range(num_bs)
-        # mask is [Batch, UT, BS]
-        mask = tf.reduce_any(
-            tf.equal(
-                tf.expand_dims(tf.expand_dims(bs_ids, 0), 0),
-                tf.expand_dims(neighbor_indices_to_mask, -1),
-            ),
-            axis=2,
+        # [Batch, UT, Neighbor(1), RxP, TxP, Time, Freq]
+        # We only need Neighbor 0
+        if self.neighbor_indices is None:
+            raise ValueError(
+                "neighbor_indices must be set to calculate serving pathloss"
+            )
+
+        # Slice neighbor_indices for Serving BS (index 0)
+        serving_neighbor_indices = self.neighbor_indices[:, :, 0:1]  # [B, U, 1]
+
+        h_serving = self.get_neighbor_channel_info(
+            batch_size,
+            ut_loc=self.hybrid_channel._global_topology["ut_loc"],
+            bs_loc=self.hybrid_channel._global_topology["bs_loc"],
+            ut_orient=self.hybrid_channel._global_topology["ut_orient"],
+            bs_orient=self.hybrid_channel._global_topology["bs_orient"],
+            neighbor_indices=serving_neighbor_indices,
+            ut_velocities=self.hybrid_channel._global_topology["ut_velocities"],
+            in_state=self.hybrid_channel._global_topology["in_state"],
+            # return_element_channel=False, (Removed duplicate)
+            # No, Pathloss is purely physical/propagation.
+            # Ideally we want 'return_element_channel=True' for raw pathloss.
+            # But 'get_pathloss' works on the provided H.
+            # If we provide Beamformed H, PL will include Beamforming Gain.
+            # Standard 3GPP Pathloss/Open Loop PC usually excludes BF gain (compensated by PL).
+            # But Open Loop PC formula: P_tx = P0 + alpha * PL.
+            # If PL includes BF gain (is smaller), P_tx will be smaller.
+            # If we want to compensate for "Propagation Loss", we should use Element Channel.
+            return_element_channel=True,
+            return_s_u_v=False,
         )
 
-        int_power_masked = tf.where(mask, 0.0, int_power)
+        # h_serving: [B, U, 1, RxAnt, TxAnt, Time, Freq]
+        # remove neighbor dim
+        h_serving = tf.squeeze(h_serving, axis=2)  # [B, U, RxA, TxA, T, F]
 
-        return tf.reduce_sum(int_power_masked, axis=2, keepdims=True)  # [B, U, 1]
+        # Use simple averaging to get pathloss (linear)
+        # PL_lin = 1 / E[|h|^2]
+        # sionna.sys.utils.get_pathloss expects [..., Rx, RxAnt, Tx, TxAnt, T, F]
+        # But here dimensions are [B, U(Rx), RxA, TxA, T, F] (Tx is implicit/single serving)
+
+        # Manual calculation to be safe and avoid dimension shuffling for utility
+        rx_power = tf.reduce_mean(
+            tf.square(tf.abs(h_serving)), axis=[-1, -2, -3, -4]
+        )  # Mean over F, T, TxA, RxA
+
+        # Avoid zero division
+        rx_power = tf.maximum(rx_power, 1e-20)
+        pl_lin = 1.0 / rx_power
+
+        pl_db = 10.0 * tf.math.log(pl_lin) / tf.math.log(10.0)
+
+        return pl_db
 
     def call(self, batch_size):
         """Mandatory block entry point."""

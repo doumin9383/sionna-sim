@@ -14,8 +14,8 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from .configs import HybridLLSConfig
-from .components.pusch_model import (
+from experiments.hybrid_beamforming.make_papr_table.configs import HybridLLSConfig
+from experiments.hybrid_beamforming.make_papr_table.components.pusch_model import (
     PUSCHCommunicationModel,
 )
 

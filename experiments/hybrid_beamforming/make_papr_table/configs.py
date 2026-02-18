@@ -34,11 +34,14 @@ class HybridLLSConfig(SimulationCommonConfig):
     # rb_counts: List[int] = field(default_factory=lambda: np.arange(6, 132 + 6, 6))
     rb_counts: List[int] = field(default_factory=lambda: [6, 66, 132])
     granularities: List[Union[int, str]] = field(
-        default_factory=lambda: ["Subcarrer-wise", "Narrowband", "Subband", "Wideband"]
+        # default_factory=lambda: ["Subcarrer-wise", "Narrowband", "Subband", "Wideband"]
+        default_factory=lambda: ["Narrowband", "Subband", "Wideband"]
     )
     precoding_strategies: List[str] = field(default_factory=lambda: ["SVD", "Identity"])
 
     papr_oversampling_factor: int = 4
 
     # Results
-    output_file: str = "experiments/hybrid_beamforming/shared/papr_table.csv"
+    output_file: str = (
+        "experiments/hybrid_beamforming/make_papr_table/results/papr_table.csv"
+    )

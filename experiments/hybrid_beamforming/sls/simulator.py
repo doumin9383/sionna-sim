@@ -183,7 +183,9 @@ class SystemSimulator(Block):
 
         # Instantiate SLS components
         self.mpr_model = MPRModel(csv_path=config.mpr_table_path)
-        self.power_control = PowerControl(p_power_class=config.ut_max_power_dbm)
+        self.power_control = PowerControl(
+            p_power_class=config.ut_max_power_dbm, method=config.power_control_method
+        )
 
         is_dfts = config.waveform == "DFT-s-OFDM"
         # DFT-s-OFDM かつ 専用テーブルフラグTrue の場合のみ TP用テーブルを使用
@@ -357,6 +359,7 @@ class SystemSimulator(Block):
         _, neighbor_indices = tf.math.top_k(-dist_modified, k=self.config.num_neighbors)
         # neighbor_indices shape: [batch, num_ut, num_neighbors]
         self.neighbor_indices = neighbor_indices
+        self.channel_interface.neighbor_indices = neighbor_indices
 
         # 3. Set topology in channel model
 
@@ -1029,15 +1032,12 @@ class SystemSimulator(Block):
                 powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
             )
             serving_power = tf.squeeze(serving_power, axis=-1)
-            pl_db = self.config.bs_max_power_dbm - serving_power
+            # pl_db = self.config.bs_max_power_dbm - serving_power
+            # Ideally we use Model Derived Pathloss
+            pl_db = self.channel_interface.get_serving_pathloss(self.batch_size)
         else:
-            fc_ghz = self.config.carrier_frequency / 1e9
-            dist_safe = tf.maximum(dist, 1.0)
-            pl_db = (
-                28.0
-                + 22.0 * tf.math.log(dist_safe) / tf.math.log(10.0)
-                + 20.0 * tf.math.log(fc_ghz) / tf.math.log(10.0)
-            )
+            # Replaced hardcoded pathloss with model-derived pathloss
+            pl_db = self.channel_interface.get_serving_pathloss(self.batch_size)
 
         # 3. MPR (Maximum Power Reduction)
         mod_name = self._get_modulation_name(mcs_index)
@@ -1062,7 +1062,7 @@ class SystemSimulator(Block):
         # 4. Tx Power 計算
         if self.direction == "uplink":
             num_rbs = self.resource_grid.num_effective_subcarriers / 12.0
-            p_tx_dbm = self.power_control.calculate_tx_power(pl_db, num_rbs, mpr_db)
+            p_tx_dbm = self.power_control.calculate_uplink_power(pl_db, num_rbs, mpr_db)
             p_cmax_dbm = self.ut_max_power_dbm - mpr_db
         else:
             p_tx_dbm = tx_power_dbm
