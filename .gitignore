@@ -37,6 +37,7 @@ ENV/
 
 # My Project junk
 results/
+results*/
 data/matlab_dummy/
 *.log
 test_log.txt

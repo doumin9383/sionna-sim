@@ -23,13 +23,16 @@ class SLSConfig(SimulationCommonConfig):
     num_slots: int = 1  # Fixed to 1 for snapshot simulation
 
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
-    precoding_strategy: str = "SVD"  # "SVD", "Identity" (Non-coherent)
+    # precoding_strategy: str = "SVD"  # "SVD", "Identity" (Non-coherent)
+    precoding_strategy: str = "Identity"  # "SVD", "Identity" (Non-coherent)
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
-    waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
+    # waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
+    waveform: str = "DFT-s-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
     cyclic_prefix_length: int = 0  # CP length for ResourceGrid
     export_detailed_logs: bool = False  # If True, export detailed rank selection logs
     num_neighbors: Optional[int] = (
-        4  # For spatial masking: num BS per UT to calculate channel for. None means all cells.
+        # 4  # For spatial masking: num BS per UT to calculate channel for. None means all cells.
+        None
     )
     num_layers: int = 4  # Number of layers for spatial multiplexing
     available_layers: List[int] = field(
@@ -64,7 +67,7 @@ class SLSConfig(SimulationCommonConfig):
 
     # Topology
     topology_type: str = "HexGrid"  # "HexGrid", "Custom", etc.
-    topology_wrap: bool = False  # wrapネットワーク干渉を考慮するか
+    topology_wrap: bool = True  # wrapネットワーク干渉を考慮するか
     # hex gridの場合
     num_rings: int = 1
     num_ut_per_sector: int = 1
@@ -91,7 +94,7 @@ class SLSConfig(SimulationCommonConfig):
             )
 
     # Scenario
-    scenario: str = "umi"  # "umi", "uma", "rma"
+    scenario: str = "uma"  # "umi", "uma", "rma"
 
     # Mobility/Link Adaptation
     coherence_time: int = 10  # slots

@@ -133,8 +133,8 @@ class MCSLinkAdaptation:
 
         # Get Max Index over available MCS
         selected_mcs = tf.reduce_max(indices_masked, axis=-1)
-
         # Throughput = SE * (1 - BLER_target)
+        throughput = selected_se * (1.0 - self.target_bler)
         return throughput, selected_mcs
 
     def get_common_mcs_throughput(self, sinr_db, reduce_axes, mask=None):
@@ -182,6 +182,11 @@ class MCSLinkAdaptation:
         # Select the best MCS that maximizes the total SE
         best_mcs_idx = tf.argmax(total_se_per_mcs, axis=-1, output_type=tf.int32)
         best_total_se = tf.reduce_max(total_se_per_mcs, axis=-1)
+
+        # If no MCS is supported, total SE is 0. In this case, select -1 as MCS.
+        best_mcs_idx = tf.where(
+            best_total_se > 0.0, best_mcs_idx, tf.constant(-1, dtype=tf.int32)
+        )
 
         # Calculate final throughput sum
         throughput_sum = best_total_se * (1.0 - self.target_bler)
