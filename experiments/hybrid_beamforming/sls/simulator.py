@@ -1071,15 +1071,9 @@ class SystemSimulator(Block):
         mod_name = self._get_modulation_name(mcs_index)
         num_rb = self.config.num_rb
         granularity = self.config.precoding_granularity
-        transform_precoding = (
-            self.config.waveform == "DFT-s-OFDM"
-            and self.config.use_transform_precoding_mcs_table
-        )
-
         mpr_db = self.mpr_model.get_mpr(
             self.config.waveform,
             rank,
-            transform_precoding,
             mod_name,
             num_rb,
             granularity,

@@ -69,9 +69,7 @@ class MPRModel:
             mpr = k * (papr - papr_ref) + mpr_ref
             return max(mpr, 0.0)
 
-    def get_mpr(
-        self, waveform, rank, transform_precoding, modulation, num_rb, granularity
-    ):
+    def get_mpr(self, waveform, rank, modulation, num_rb, granularity):
         """
         Returns MPR in dB for the given parameters.
         Supports both scalar and tensor inputs for rank and other parameters if needed,
@@ -80,21 +78,19 @@ class MPRModel:
         if not self.mpr_table:
             return tf.zeros_like(rank, dtype=tf.float32) if tf.is_tensor(rank) else 0.0
 
-        def lookup_mpr(r, tp, mod, rb, gran):
+        def lookup_mpr(r, mod, rb, gran):
             if isinstance(mod, bytes):
                 mod = mod.decode("utf-8")
             if isinstance(gran, bytes):
                 gran = gran.decode("utf-8")
 
             rank_str = str(int(r))
-            tp_str = str(bool(tp))
             rb_str = str(int(rb))
 
             for row in self.mpr_table:
                 if (
                     row.get("waveform") == waveform
                     and row.get("rank") == rank_str
-                    and row.get("transform_precoding") == tp_str
                     and row.get("modulation") == mod
                     and row.get("num_rb") == rb_str
                     and row.get("granularity") == gran
@@ -112,17 +108,12 @@ class MPRModel:
             return 0.0
 
         # Vectorized lookup for tensors
-        def vectorized_lookup(r_v, tp_v, mod_v, rb_v, gran_v):
+        def vectorized_lookup(r_v, mod_v, rb_v, gran_v):
             # Convert tensors to numpy if they aren't already (py_function handles this)
-            return np.vectorize(lookup_mpr)(r_v, tp_v, mod_v, rb_v, gran_v)
+            return np.vectorize(lookup_mpr)(r_v, mod_v, rb_v, gran_v)
 
         if tf.is_tensor(rank):
             # Ensure all inputs are tensors for py_function
-            tp_t = (
-                tf.convert_to_tensor(transform_precoding)
-                if not tf.is_tensor(transform_precoding)
-                else transform_precoding
-            )
             mod_t = (
                 tf.convert_to_tensor(modulation)
                 if not tf.is_tensor(modulation)
@@ -137,12 +128,10 @@ class MPRModel:
 
             mpr = tf.py_function(
                 func=vectorized_lookup,
-                inp=[rank, tp_t, mod_t, rb_t, gran_t],
+                inp=[rank, mod_t, rb_t, gran_t],
                 Tout=tf.float32,
             )
             mpr.set_shape(rank.shape)
             return mpr
         else:
-            return lookup_mpr(
-                rank, transform_precoding, modulation, num_rb, granularity
-            )
+            return lookup_mpr(rank, modulation, num_rb, granularity)
