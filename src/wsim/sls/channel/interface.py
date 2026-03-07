@@ -141,7 +141,17 @@ class HybridChannelInterface(Block):
             return_s_u_v=False,
         )
 
-    def get_serving_pathloss(self, batch_size, serving_bs_ids=None):
+    def get_serving_pathloss(
+        self,
+        batch_size,
+        serving_bs_ids=None,
+        ut_loc=None,
+        bs_loc=None,
+        ut_orient=None,
+        bs_orient=None,
+        ut_velocities=None,
+        in_state=None,
+    ):
         """
         Computes pathloss from the serving BS to each UT based on the generated channel.
         Uses sionna.sys.utils.get_pathloss to extract pathloss from channel coefficients.
@@ -161,21 +171,40 @@ class HybridChannelInterface(Block):
                 hasattr(self.external_loader, "get_power_map")
                 and self.hybrid_channel._global_topology
             ):
-                # Need mesh indices. This might be tricky if not stored.
-                # Assuming simulator handles this call or we reuse stored topology?
-                # Actually simulator calls external_loader.get_power_map directly currently.
-                # We should try to support it here if possible, but simulator.py has the mesh indices.
-                # For now, let's rely on standard 'get_neighbor_channel_info' path which works for both.
                 pass
 
-        # 2. Get Serving Channel (Neighbor 0)
-        # We assume Neighbor 0 is the Serving BS as per simulator logic
-        # But to be safe, if serving_bs_ids is provided, we should ensure we get that.
-        # However, 'get_neighbor_channel_info' relies on 'neighbor_indices'.
-        # In Simulator.py, neighbor_indices[:,:,0] IS the serving BS.
+        # Use explicitly provided topology or fallback to global topology
+        ut_loc = (
+            ut_loc
+            if ut_loc is not None
+            else self.hybrid_channel._global_topology["ut_loc"]
+        )
+        bs_loc = (
+            bs_loc
+            if bs_loc is not None
+            else self.hybrid_channel._global_topology["bs_loc"]
+        )
+        ut_orient = (
+            ut_orient
+            if ut_orient is not None
+            else self.hybrid_channel._global_topology["ut_orient"]
+        )
+        bs_orient = (
+            bs_orient
+            if bs_orient is not None
+            else self.hybrid_channel._global_topology["bs_orient"]
+        )
+        ut_velocities = (
+            ut_velocities
+            if ut_velocities is not None
+            else self.hybrid_channel._global_topology["ut_velocities"]
+        )
+        in_state = (
+            in_state
+            if in_state is not None
+            else self.hybrid_channel._global_topology["in_state"]
+        )
 
-        # [Batch, UT, Neighbor(1), RxP, TxP, Time, Freq]
-        # We only need Neighbor 0
         if self.neighbor_indices is None:
             raise ValueError(
                 "neighbor_indices must be set to calculate serving pathloss"
@@ -186,22 +215,13 @@ class HybridChannelInterface(Block):
 
         h_serving = self.get_neighbor_channel_info(
             batch_size,
-            ut_loc=self.hybrid_channel._global_topology["ut_loc"],
-            bs_loc=self.hybrid_channel._global_topology["bs_loc"],
-            ut_orient=self.hybrid_channel._global_topology["ut_orient"],
-            bs_orient=self.hybrid_channel._global_topology["bs_orient"],
+            ut_loc=ut_loc,
+            bs_loc=bs_loc,
+            ut_orient=ut_orient,
+            bs_orient=bs_orient,
             neighbor_indices=serving_neighbor_indices,
-            ut_velocities=self.hybrid_channel._global_topology["ut_velocities"],
-            in_state=self.hybrid_channel._global_topology["in_state"],
-            # return_element_channel=False, (Removed duplicate)
-            # No, Pathloss is purely physical/propagation.
-            # Ideally we want 'return_element_channel=True' for raw pathloss.
-            # But 'get_pathloss' works on the provided H.
-            # If we provide Beamformed H, PL will include Beamforming Gain.
-            # Standard 3GPP Pathloss/Open Loop PC usually excludes BF gain (compensated by PL).
-            # But Open Loop PC formula: P_tx = P0 + alpha * PL.
-            # If PL includes BF gain (is smaller), P_tx will be smaller.
-            # If we want to compensate for "Propagation Loss", we should use Element Channel.
+            ut_velocities=ut_velocities,
+            in_state=in_state,
             return_element_channel=True,
             return_s_u_v=False,
         )

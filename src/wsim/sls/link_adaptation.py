@@ -135,6 +135,55 @@ class MCSLinkAdaptation:
         selected_mcs = tf.reduce_max(indices_masked, axis=-1)
 
         # Throughput = SE * (1 - BLER_target)
-        throughput = selected_se * (1.0 - self.target_bler)
-
         return throughput, selected_mcs
+
+    def get_common_mcs_throughput(self, sinr_db, reduce_axes, mask=None):
+        """
+        Evaluate all possible MCS indices across the specified axes (e.g. Frequency and Layers)
+        and select a single, common MCS that maximizes the total throughput sum.
+
+        Args:
+            sinr_db (tf.Tensor): Effective SINR in dB. Shape e.g., [Batch, UT, F, Layers]
+            reduce_axes (list or tuple): The axes over which to sum the throughput to evaluate the best MCS.
+                                         e.g., [-1, -2] for summing over Freq and Layers.
+            mask (tf.Tensor, optional): Boolean mask indicating valid entries. Must be broadcastable to sinr_db.
+                                        Invalid entries will not contribute to the sum.
+
+        Returns:
+            throughput_sum (tf.Tensor): The maximized total throughput (SE * (1-BLER)) for the selected common MCS.
+                                        Shape will have the `reduce_axes` removed.
+            selected_mcs (tf.Tensor): The index of the selected common MCS.
+                                      Shape will have the `reduce_axes` removed.
+        """
+        req_sinr = tf.constant([row[3] for row in self.mcs_table], dtype=sinr_db.dtype)
+        se = tf.constant(
+            [row[1] * (row[2] / 1024.0) for row in self.mcs_table], dtype=sinr_db.dtype
+        )
+
+        # Expand dims for broadcasting over the MCS table (last dim)
+        # sinr_expanded shape: [..., 1]
+        sinr_expanded = tf.expand_dims(sinr_db, -1)
+
+        # Compare: sinr >= req ?
+        # supported shape: [..., NumMCS]
+        supported = sinr_expanded >= req_sinr
+
+        if mask is not None:
+            mask_expanded = tf.expand_dims(mask, -1)
+            supported = tf.logical_and(supported, mask_expanded)
+
+        # Get SE for supported REs. If not supported, SE is 0.
+        se_masked = tf.where(supported, se, tf.zeros_like(se))
+
+        # Sum SE over the specified axes for each MCS option
+        # total_se_per_mcs shape: [..., NumMCS] (with reduce_axes removed)
+        total_se_per_mcs = tf.reduce_sum(se_masked, axis=reduce_axes)
+
+        # Select the best MCS that maximizes the total SE
+        best_mcs_idx = tf.argmax(total_se_per_mcs, axis=-1, output_type=tf.int32)
+        best_total_se = tf.reduce_max(total_se_per_mcs, axis=-1)
+
+        # Calculate final throughput sum
+        throughput_sum = best_total_se * (1.0 - self.target_bler)
+
+        return throughput_sum, best_mcs_idx

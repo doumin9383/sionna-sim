@@ -257,7 +257,7 @@ class SLSExternalLoader:
         # Since we use RT, this is less critical unless Hybrid needs it.
         los = tf.zeros((B, num_ut, self.num_bs), dtype=tf.bool)  # Dummy
 
-        return {
+        topo_dict = {
             "ut_loc": ut_loc,
             "bs_loc": bs_loc,
             "ut_orient": ut_orient,
@@ -267,6 +267,24 @@ class SLSExternalLoader:
             "los": los,
             # "serving_cell_id": ... # Optional, can be derived by distance
         }
+
+        if self.config.topology_wrap:
+            # If wrap is enabled, try to provide bs_virtual_loc from the loader's metadata
+            # For bounded meshes without wrap, this will remain None or we can fallback to bs_loc
+            if (
+                hasattr(self.loader, "bs_virtual_loc")
+                and self.loader.bs_virtual_loc is not None
+            ):
+                bs_v_loc = tf.convert_to_tensor(
+                    self.loader.bs_virtual_loc, dtype=tf.float32
+                )
+                bs_v_loc = tf.broadcast_to(bs_v_loc[None, ...], [B, *bs_v_loc.shape])
+                topo_dict["bs_virtual_loc"] = bs_v_loc
+            else:
+                # Provide a dummy single-wrap (standard positions) as fallback
+                topo_dict["bs_virtual_loc"] = tf.expand_dims(bs_loc, axis=2)
+
+        return topo_dict
 
     def __call__(self, config):
         """

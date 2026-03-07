@@ -28,8 +28,8 @@ class SLSConfig(SimulationCommonConfig):
     waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
     cyclic_prefix_length: int = 0  # CP length for ResourceGrid
     export_detailed_logs: bool = False  # If True, export detailed rank selection logs
-    num_neighbors: int = (
-        4  # For spatial masking: num BS per UT to calculate channel for
+    num_neighbors: Optional[int] = (
+        4  # For spatial masking: num BS per UT to calculate channel for. None means all cells.
     )
     num_layers: int = 4  # Number of layers for spatial multiplexing
     available_layers: List[int] = field(
@@ -64,6 +64,7 @@ class SLSConfig(SimulationCommonConfig):
 
     # Topology
     topology_type: str = "HexGrid"  # "HexGrid", "Custom", etc.
+    topology_wrap: bool = False  # wrapネットワーク干渉を考慮するか
     # hex gridの場合
     num_rings: int = 1
     num_ut_per_sector: int = 1

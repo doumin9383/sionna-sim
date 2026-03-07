@@ -273,14 +273,11 @@ class SystemSimulator(Block):
 
             self.ut_mesh_indices = self.loader_instance.find_nearest_mesh(self.ut_loc)
 
-            # BS Virtual Loc needs to be derived or loaded?
-            # gen_hexgrid_topology returns it.
-            # If not saved, we might need it for some logic?
-            # It's used for wrapped-around distance calculation if enabled.
-            # If we don't support wrap-around in external mode or if saved bs_loc is already virtual/final?
-            # Usually bs_loc is enough for distance if no wrap-around logic is explicitly called later.
-            # We'll set it to None or bs_loc for now.
-            self.bs_virtual_loc = None
+            # Get bs_virtual_loc from external loader if available and wrap is enabled
+            if self.config.topology_wrap and "bs_virtual_loc" in topo:
+                self.bs_virtual_loc = topo["bs_virtual_loc"]
+            else:
+                self.bs_virtual_loc = None
 
             # Update counts to match external data
             self.num_ut = tf.shape(self.ut_loc)[1]
@@ -319,8 +316,25 @@ class SystemSimulator(Block):
 
         # 1. Calculate distances [batch, num_ut, num_bs]
         # ut_loc: [batch, num_ut, 3], bs_loc: [batch, num_bs, 3]
-        diff = tf.expand_dims(self.ut_loc, axis=2) - tf.expand_dims(self.bs_loc, axis=1)
-        dist = tf.norm(diff, axis=-1)
+        if self.config.topology_wrap and self.bs_virtual_loc is not None:
+            # bs_virtual_loc is usually [batch, num_bs, num_wrap_copies, 3]
+            bs_v_loc = self.bs_virtual_loc
+            if len(self.bs_virtual_loc.shape) == 3:
+                bs_v_loc = tf.expand_dims(self.bs_virtual_loc, axis=2)
+
+            # Compute distance between each UT and all virtual BS positions
+            # diff shape: [batch, num_ut, num_bs, num_wrap_copies, 3]
+            diff = tf.expand_dims(
+                tf.expand_dims(self.ut_loc, axis=2), axis=3
+            ) - tf.expand_dims(bs_v_loc, axis=1)
+            dist_all = tf.norm(diff, axis=-1)
+            # Take minimum distance across wrap copies
+            dist = tf.reduce_min(dist_all, axis=-1)
+        else:
+            diff = tf.expand_dims(self.ut_loc, axis=2) - tf.expand_dims(
+                self.bs_loc, axis=1
+            )
+            dist = tf.norm(diff, axis=-1)
 
         # 2. Define Explicit Serving BS Association
         if self.serving_cell_id is not None:
@@ -357,8 +371,13 @@ class SystemSimulator(Block):
         dist_modified = tf.where(is_serving, -1.0e9, dist)
 
         # Select neighbors
-        _, neighbor_indices = tf.math.top_k(-dist_modified, k=self.config.num_neighbors)
-        # neighbor_indices shape: [batch, num_ut, num_neighbors]
+        k_neighbors = (
+            self.config.num_neighbors
+            if self.config.num_neighbors is not None
+            else current_num_bs
+        )
+        _, neighbor_indices = tf.math.top_k(-dist_modified, k=k_neighbors)
+        # neighbor_indices shape: [batch, num_ut, k_neighbors]
         self.neighbor_indices = neighbor_indices
         self.channel_interface.neighbor_indices = neighbor_indices
 
@@ -371,6 +390,9 @@ class SystemSimulator(Block):
         else:
             los_arg = self.los
 
+        # Sionna calculates wrap-around internally if bs_virtual_loc is provided
+        bs_virtual_loc_arg = self.bs_virtual_loc if self.config.topology_wrap else None
+
         self.channel_model.set_topology(
             self.ut_loc,
             self.bs_loc,
@@ -379,7 +401,7 @@ class SystemSimulator(Block):
             self.ut_velocities,
             self.in_state,
             los_arg,
-            self.bs_virtual_loc,
+            bs_virtual_loc_arg,
         )
 
     def _setup_drop_topology(self, drop_idx):
@@ -718,13 +740,10 @@ class SystemSimulator(Block):
                         10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
                     )
 
-                    # MCS & Throughput
-                    tp_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(
-                        sinr_db
+                    # Common MCS & Throughput Sum across layers and frequency
+                    tp_sum, mcs_idx = self.mcs_adapter.get_common_mcs_throughput(
+                        sinr_db, reduce_axes=[-1, -2]
                     )
-
-                    # Sum throughput across layers and frequency
-                    tp_sum = tf.reduce_sum(tp_per_re, axis=[-1, -2])  # [B, U_sub]
 
                     if self.config.use_rbg_granularity:
                         tp_sum *= tf.cast(self.rbg_size_sc, self.rdtype)
@@ -762,14 +781,7 @@ class SystemSimulator(Block):
                                         "sinr_db_avg": float(
                                             tf.reduce_mean(sinr_db[b, u_local, :, :])
                                         ),
-                                        "mcs_idx_avg": float(
-                                            tf.reduce_mean(
-                                                tf.cast(
-                                                    mcs_idx[b, u_local, :, :],
-                                                    tf.float32,
-                                                )
-                                            )
-                                        ),
+                                        "mcs_idx_avg": float(mcs_idx[b, u_local]),
                                         "throughput_bits": float(tp_sum[b, u_local]),
                                         "interference_power_dbm": (
                                             float(
@@ -1033,12 +1045,27 @@ class SystemSimulator(Block):
                 powers_dbm, serving_bs_idx_expand, axis=2, batch_dims=2
             )
             serving_power = tf.squeeze(serving_power, axis=-1)
-            # pl_db = self.config.bs_max_power_dbm - serving_power
             # Ideally we use Model Derived Pathloss
-            pl_db = self.channel_interface.get_serving_pathloss(self.batch_size)
+            pl_db = self.channel_interface.get_serving_pathloss(
+                self.batch_size,
+                ut_loc=self.ut_loc,
+                bs_loc=self.bs_loc,
+                ut_orient=self.ut_orientations,
+                bs_orient=self.bs_orientations,
+                ut_velocities=self.ut_velocities,
+                in_state=self.in_state,
+            )
         else:
             # Replaced hardcoded pathloss with model-derived pathloss
-            pl_db = self.channel_interface.get_serving_pathloss(self.batch_size)
+            pl_db = self.channel_interface.get_serving_pathloss(
+                self.batch_size,
+                ut_loc=self.ut_loc,
+                bs_loc=self.bs_loc,
+                ut_orient=self.ut_orientations,
+                bs_orient=self.bs_orientations,
+                ut_velocities=self.ut_velocities,
+                in_state=self.in_state,
+            )
 
         # 3. MPR (Maximum Power Reduction)
         mod_name = self._get_modulation_name(mcs_index)
@@ -1173,18 +1200,13 @@ class SystemSimulator(Block):
         sinr_safe = tf.where(mask, sinr, tf.ones_like(sinr))
         sinr_db = 10.0 * tf.math.log(sinr_safe) / tf.math.log(10.0)
 
-        # MCS lookup
-        capacity_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(sinr_db)
-
-        # Mask unused layers capacity
-        capacity_per_re = tf.where(
-            mask, capacity_per_re, tf.zeros_like(capacity_per_re)
+        # Common MCS lookup with mask
+        throughput_per_user, mcs_idx = self.mcs_adapter.get_common_mcs_throughput(
+            sinr_db, reduce_axes=[-1, -2], mask=mask
         )
 
         if self.config.use_rbg_granularity:
-            capacity_per_re *= tf.cast(self.rbg_size_sc, self.rdtype)
-
-        throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
+            throughput_per_user *= tf.cast(self.rbg_size_sc, self.rdtype)
 
         # 修正: 1シンボルあたりのビット数 -> 1スロット分（有効データシンボルのみ）にスケール
         throughput_per_user *= tf.cast(self.config.num_data_symbols, self.rdtype)
@@ -1194,9 +1216,7 @@ class SystemSimulator(Block):
         sinr_eff_avg = tf.reduce_sum(
             sinr * tf.cast(mask, self.rdtype), axis=[-1, -2]
         ) / (active_layers * tf.cast(self.simulation_freq_res, self.rdtype))
-        mcs_idx_avg = tf.reduce_sum(
-            tf.cast(mcs_idx, self.rdtype) * tf.cast(mask, self.rdtype), axis=[-1, -2]
-        ) / (active_layers * tf.cast(self.simulation_freq_res, self.rdtype))
+        mcs_idx_avg = tf.cast(mcs_idx, self.rdtype)
 
         return {
             "sinr": sinr,
@@ -1353,13 +1373,15 @@ class SystemSimulator(Block):
 
         sinr = s_power / (i_total + self.no)
         sinr_db = 10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
-        capacity_per_re, mcs_idx = self.mcs_adapter.get_throughput_vectorized(sinr_db)
+
+        throughput_per_user, mcs_idx = self.mcs_adapter.get_common_mcs_throughput(
+            sinr_db, reduce_axes=[-1, -2]
+        )
 
         if self.config.use_rbg_granularity:
-            capacity_per_re *= tf.cast(self.rbg_size_sc, self.rdtype)
+            throughput_per_user *= tf.cast(self.rbg_size_sc, self.rdtype)
 
-        throughput_per_user = tf.reduce_sum(capacity_per_re, axis=[-1, -2])
-        mcs_idx_avg = tf.reduce_mean(tf.cast(mcs_idx, tf.float32), axis=[-1, -2])
+        mcs_idx_avg = tf.cast(mcs_idx, tf.float32)
         sinr_eff_avg = tf.reduce_mean(sinr, axis=[-1, -2])
 
         return {
