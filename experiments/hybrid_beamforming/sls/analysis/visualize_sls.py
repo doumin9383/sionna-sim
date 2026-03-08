@@ -24,23 +24,38 @@ def plot_cdf(df, col, xlabel, output_dir, filename):
 
 
 def plot_resource_allocation(df, output_dir):
-    """各セルのリソース割り当て状況をヒートマップで可視化する (全スロット)"""
-    # 最終反復のみ抽出
+    """各セルのリソース割り当て状況をヒートマップで可視化する (全スロット)
+    縦軸: サブキャリア(RB)
+    横軸: スロット(Drop)
+    色   : UE-ID
+    """
+    npy_path = os.path.join(output_dir, "bs_alloc_map.npy")
+    if not os.path.exists(npy_path):
+        print(
+            f"RBベース割り当てマップが見つからないため、リソース割り当て図をスキップします。({npy_path})"
+        )
+        return
+
+    # csvには最終LA結果が含まれるとしているが、NPYは全レコードある。
     max_iter = df["LA_Iter_ID"].max()
-    df_plot = df[df["LA_Iter_ID"] == max_iter].copy()
+    bs_alloc_map = np.load(npy_path)  # shape: [num_records, batch, num_bs, num_rb]
+    R, B, NBS, NRB = bs_alloc_map.shape
 
-    # セル、スロット、UEの情報を整理
-    for col in ["BS_ID", "Slot_ID", "UT_Sector_ID", "Allocation_Ratio"]:
-        if col not in df_plot.columns:
-            print(
-                f"カラム {col} が見つからないため、リソース割り当て図をスキップします。"
-            )
-            return
+    num_la_iter = int(max_iter) + 1
+    num_drops = R // num_la_iter
+    if num_drops * num_la_iter != R:
+        print("Warning: NPY shape mismatch with expected records")
+        return
 
-    bs_ids = sorted(df_plot["BS_ID"].unique())
-    num_bs = len(bs_ids)
-    slots = sorted(df_plot["Slot_ID"].unique())
-    num_slots = len(slots)
+    # [num_drops, num_la_iter, batch, num_bs, num_rb] に変形し、最終反復を抽出
+    bs_alloc_map_reshaped = bs_alloc_map.reshape(num_drops, num_la_iter, B, NBS, NRB)
+    final_alloc = bs_alloc_map_reshaped[
+        :, max_iter, 0, :, :
+    ]  # assuming batch=0. shape: [num_drops, num_bs, num_rb]
+
+    num_slots = num_drops
+    num_bs = NBS
+    num_rb = NRB
 
     if num_slots < 1:
         print("スロット情報がないため、リソース割り当て図をスキップします。")
@@ -59,50 +74,49 @@ def plot_resource_allocation(df, output_dir):
     )
 
     im = None
-    for i, bs_id in enumerate(bs_ids):
+    import matplotlib.colors as mcolors
+
+    # -1(未割当)とUE-ID(0,1,2...)を色分けするためのColormapを作成
+    cmap = plt.cm.get_cmap("tab10", 10).copy()
+    cmap.set_under("white")  # -1 は白
+
+    for i in range(num_bs):
         r, c = divmod(i, cols)
         ax = axes[r, c]
 
-        cell_data = df_plot[df_plot["BS_ID"] == bs_id]
-        ue_sector_ids = sorted(cell_data["UT_Sector_ID"].unique())
-        num_ue_sector = len(ue_sector_ids)
-
-        allocation_matrix = np.zeros((num_ue_sector, num_slots))
-
-        for j, slot in enumerate(slots):
-            slot_data = cell_data[cell_data["Slot_ID"] == slot]
-            for k, ue_sec_id in enumerate(ue_sector_ids):
-                val = slot_data[slot_data["UT_Sector_ID"] == ue_sec_id][
-                    "Allocation_Ratio"
-                ].values
-                if len(val) > 0:
-                    allocation_matrix[k, j] = val[0]
+        # 横: Slot(num_drops), 縦: RB
+        allocation_matrix = final_alloc[:, i, :].T  # [num_rb, num_slots]
 
         im = ax.imshow(
             allocation_matrix,
             aspect="auto",
             origin="lower",
-            extent=[slots[0], slots[-1], 0, num_ue_sector],
-            cmap="YlGnBu",
-            vmin=0,
-            vmax=1,
+            extent=[-0.5, num_slots - 0.5, -0.5, num_rb - 0.5],
+            cmap=cmap,
+            vmin=-0.5,
+            vmax=9.5,
+            interpolation="nearest",
         )
-        ax.set_title(f"Cell {bs_id}")
-        ax.set_yticks(np.arange(num_ue_sector) + 0.5)
-        ax.set_yticklabels([f"UE{sid}" for sid in ue_sector_ids])
+        ax.set_title(f"Cell {i}")
+        if c == 0:
+            ax.set_ylabel("Subcarrier (RB)")
+        if r == rows - 1:
+            ax.set_xlabel("Slot Index")
+        # 縦軸の目盛りを少し間引く
+        ax.set_yticks(np.arange(0, num_rb, max(1, num_rb // 10)))
 
-    fig.text(0.5, 0.04, "Slot Index", ha="center")
-    fig.text(0.04, 0.5, "UE (Sector ID)", va="center", rotation="vertical")
     fig.suptitle("Resource Allocation Heatmap per Cell")
 
     if im is not None:
         cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-        fig.colorbar(im, cax=cbar_ax, label="Allocation Ratio (RBGs)")
+        fig.colorbar(
+            im, cax=cbar_ax, label="UE ID (White: Unallocated)", ticks=np.arange(0, 10)
+        )
 
     plt.tight_layout(rect=[0.05, 0.05, 0.9, 0.95])
     path = os.path.join(output_dir, "resource_allocation_heatmap.png")
     plt.savefig(path)
-    print(f"リソース割り当て図を保存しました: {path}")
+    print(f"RBベース割り当て図を保存しました: {path}")
     plt.close()
 
 

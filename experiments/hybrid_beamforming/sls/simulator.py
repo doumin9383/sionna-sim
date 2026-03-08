@@ -1382,6 +1382,7 @@ class SystemSimulator(Block):
             "pl_alloc": pl_alloc,
             "mpr_alloc": mpr_alloc,
             "p_cmax_alloc": p_cmax_alloc,
+            "allocation_mask": allocation_mask,
         }
 
     def _process_single_rank_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt, rank):
@@ -1534,6 +1535,11 @@ class SystemSimulator(Block):
                 tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector]
             )
 
+        def match_hist_shape_rb(tensor):
+            return tf.reshape(
+                tensor, [self.batch_size, self.num_bs, self.num_ut_per_sector, -1]
+            )
+
         return record_results(
             hist,
             drop_idx,
@@ -1557,11 +1563,17 @@ class SystemSimulator(Block):
             beam_idx=match_hist_shape(beam_idx),
             interference_power=match_hist_shape(results["interference_power"]),
             allocation_mask=(
-                match_hist_shape(
-                    tf.reduce_mean(tf.cast(allocation_mask, tf.float32), axis=-1)
-                )
+                match_hist_shape_rb(tf.cast(allocation_mask, tf.float32))
                 if allocation_mask is not None
-                else tf.zeros(match_hist_shape(pl_db).shape, dtype=tf.float32)
+                else tf.zeros(
+                    [
+                        self.batch_size,
+                        self.num_bs,
+                        self.num_ut_per_sector,
+                        self.simulation_freq_res,
+                    ],
+                    dtype=tf.float32,
+                )
             ),
             ut_loc=ut_loc,
             bs_loc=bs_loc,

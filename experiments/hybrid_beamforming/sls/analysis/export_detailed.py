@@ -75,7 +75,6 @@ def export_sls_data(history, output_dir, slot_duration=1e-3, max_la_iterations=5
         "Tx_Power_Watt": "tx_power",
         "Beam_Index": "beam_idx",
         "Interference_Power_Lin": "interference_power",
-        "Allocation_Ratio": "allocation_mask",  # Ratio of allocated RBGs
         "P_Cmax_dBm": "p_cmax_dbm",
         "MPR_dB": "mpr_db",
     }
@@ -89,6 +88,28 @@ def export_sls_data(history, output_dir, slot_duration=1e-3, max_la_iterations=5
                 print(
                     f"Skipping {col_name}: shape mismatch {len(val)} vs {total_samples}"
                 )
+
+    # Allocation Mask の特別処理
+    if "allocation_mask" in history:
+        alloc_mask_np = to_np(history["allocation_mask"])
+
+        # 1. CSV用の割当RB数計算
+        if alloc_mask_np.ndim in [4, 5]:
+            # 各サンプルの割当RB数 (Axis=-1 で和をとる)
+            allocated_rbs = np.sum(alloc_mask_np, axis=-1).flatten()
+            if len(allocated_rbs) == total_samples:
+                df["Allocated_RBs"] = allocated_rbs
+
+        # 2. RBベース割り当てマップの保存 (.npy)
+        if alloc_mask_np.ndim == 5:
+            # [num_records, batch, num_bs, num_ut_sector, num_rb] -> [num_records, batch, num_bs, num_rb]
+            max_alloc = np.max(alloc_mask_np, axis=3)
+            argmax_alloc = np.argmax(alloc_mask_np, axis=3)
+            bs_alloc_map = np.where(max_alloc > 0.5, argmax_alloc, -1)
+
+            npy_path = os.path.join(output_dir, "bs_alloc_map.npy")
+            np.save(npy_path, bs_alloc_map)
+            print(f"RB割り当てマップを保存しました: {npy_path}")
 
     # トポロジー情報の追加 (ut_loc, bs_loc)
     # distance の計算も行う
