@@ -27,32 +27,44 @@ def train_fdd_model(config, data_path):
     Y = []
 
     for sample in data:
-        # UL Features
-        if config.use_singular_vectors:
-            # Flatten UL V vector: [BUT, F, TxP, Rank]
-            ul_v = sample["ul_svd"]["v"]
-            X.append(ul_v.flatten())
-        else:
-            # Use Path Features (Pattern B)
-            # Simplification: flattening all path info
-            paths = sample["ul_paths"]
-            feat_list = []
-            if "gain_abs" in paths:
-                feat_list.append(paths["gain_abs"].flatten())
-            if "delay" in paths:
-                feat_list.append(paths["delay"].flatten())
-            if "aoa_azimuth" in paths:
-                feat_list.append(paths["aoa_azimuth"].flatten())
-            if "aod_azimuth" in paths:
-                feat_list.append(paths["aod_azimuth"].flatten())
-            X.append(np.concatenate(feat_list))
-
-        # Target: DL V vector (flattened)
+        # UL SVD V: [B, BUT, F, TxP, Rank]
+        ul_v = sample["ul_svd"]["v"]
         dl_v = sample["dl_svd"]["v"]
-        # Convert complex to real/imag for regression
-        # dl_v: [BUT, F, TxP, Rank]
-        target = np.concatenate([np.real(dl_v).flatten(), np.imag(dl_v).flatten()])
-        Y.append(target)
+        paths = sample["ul_paths"]
+
+        B_val, BUT_val, F_val, TxP_val, Rank_val = ul_v.shape
+        num_ut_per_sector = config.num_ut_per_sector
+
+        for b in range(B_val):
+            for u in range(BUT_val):
+                # Target: DL V (complex flatten)
+                target = np.concatenate(
+                    [np.real(dl_v[b, u]).flatten(), np.imag(dl_v[b, u]).flatten()]
+                )
+                Y.append(target)
+
+                # Features
+                if config.use_singular_vectors:
+                    # Pattern A: UL V Vectors
+                    feat = np.concatenate(
+                        [np.real(ul_v[b, u]).flatten(), np.imag(ul_v[b, u]).flatten()]
+                    )
+                    X.append(feat)
+                else:
+                    # Pattern B: Path Features
+                    # Indexing: paths['gain_abs'] is [B, num_bs, num_ut, C]
+                    # We take the serving BS index
+                    bs_idx = u // num_ut_per_sector
+                    feat_list = []
+                    if "gain_abs" in paths:
+                        feat_list.append(paths["gain_abs"][b, bs_idx, u].flatten())
+                    if "delay" in paths:
+                        feat_list.append(paths["delay"][b, bs_idx, u].flatten())
+                    if "aoa_azimuth" in paths:
+                        feat_list.append(paths["aoa_azimuth"][b, bs_idx, u].flatten())
+                    if "aod_azimuth" in paths:
+                        feat_list.append(paths["aod_azimuth"][b, bs_idx, u].flatten())
+                    X.append(np.concatenate(feat_list))
 
     X = np.array(X)
     Y = np.array(Y)
@@ -119,8 +131,8 @@ def plot_fdd_results(results, output_dir):
 
 def main():
     config = SLSConfig()
-    config.num_ut_drops = 5  # Sufficient for basic CDF
-    config.num_slots = 5
+    config.num_ut_drops = 2  # Small for quick check
+    config.num_slots = 2
     config.precoding_granularity = "Wideband"
 
     # Step 1: Data Generation
@@ -128,8 +140,8 @@ def main():
     if not os.path.exists(data_path):
         print("Starting Data Generation Phase...")
         generator = FDDDataGenerator(config)
-        # Collect enough data for training
-        data = generator.collect_data(num_drops=10, num_slots_per_drop=10)
+        # Collect very small data for quick verification
+        data = generator.collect_data(num_drops=2, num_slots_per_drop=2)
         generator.save_data(data, data_path)
     else:
         print(f"Using existing data at {data_path}")
@@ -138,7 +150,6 @@ def main():
     ml_model = train_fdd_model(config, data_path)
 
     # Step 3: Evaluation
-    # Note: SystemSimulator now accepts ml_model in __init__
     results = run_fdd_evaluation(config, ml_model)
 
     # Step 4: Plotting

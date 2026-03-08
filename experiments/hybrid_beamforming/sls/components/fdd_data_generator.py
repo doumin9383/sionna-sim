@@ -43,13 +43,16 @@ class FDDDataGenerator:
         }
 
         if self.config.scenario == "umi":
-            return UMi(o2i_model="low", **common_params)
+            model = UMi(o2i_model=self.config.o2i_model, **common_params)
         elif self.config.scenario == "uma":
-            return UMa(o2i_model="low", **common_params)
+            model = UMa(o2i_model=self.config.o2i_model, **common_params)
         elif self.config.scenario == "rma":
-            return RMa(**common_params)
+            model = RMa(o2i_model=self.config.o2i_model, **common_params)
         else:
             raise ValueError(f"Unknown scenario: {self.config.scenario}")
+
+        model.return_rays = True
+        return model
 
     def generate_topology(self):
         """Generates random topology (UT locations etc.)"""
@@ -62,7 +65,9 @@ class FDDDataGenerator:
             min_bs_ut_dist=self.config.min_bs_ut_dist,
             max_bs_ut_dist=self.config.max_bs_ut_dist,
             scenario=self.config.scenario,
-            precision=tf.float32,
+            los=True,
+            return_grid=True,
+            precision="single",
         )
 
     def compute_svd_vectors(self, h, granularity="subband"):
@@ -96,27 +101,19 @@ class FDDDataGenerator:
         )
         return u, v, s
 
-    def extract_features_from_paths(self, paths):
-        """
-        Extracts Pattern B features: Gain, Delay, AoA, AoD.
-        paths is a sionna.phy.channel.tr38901.Paths object.
-        """
+    def extract_features_from_rays(self, rays):
+        """Extracts and flattens specific features from the Sionna Rays object."""
         features = {}
-        # a: [batch, num_rx, num_tx, num_clusters, num_rays]
+        # rays properties: powers, delays, aoa, zoa, aod, zod
         if self.config.use_path_gain:
-            features["gain_abs"] = tf.abs(paths.a)
-            features["gain_phase"] = tf.math.angle(paths.a)
-
+            # use power as gain feature
+            features["gain_abs"] = tf.sqrt(rays.powers).numpy()
         if self.config.use_path_delay:
-            features["delay"] = paths.tau
-
+            features["delay"] = rays.delays.numpy()
         if self.config.use_path_aoa:
-            features["aoa_zenith"] = paths.theta_r
-            features["aoa_azimuth"] = paths.phi_r
-
+            features["aoa_azimuth"] = rays.aoa.numpy()
         if self.config.use_path_aod:
-            features["aod_zenith"] = paths.theta_t
-            features["aod_azimuth"] = paths.phi_t
+            features["aod_azimuth"] = rays.aod.numpy()
 
         return features
 
@@ -142,16 +139,16 @@ class FDDDataGenerator:
 
             for slot in range(num_slots_per_drop):
                 # Generate UL Channel
-                ul_h, ul_paths = self.ul_channel_model(
-                    num_samples=1, sampling_frequency=sampling_frequency
+                ul_h, ul_delays, ul_rays = self.ul_channel_model(
+                    num_time_samples=1, sampling_frequency=sampling_frequency
                 )
                 # Generate DL Channel
-                dl_h, dl_paths = self.dl_channel_model(
-                    num_samples=1, sampling_frequency=sampling_frequency
+                dl_h, dl_delays, dl_rays = self.dl_channel_model(
+                    num_time_samples=1, sampling_frequency=sampling_frequency
                 )
 
-                # Extract UL Features (Pattern B: Paths)
-                ul_path_features = self.extract_features_from_paths(ul_paths)
+                # Extract UL Features (Pattern B: Rays)
+                ul_path_features = self.extract_features_from_rays(ul_rays)
 
                 # Extract UL SVD (Pattern A)
                 ul_u, ul_v, ul_s = self.compute_svd_vectors(ul_h)
@@ -170,6 +167,7 @@ class FDDDataGenerator:
                 all_data.append(sample)
                 pbar.update(1)
         pbar.close()
+        return all_data
 
     def save_data(self, data, filename):
         """Saves collected data to a pickle file."""

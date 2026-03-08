@@ -21,6 +21,7 @@ class SLSConfig(SimulationCommonConfig):
 
     num_ut_drops: int = 5  # Debug: 1. Number of random topology drops.
     num_slots: int = 10  # Number of slots per drop for time evolution
+    batch_size_ut: int = 128  # Number of UTs to process in a batch
     coherence_time: int = 10  # [slots] Channel coherence time in slots
 
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
@@ -39,7 +40,6 @@ class SLSConfig(SimulationCommonConfig):
     available_layers: List[int] = field(
         default_factory=lambda: [1, 2, 4]
     )  # Ranks to sweep in link adaptation
-    batch_size_ut: int = 1  # UT batch size for memory management
     max_la_iterations: int = 2  # Max iterations for MPR/LA convergence
     max_rank_selection_iterations: int = 2  # Max iterations for Rank Selection loop
     num_symbols_per_slot: int = 14  # Number of symbols in a slot for throughput scaling
@@ -110,8 +110,8 @@ class SLSConfig(SimulationCommonConfig):
     # Mobility/Link Adaptation
     pf_beta: float = 0.98
 
-    # FDD Settings
-    ul_carrier_frequency: float = 2.0e9
+    o2i_model: str = "low"  # "low" or "high"
+    ul_carrier_frequency: float = 2.1e9
     dl_carrier_frequency: float = 2.1e9
 
     # Path Feature Flags for ML

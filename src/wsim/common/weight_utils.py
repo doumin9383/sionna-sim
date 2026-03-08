@@ -107,33 +107,41 @@ def compute_digital_weights(
         raise NotImplementedError(f"Weight type {weight_type} not implemented")
 
 
-def expand_weights(w, target_fft_size, granularity, rbg_size_sc=None):
+def expand_weights(w, target_fft_size, granularity, rbg_size_sc=None, axis=-3):
     """
     計算された重みをフル有効サブキャリアサイズに展開する。
 
     Args:
-        w (tf.Tensor): 重み行列 [..., Num_Blocks, P, R]
+        w (tf.Tensor): 重み行列 [..., Num_Blocks, P, R] または [..., Num_Blocks, R]
         target_fft_size (int): 展開後の有効サブキャリア数
         granularity (str): 'wideband', 'subband', 'narrowband', 'carrierwise'
         rbg_size_sc (int): Subband時のサブキャリア数
+        axis (int): 展開する周波数軸の指定。デフォルトは-3 (u, v用)。sの場合は-2を指定。
 
     Returns:
         w_expanded: 展開後の重み [..., target_fft_size, P, R]
     """
     if granularity == "wideband":
-        # w: [..., 1, P, R]
-        multiples = [1] * (w.shape.rank - 3) + [target_fft_size, 1, 1]
-        return tf.tile(w, multiples)
+        # w: [..., 1, ...]
+        return tf.repeat(w, repeats=target_fft_size, axis=axis)
 
     elif granularity == "subband":
-        # w: [..., Num_RBG, P, R]
-        w_rep = tf.repeat(w, repeats=rbg_size_sc, axis=-3)
-        return w_rep[..., :target_fft_size, :, :]
+        # w: [..., Num_RBG, ...]
+        w_rep = tf.repeat(w, repeats=rbg_size_sc, axis=axis)
+        return (
+            w_rep[..., :target_fft_size, :, :]
+            if axis == -3
+            else w_rep[..., :target_fft_size, :]
+        )
 
     elif granularity == "narrowband":
-        # w: [..., Num_RB, P, R]
-        w_rep = tf.repeat(w, repeats=12, axis=-3)
-        return w_rep[..., :target_fft_size, :, :]
+        # w: [..., Num_RB, ...]
+        w_rep = tf.repeat(w, repeats=12, axis=axis)
+        return (
+            w_rep[..., :target_fft_size, :, :]
+            if axis == -3
+            else w_rep[..., :target_fft_size, :]
+        )
 
     else:  # carrierwise
         return w
@@ -161,9 +169,9 @@ def get_digital_precoders(
         weight_type (str): 'svd', 'zf', 'mrt', etc. (Currently only 'svd')
 
     Returns:
-        w_ut (tf.Tensor): UT precoder/combiner [..., target_res, P, num_layers]
-        w_bs (tf.Tensor): BS combiner/precoder [..., target_res, P, num_layers]
-        s_val (tf.Tensor): Singular values [..., target_res, num_layers]
+        u_exp (tf.Tensor): BS weight [..., target_res, P, num_layers]
+        v_exp (tf.Tensor): UT weight [..., target_res, P, num_layers]
+        s_exp (tf.Tensor): Singular values [..., target_res, num_layers]
     """
     # 1. 粒度に応じた重み計算 (Aggregation & SVD)
     # s: [..., Coarse_F, Rank_Full], u: [..., Coarse_F, RxP, Rank_Full], v: [..., Coarse_F, TxP, Rank_Full]
@@ -182,9 +190,10 @@ def get_digital_precoders(
     v_sliced = v[..., :num_layers]
 
     # 3. Expansion (ターゲット解像度に展開)
-    s_exp = expand_weights(s_sliced, target_res, granularity, rbg_size_sc)
-    u_exp = expand_weights(u_sliced, target_res, granularity, rbg_size_sc)
-    v_exp = expand_weights(v_sliced, target_res, granularity, rbg_size_sc)
+    # u, v has 5 dims [B, U, F, P, K], s has 4 dims [B, U, F, K]
+    s_exp = expand_weights(s_sliced, target_res, granularity, rbg_size_sc, axis=-2)
+    u_exp = expand_weights(u_sliced, target_res, granularity, rbg_size_sc, axis=-3)
+    v_exp = expand_weights(v_sliced, target_res, granularity, rbg_size_sc, axis=-3)
 
     # Return u as w_bs (or w_ut depending on link direction, handled by caller mapping)
     # SVD returns u (Left SV) and v (Right SV).

@@ -238,7 +238,9 @@ class SystemSimulator(Block):
     def simulation_freq_res(self):
         """Simulation Frequency Resolution (N_target)"""
         if self.config.use_rbg_granularity:
-            return self.resource_grid.fft_size // self.rbg_size_sc
+            # Match weight_utils.py logic to handle edge subcarriers correctly
+            n_f = self.resource_grid.fft_size
+            return (n_f + self.rbg_size_sc - 1) // self.rbg_size_sc
         return self.resource_grid.num_effective_subcarriers
 
     def _create_channel_model(self, scenario, carrier_frequency, o2i_model):
@@ -292,6 +294,9 @@ class SystemSimulator(Block):
             self.ul_channel_model = self._create_channel_model(
                 scenario, self.config.ul_carrier_frequency, o2i_model
             )
+            # ML推論でパス情報を使う場合は rays を返すように設定
+            if not self.config.use_singular_vectors:
+                self.ul_channel_model.return_rays = True
         else:
             self.ul_channel_model = self.channel_model
 
@@ -723,43 +728,99 @@ class SystemSimulator(Block):
                 and self.ml_model is not None
             ):
                 # ML Predicted Strategy
-                # 1. Get UL Channel for features
-                h_ul_port = self.ul_channel_interface.get_neighbor_channel_info(
-                    batch_size=B,
-                    ut_loc=self.ut_loc[:, start_ut:end_ut, :],
-                    bs_loc=self.bs_loc,
-                    ut_orient=self.ut_orientations[:, start_ut:end_ut, :],
-                    bs_orient=self.bs_orientations,
-                    neighbor_indices=srv_indices,
-                    ut_velocities=self.ut_velocities[:, start_ut:end_ut, :],
-                    in_state=self.in_state[:, start_ut:end_ut],
-                    return_element_channel=False,
-                    return_s_u_v=False,
-                )
-                h_ul_sliced = (
-                    h_ul_port[:, :, 0, :, :, 0, :]
-                    if len(h_ul_port.shape) == 7
-                    else h_ul_port[:, :, 0, :, :, 0, 0, :]
-                )
-                h_ul = tf.transpose(h_ul_sliced, [0, 1, 4, 2, 3])
+                # 1. Get UL Channel information for features
+                sampling_frequency = 1 / self.resource_grid.ofdm_symbol_duration
+                if not self.config.use_singular_vectors:
+                    # Case: Path Features (Pattern B)
+                    # Call model to get rays
+                    ul_h, ul_delays, ul_rays = self.ul_channel_model(
+                        num_time_samples=1, sampling_frequency=sampling_frequency
+                    )
+                    num_ut_per_sector = self.config.num_ut_per_sector
+                    feat_list = []
 
-                # 2. Extract Features (Consistency with run_fdd_sim.py MVP: Pattern A)
-                u_ul, v_ul, s_ul = weight_utils.get_digital_precoders(
-                    h_ul, rank, granularity, N_target
-                )
+                    # Extract features per user for the serving BS
+                    if self.config.use_path_gain:
+                        p = tf.sqrt(ul_rays.powers)  # [B, num_bs, num_ut, clusters]
+                        p_srv = []
+                        for i, ut_idx in enumerate(range(start_ut, end_ut)):
+                            bs_idx = ut_idx // num_ut_per_sector
+                            p_srv.append(p[:, bs_idx, ut_idx, :])
+                        feat_list.append(
+                            tf.reshape(
+                                tf.stack(p_srv, axis=1), [B * curr_batch_size, -1]
+                            )
+                        )
 
-                # Features: Flattened real/imag UL V. Shape: [B*curr_batch_size, Features]
-                # v_ul: [B, curr_batch_size, N_target, TxP, Rank]
-                feat_input = tf.reshape(v_ul, [B * curr_batch_size, -1])
-                # Note: Model might expect specific real/imag format.
-                # Let's follow run_fdd_sim.py: X = UL V (complex flatten if using certain models, but Keras/LGBM usually needs real)
-                # If we use simple MLP/CNN and complex inputs, we should concat real/imag.
-                feat_input_real = tf.concat(
-                    [tf.math.real(feat_input), tf.math.imag(feat_input)], axis=-1
-                )
+                    if self.config.use_path_delay:
+                        d = ul_rays.delays
+                        d_srv = []
+                        for i, ut_idx in enumerate(range(start_ut, end_ut)):
+                            bs_idx = ut_idx // num_ut_per_sector
+                            d_srv.append(d[:, bs_idx, ut_idx, :])
+                        feat_list.append(
+                            tf.reshape(
+                                tf.stack(d_srv, axis=1), [B * curr_batch_size, -1]
+                            )
+                        )
+
+                    if self.config.use_path_aoa:
+                        a = ul_rays.aoa
+                        a_srv = []
+                        for i, ut_idx in enumerate(range(start_ut, end_ut)):
+                            bs_idx = ut_idx // num_ut_per_sector
+                            a_srv.append(a[:, bs_idx, ut_idx, :])
+                        feat_list.append(
+                            tf.reshape(
+                                tf.stack(a_srv, axis=1), [B * curr_batch_size, -1]
+                            )
+                        )
+
+                    if self.config.use_path_aod:
+                        o = ul_rays.aod
+                        o_srv = []
+                        for i, ut_idx in enumerate(range(start_ut, end_ut)):
+                            bs_idx = ut_idx // num_ut_per_sector
+                            o_srv.append(o[:, bs_idx, ut_idx, :])
+                        feat_list.append(
+                            tf.reshape(
+                                tf.stack(o_srv, axis=1), [B * curr_batch_size, -1]
+                            )
+                        )
+
+                    feat_input_real = tf.concat(feat_list, axis=-1)
+                else:
+                    # Case: SVD Singular Vectors (Pattern A)
+                    # 1. Get port channel for SVD
+                    h_ul_port = self.ul_channel_interface.get_neighbor_channel_info(
+                        batch_size=B,
+                        ut_loc=self.ut_loc[:, start_ut:end_ut, :],
+                        bs_loc=self.bs_loc,
+                        ut_orient=self.ut_orientations[:, start_ut:end_ut, :],
+                        bs_orient=self.bs_orientations,
+                        neighbor_indices=srv_indices,
+                        ut_velocities=self.ut_velocities[:, start_ut:end_ut, :],
+                        in_state=self.in_state[:, start_ut:end_ut],
+                        return_element_channel=False,
+                        return_s_u_v=False,
+                    )
+                    h_ul_sliced = (
+                        h_ul_port[:, :, 0, :, :, 0, :]
+                        if len(h_ul_port.shape) == 7
+                        else h_ul_port[:, :, 0, :, :, 0, 0, :]
+                    )
+                    h_ul = tf.transpose(h_ul_sliced, [0, 1, 4, 2, 3])
+
+                    u_ul, v_ul, s_ul = weight_utils.get_digital_precoders(
+                        h_ul, rank, granularity, N_target
+                    )
+                    # feat_input: [B, curr_batch_size, N_target, TxP, Rank] -> [B*curr_batch_size, -1]
+                    feat_flat = tf.reshape(v_ul, [B * curr_batch_size, -1])
+                    feat_input_real = tf.concat(
+                        [tf.math.real(feat_flat), tf.math.imag(feat_flat)], axis=-1
+                    )
 
                 # 3. Predict DL V using ML model
-                # predicted: [B*curr_batch_size, OutputDim]
                 if self.config.fdd_ml_model_type == "lightgbm":
                     predicted = self.ml_model.predict(feat_input_real.numpy())
                     predicted = tf.convert_to_tensor(predicted, dtype=self.rdtype)
@@ -767,7 +828,6 @@ class SystemSimulator(Block):
                     predicted = self.ml_model(feat_input_real, training=False)
 
                 # 4. Convert back to complex V
-                # predicted output format: [real_part, imag_part]
                 out_dim = predicted.shape[-1] // 2
                 res_real = tf.reshape(
                     predicted[:, :out_dim], [B, curr_batch_size, N_target, -1, rank]
@@ -777,10 +837,10 @@ class SystemSimulator(Block):
                 )
                 v_exp = tf.complex(res_real, res_imag)
 
-                # Orthogonalize predicted V to ensure valid precoder
+                # Orthogonalize predicted V
                 v_exp, _ = tf.linalg.qr(v_exp)
 
-                # Use standard DL SVD for combiner (U) and singular values (s) to see beam gain
+                # Use standard DL SVD for combiner (U) and singular values (s)
                 u_exp, _, s_exp = weight_utils.get_digital_precoders(
                     h_srv, rank, granularity, N_target
                 )
@@ -813,6 +873,10 @@ class SystemSimulator(Block):
             indices_bs = tf.stack([batch_indices, bs_ids_flat], axis=-1)
             indices_bs_flat = tf.reshape(indices_bs, [-1, 2])
 
+            # DEBUG print before reshape
+            print(
+                f"DEBUG: s_exp shape={s_exp.shape}, N_target={N_target}, rank={rank}, curr_batch={curr_batch_size}"
+            )
             s_exp_flat = tf.reshape(s_exp, [-1, N_target, rank])
             s_srv_full = tf.tensor_scatter_nd_update(
                 s_srv_full, indices_ut_flat, s_exp_flat
