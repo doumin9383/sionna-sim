@@ -1586,7 +1586,7 @@ class SystemSimulator(Block):
     # @tf.function(jit_compile=False)
     def call(self, num_drops, tx_power_dbm):
         """シミュレーションのメインループ（オーケストレーター）"""
-        num_records = num_drops * self.config.max_la_iterations
+        num_records = num_drops * self.config.num_slots * self.config.max_la_iterations
         hist = init_result_history(
             self.batch_size,
             num_records,
@@ -1600,83 +1600,102 @@ class SystemSimulator(Block):
             # 1. トポロジーのセットアップ
             self._setup_drop_topology(drop_idx)
 
-            # 2. アナログビーム選択
-            w_rf_bs, w_rf_bs_idx = self._select_analog_beams()
+            # --- Slot Loop ---
+            for slot_idx in range(self.config.num_slots):
+                # coherence_time に基づいてチャネル情報を更新するか決定
+                # 初回、または指定されたコヒーレンスタイムが経過した時に更新
+                if slot_idx % self.config.coherence_time == 0:
+                    # 2. アナログビーム選択
+                    w_rf_bs, w_rf_bs_idx = self._select_analog_beams()
 
-            # 3. デジタル重み計算 (SVD)
-            # 粒度は self.precoding_granularity を使用
-            w_ut_dig, w_bs_dig, s_srv = self._compute_digital_weights(
-                granularity=self.precoding_granularity
-            )
+                    # 3. デジタル重み計算 (SVD)
+                    # 粒度は self.precoding_granularity を使用
+                    w_ut_dig, w_bs_dig, s_srv = self._compute_digital_weights(
+                        granularity=self.precoding_granularity
+                    )
 
-            # --- LA / MPR 反復ループ ---
-            # 初期ランクをセット
-            rank = tf.fill(
-                [self.batch_size, self.num_ut],
-                tf.cast(self.config.num_layers, tf.float32),
-            )
-            mcs_index = None
-
-            for la_iter in range(self.config.max_la_iterations):
-                # 4. 送信電力制御 (直前の反復のRankに基づくMPRを適用)
-                # This initial power control is for the pre-allocation phase.
-                # The actual power control for final SINR is done inside _process_sinr_and_la.
-                p_tx_watt_iter, pl_db_iter, mpr_db_iter, p_cmax_dbm_iter = (
-                    self._apply_power_control(tx_power_dbm, rank, mcs_index=mcs_index)
+                # --- LA / MPR 反復ループ ---
+                # 初期ランクをセット
+                rank = tf.fill(
+                    [self.batch_size, self.num_ut],
+                    tf.cast(self.config.num_layers, tf.float32),
                 )
+                mcs_index = None
 
-                # 5. SINR計算 & Link Adaptation (Rank自律選択)
-                # ※ 現在の実装ではRankは固定だが、スループット計算は修正済み
-                results_iter = self._process_sinr_and_la(
-                    w_ut_dig,
-                    w_bs_dig,
-                    s_srv,
-                    tx_power_dbm,  # Use base tx_power_dbm for initial PC in _optimize_rank_allocation
-                    drop_idx=drop_idx,
-                    la_iter=la_iter,
-                    mcs_index_hint=mcs_index,
-                )
+                for la_iter in range(self.config.max_la_iterations):
+                    # 4. 送信電力制御 (直前の反復のRankに基づくMPRを適用)
+                    # This initial power control is for the pre-allocation phase.
+                    # The actual power control for final SINR is done inside _process_sinr_and_la.
+                    p_tx_watt_iter, pl_db_iter, mpr_db_iter, p_cmax_dbm_iter = (
+                        self._apply_power_control(
+                            tx_power_dbm, rank, mcs_index=mcs_index
+                        )
+                    )
 
-                # ランクの更新 (MPRに影響を与えるため、次回の反復で使用)
-                rank = results_iter["rank"]
-                mcs_index = results_iter["mcs_idx_avg"]
+                    # 5. SINR計算 & Link Adaptation (Rank自律選択)
+                    # ※ 現在の実装ではRankは固定だが、スループット計算は修正済み
+                    results_iter = self._process_sinr_and_la(
+                        w_ut_dig,
+                        w_bs_dig,
+                        s_srv,
+                        tx_power_dbm,  # Use base tx_power_dbm for initial PC in _optimize_rank_allocation
+                        drop_idx=drop_idx,
+                        la_iter=la_iter,
+                        mcs_index_hint=mcs_index,
+                    )
 
-                # 収束判定 (RankやMCSに変化がなければ終了、現状は最大回数回すか、簡易的な判定を入れる)
+                    # ランクの更新 (MPRに影響を与えるため、次回の反復で使用)
+                    rank = results_iter["rank"]
+                    mcs_index = results_iter["mcs_idx_avg"]
 
-                # 反復ごとに記録
-                # Global Record Index = drop_idx * max_la_iterations + la_iter
-                record_idx = drop_idx * self.config.max_la_iterations + la_iter
+                    # 収束判定 (RankやMCSに変化がなければ終了、現状は最大回数回すか、簡易的な判定を入れる)
 
-                # Expand dimensions for ut_loc/bs_loc to match history element_shape [Batch, N, 3]
-                # self.ut_loc is [N_UT, 3], needs to be [Batch, N_UT, 3] if batch > 1 or consistent
-                if len(self.ut_loc.shape) == 2:
-                    ut_loc_batch = tf.expand_dims(self.ut_loc, axis=0)
-                    if self.batch_size > 1:
-                        ut_loc_batch = tf.tile(ut_loc_batch, [self.batch_size, 1, 1])
-                else:
-                    ut_loc_batch = self.ut_loc
+                    # 反復ごとに記録
+                    # Global Record Index
+                    record_idx = (
+                        (
+                            drop_idx
+                            * self.config.num_slots
+                            * self.config.max_la_iterations
+                        )
+                        + (slot_idx * self.config.max_la_iterations)
+                        + la_iter
+                    )
 
-                if len(self.bs_loc.shape) == 2:
-                    bs_loc_batch = tf.expand_dims(self.bs_loc, axis=0)
-                    if self.batch_size > 1:
-                        bs_loc_batch = tf.tile(bs_loc_batch, [self.batch_size, 1, 1])
-                else:
-                    bs_loc_batch = self.bs_loc
+                    # Expand dimensions for ut_loc/bs_loc to match history element_shape [Batch, N, 3]
+                    # self.ut_loc is [N_UT, 3], needs to be [Batch, N_UT, 3] if batch > 1 or consistent
+                    if len(self.ut_loc.shape) == 2:
+                        ut_loc_batch = tf.expand_dims(self.ut_loc, axis=0)
+                        if self.batch_size > 1:
+                            ut_loc_batch = tf.tile(
+                                ut_loc_batch, [self.batch_size, 1, 1]
+                            )
+                    else:
+                        ut_loc_batch = self.ut_loc
 
-                # 6. 結果の記録
-                hist = self._record_drop(
-                    hist,
-                    record_idx,
-                    results_iter,
-                    results_iter["pl_alloc"],  # Use allocated pathloss
-                    results_iter["p_tx_watt_sched"],  # Use scheduled tx power
-                    results_iter["p_cmax_alloc"],  # Use allocated p_cmax
-                    results_iter["mpr_alloc"],  # Use allocated mpr
-                    w_rf_bs_idx,
-                    allocation_mask=results_iter.get("allocation_mask"),
-                    ut_loc=ut_loc_batch,
-                    bs_loc=bs_loc_batch,
-                )
+                    if len(self.bs_loc.shape) == 2:
+                        bs_loc_batch = tf.expand_dims(self.bs_loc, axis=0)
+                        if self.batch_size > 1:
+                            bs_loc_batch = tf.tile(
+                                bs_loc_batch, [self.batch_size, 1, 1]
+                            )
+                    else:
+                        bs_loc_batch = self.bs_loc
+
+                    # 6. 結果の記録
+                    hist = self._record_drop(
+                        hist,
+                        record_idx,
+                        results_iter,
+                        results_iter["pl_alloc"],  # Use allocated pathloss
+                        results_iter["p_tx_watt_sched"],  # Use scheduled tx power
+                        results_iter["p_cmax_alloc"],  # Use allocated p_cmax
+                        results_iter["mpr_alloc"],  # Use allocated mpr
+                        w_rf_bs_idx,
+                        allocation_mask=results_iter.get("allocation_mask"),
+                        ut_loc=ut_loc_batch,
+                        bs_loc=bs_loc_batch,
+                    )
 
         # 履歴をTensorに変換
         final_hist = {}

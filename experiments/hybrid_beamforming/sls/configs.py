@@ -19,8 +19,9 @@ class SLSConfig(SimulationCommonConfig):
     # Simulation Control
     batch_size: int = 1  # Debug: 1
 
-    num_ut_drops: int = 1  # Debug: 1. Number of random topology drops.
-    num_slots: int = 1  # Fixed to 1 for snapshot simulation
+    num_ut_drops: int = 5  # Debug: 1. Number of random topology drops.
+    num_slots: int = 10  # Number of slots per drop for time evolution
+    coherence_time: int = 10  # [slots] Channel coherence time in slots
 
     precoding_granularity: str = "Wideband"  # "Narrowband", "Subband", "Wideband"
     # precoding_strategy: str = "SVD"  # "SVD", "Identity" (Non-coherent)
@@ -102,7 +103,6 @@ class SLSConfig(SimulationCommonConfig):
     scenario: str = "uma"  # "umi", "uma", "rma"
 
     # Mobility/Link Adaptation
-    coherence_time: int = 10  # slots
     pf_beta: float = 0.98
 
     # Results
