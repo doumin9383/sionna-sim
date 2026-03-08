@@ -1,5 +1,7 @@
 import sionna
 import tensorflow as tf
+import time
+from tqdm import tqdm
 
 # Additional external libraries
 import matplotlib.pyplot as plt
@@ -1598,6 +1600,10 @@ class SystemSimulator(Block):
     # @tf.function(jit_compile=False)
     def call(self, num_drops, tx_power_dbm):
         """シミュレーションのメインループ（オーケストレーター）"""
+        import time
+
+        start_time = time.time()
+
         num_records = num_drops * self.config.num_slots * self.config.max_la_iterations
         hist = init_result_history(
             self.batch_size,
@@ -1607,6 +1613,9 @@ class SystemSimulator(Block):
             self.num_ut,
             self.config.max_la_iterations,
         )
+
+        total_slots = num_drops * self.config.num_slots
+        pbar = tqdm(total=total_slots, desc="Simulating")
 
         for drop_idx in range(num_drops):
             # 1. トポロジーのセットアップ
@@ -1747,7 +1756,16 @@ class SystemSimulator(Block):
                     # すべてのUEのバッファが空（閾値以下）になったらスロットループを抜ける
                     if tf.reduce_all(ue_buffers < 0.1):
                         # print(f"Drop {drop_idx}: All buffers empty at slot {slot_idx}. Early terminating.")
+                        pbar.update(
+                            self.config.num_slots - slot_idx
+                        )  # 残りのスロット分を進める
                         break
+
+                pbar.update(1)
+
+        pbar.close()
+        total_time = time.time() - start_time
+        print(f"\nシミュレーション終了。総実行時間: {total_time:.2f}s")
 
         # 履歴をTensorに変換
         final_hist = {}
