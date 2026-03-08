@@ -169,7 +169,8 @@ class MCSLinkAdaptation:
         supported = sinr_expanded >= req_sinr
 
         if mask is not None:
-            mask_expanded = tf.expand_dims(mask, -1)
+            mask_bool = tf.cast(mask, tf.bool)
+            mask_expanded = tf.expand_dims(mask_bool, -1)
             supported = tf.logical_and(supported, mask_expanded)
 
         # Get SE for supported REs. If not supported, SE is 0.

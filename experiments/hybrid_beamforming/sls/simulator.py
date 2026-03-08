@@ -20,6 +20,7 @@ from .components.power_control import PowerControl
 from wsim.sls.link_adaptation import MCSLinkAdaptation
 from .components.get_hist import init_result_history, record_results
 from .components.beam_management import BeamSelector
+from .components.scheduler import PFScheduler
 from wsim.common import weight_utils
 
 # Set random seed for reproducibility
@@ -211,6 +212,11 @@ class SystemSimulator(Block):
             polarization=config.bs_polarization,
             oversampling_factor=config.beambook_oversampling_factor,
             dtype=self.rdtype,  # Use simulation precision
+        )
+
+        # Instantiate PF Scheduler
+        self.scheduler = PFScheduler(
+            config=config, num_ut=self.num_ut, num_rb=self.simulation_freq_res
         )
 
     @property
@@ -660,165 +666,119 @@ class SystemSimulator(Block):
         mcs_index_hint=None,
     ):
         """
-        反復的なランク選択を実行し、最適なランクと有効なデジタル重みを決定する。
-        Iterative Rank Selection:
-        1. 初期ランクを設定 (Rank=1)
-        2. 干渉電力を計算 (固定)
-        3. 各UEがSVD重み(Rank 1..Max)を用いてSINRとスループットを評価
-        4. 最適ランクを選択し、有効重みを更新
-        5. 2-4を繰り返す
+        [Phase 1: Pre-allocation (Algorithm 1)]
+        S_FDRA (bandwidth candidates) と Rank の組み合わせを全探索し、
+        各UEにとって最適なリソースサイズ ($N_{req}$), ランク, MCS, および最大の期待スループットを決定する。
         """
         B = self.batch_size
         N_BS = self.num_bs
         N_UT = self.num_ut
         max_rank = self.config.num_layers
-        iterations = self.config.max_rank_selection_iterations
 
-        # 1. 初期化: Rank 1 からスタート
-        current_rank = tf.ones([B, N_UT], dtype=tf.int32)
+        # Determine available PRB sizes
+        if hasattr(self.config, "s_fdra_options") and self.config.s_fdra_options:
+            s_fdra_options = self.config.s_fdra_options
+        else:
+            # Fallback to single size simulation if dynamic allocation is not configured
+            s_fdra_options = [self.config.num_rb]
 
-        # 初期状態の有効重み (Rank 1)
-        w_ut_eff, w_bs_eff = self._get_effective_weights(
-            w_ut_dig_full, w_bs_dig_full, current_rank
-        )
+        # Tracking the best parameters across all combinations
+        best_n_rb = tf.zeros([B, N_UT], dtype=tf.int32)
+        best_rank_overall = tf.ones([B, N_UT], dtype=tf.int32)
+        best_mcs = tf.zeros([B, N_UT], dtype=tf.int32)
+        global_max_throughput = tf.zeros([B, N_UT], dtype=self.rdtype) - 1.0
 
-        # 収束ループ
-        for i in range(iterations):
-            # 2. 干渉電力の計算 (現在の有効重みを使用)
-            # このステップでは全UEの重みが固定されていると仮定
-            i_total = self._compute_interference(w_ut_eff, w_bs_eff, current_rank)
+        # We need an initial valid weight for iter loop fallback and legacy compatibility
+        current_rank_fallback = tf.ones([B, N_UT], dtype=tf.int32)
 
-            # 3. ランク探索 (Rank Sweep)
-            # 各ランクについてスループットを計算し、ベストを選択
-            best_rank = current_rank
-            max_throughput = (
-                tf.zeros([B, N_UT], dtype=self.rdtype) - 1.0
-            )  # Initialize with -1
+        # Iterate over S_FDRA options
+        for n_rb in s_fdra_options:
+            if n_rb > self.config.num_rb:
+                continue
 
-            # 候補ランク
-            # for r in range(1, max_rank + 1):
             for r in self.config.available_layers:
                 if r > max_rank:
                     continue
 
-                # ランク r を仮定
                 rank_tensor_full = tf.fill([B, N_UT], r)
 
-                # 電力割り当て (Equal Power Allocation with MPR Backoff)
-                # 全UE一括計算 (B, N_UT サイズなのでメモリ負荷は低い)
                 p_tx_watt_full, pl_db_full, mpr_db_full, _ = self._apply_power_control(
-                    tx_power_dbm_base, rank_tensor_full, mcs_index=mcs_index_hint
+                    tx_power_dbm_base,
+                    rank_tensor_full,
+                    num_rbs=n_rb,
+                    mcs_index=mcs_index_hint,
                 )
 
-                # スループット計算を batch_size_ut で分割実行 (VRAM節約)
+                i_floor_full = (
+                    tf.zeros([B, N_UT, self.simulation_freq_res], dtype=self.rdtype)
+                    + self.no
+                )
+
                 total_tp_r_list = []
+                mcs_list = []
                 batch_size_ut = self.config.batch_size_ut
 
                 for start_ut in range(0, N_UT, batch_size_ut):
                     end_ut = min(start_ut + batch_size_ut, N_UT)
 
-                    # Slice inputs
                     p_tx_watt_slice = p_tx_watt_full[:, start_ut:end_ut]
                     s_srv_slice = s_srv_full[:, start_ut:end_ut, :, :r]
-                    i_floor_slice = i_total[:, start_ut:end_ut, :] + self.no
+                    i_floor_slice = i_floor_full[:, start_ut:end_ut, :]
 
-                    # Metrics Calculation -----------------------
-                    p_layer = p_tx_watt_slice / tf.cast(r, self.rdtype)  # [B, U_sub]
-                    p_layer_expanded = p_layer[:, :, None, None]  # [B, U_sub, 1, 1]
+                    n_sc = tf.cast(n_rb * 12 * r, self.rdtype)
+                    p_sc_layer = p_tx_watt_slice / n_sc
+                    p_sc_expanded = p_sc_layer[:, :, None, None]
 
-                    # 信号電力: P_layer * |s|^2
-                    s_power = p_layer_expanded * tf.square(
-                        s_srv_slice
-                    )  # [B, U_sub, F, r]
-
-                    i_floor_expanded = tf.expand_dims(
-                        i_floor_slice, -1
-                    )  # [B, U_sub, F, 1]
+                    s_power = p_sc_expanded * tf.square(s_srv_slice)
+                    i_floor_expanded = tf.expand_dims(i_floor_slice, -1)
 
                     sinr = s_power / i_floor_expanded
                     sinr_db = (
                         10.0 * tf.math.log(tf.maximum(sinr, 1e-20)) / tf.math.log(10.0)
                     )
 
-                    # Common MCS & Throughput Sum across layers and frequency
                     tp_sum, mcs_idx = self.mcs_adapter.get_common_mcs_throughput(
                         sinr_db, reduce_axes=[-1, -2]
                     )
 
-                    if self.config.use_rbg_granularity:
-                        tp_sum *= tf.cast(self.rbg_size_sc, self.rdtype)
+                    tp_total_rb = (
+                        tp_sum
+                        / tf.cast(self.simulation_freq_res, self.rdtype)
+                        * tf.cast(n_rb * 12, self.rdtype)
+                    )
+                    tp_total_rb *= tf.cast(self.config.num_data_symbols, self.rdtype)
 
-                    # Scale by data symbols
-                    tp_sum *= tf.cast(self.config.num_data_symbols, self.rdtype)
+                    total_tp_r_list.append(tp_total_rb)
+                    mcs_list.append(mcs_idx)
 
-                    total_tp_r_list.append(tp_sum)
-
-                    # Detailed Logging (Chunk内で行う)
-                    if self.config.export_detailed_logs:
-                        # Collect metrics for each UT in the batch
-                        for b in range(B):
-                            for u_local in range(end_ut - start_ut):
-                                u_global = start_ut + u_local
-                                self.detailed_logs.append(
-                                    {
-                                        "drop_idx": drop_idx,
-                                        "la_iter": la_iter,
-                                        "rank_iter": i,
-                                        "ut_idx": u_global,
-                                        "batch_idx": b,
-                                        "candidate_rank": r,
-                                        "tx_power_dbm": (
-                                            float(
-                                                10
-                                                * np.log10(p_tx_watt_slice[b, u_local])
-                                                + 30
-                                            )
-                                            if p_tx_watt_slice[b, u_local] > 0
-                                            else -100
-                                        ),
-                                        "mpr_db": float(mpr_db_full[b, u_global]),
-                                        "pathloss_db": float(pl_db_full[b, u_global]),
-                                        "sinr_db_avg": float(
-                                            tf.reduce_mean(sinr_db[b, u_local, :, :])
-                                        ),
-                                        "mcs_idx_avg": float(mcs_idx[b, u_local]),
-                                        "throughput_bits": float(tp_sum[b, u_local]),
-                                        "interference_power_dbm": (
-                                            float(
-                                                10
-                                                * np.log10(
-                                                    tf.reduce_mean(
-                                                        i_floor_slice[b, u_local]
-                                                        - self.no
-                                                    )
-                                                )
-                                                + 30
-                                            )
-                                            if tf.reduce_mean(
-                                                i_floor_slice[b, u_local] - self.no
-                                            )
-                                            > 0
-                                            else -100
-                                        ),
-                                    }
-                                )
-
-                # Combine results
                 total_tp_r = tf.concat(total_tp_r_list, axis=1)
+                mcs_r = tf.concat(mcs_list, axis=1)
 
-                # Update best rank
-                is_better = total_tp_r > max_throughput
-                max_throughput = tf.where(is_better, total_tp_r, max_throughput)
-                best_rank = tf.where(is_better, rank_tensor_full, best_rank)
+                is_better = total_tp_r > global_max_throughput
 
-            # 4. ランク更新
-            current_rank = best_rank
-            # 重み更新 (次のイテレーションの干渉計算用)
-            w_ut_eff, w_bs_eff = self._get_effective_weights(
-                w_ut_dig_full, w_bs_dig_full, current_rank
-            )
+                global_max_throughput = tf.where(
+                    is_better, total_tp_r, global_max_throughput
+                )
+                best_n_rb = tf.where(is_better, tf.fill([B, N_UT], n_rb), best_n_rb)
+                best_rank_overall = tf.where(
+                    is_better, rank_tensor_full, best_rank_overall
+                )
 
-        return current_rank, w_ut_eff, w_bs_eff
+                mcs_r_i32 = tf.cast(mcs_r, tf.int32)
+                best_mcs = tf.where(is_better, mcs_r_i32, best_mcs)
+
+        w_ut_eff, w_bs_eff = self._get_effective_weights(
+            w_ut_dig_full, w_bs_dig_full, best_rank_overall
+        )
+
+        self.pre_allocation_results = {
+            "n_req": best_n_rb,
+            "rank_opt": best_rank_overall,
+            "mcs_opt": best_mcs,
+            "max_thp": global_max_throughput,
+        }
+
+        return best_rank_overall, w_ut_eff, w_bs_eff
 
     def _get_effective_weights(self, w_ut_dig_full, w_bs_dig_full, rank_tensor):
         """
@@ -843,130 +803,210 @@ class SystemSimulator(Block):
         return w_ut_eff, w_bs_eff
 
     def _compute_interference(
-        self, w_ut, w_bs, rank_tensor, tx_power_dbm_base=None, mcs_index_hint=None
+        self,
+        w_ut,
+        w_bs,
+        rank_tensor,
+        tx_power_dbm_base=None,
+        mcs_index_hint=None,
+        allocation_mask=None,
     ):
         """
         現在の有効重みリストに基づいて全干渉電力を計算する。
+        allocation_mask: [B, N_UT, F] bool mask to disable interference from unused PRBs.
         """
         B = self.batch_size
         N_BS = self.num_bs
         N_UT = self.num_ut
         N_target = self.simulation_freq_res
 
-        # 送信電力計算 (現在のランクに基づく)
-        if tx_power_dbm_base is None:
-            tx_power_dbm_base = (
-                self.ut_max_power_dbm
-                if self.direction == "uplink"
-                else self.bs_max_power_dbm
-            )
-
-        p_tx_watt, _, _, _ = self._apply_power_control(
+        # Power Allocation for calculation
+        p_tx_watt_full, pl_full, mpr_full, _ = self._apply_power_control(
             tx_power_dbm_base, rank_tensor, mcs_index=mcs_index_hint
         )
 
-        # Layerごとの電力に分配
-        p_layer = p_tx_watt / tf.cast(rank_tensor, self.rdtype)
-        p_layer_expanded = p_layer[:, :, None, None, None]  # [B, N_UT, 1, 1, 1]
+        # Mask conversion
+        mask_f = (
+            tf.cast(allocation_mask, self.rdtype)
+            if allocation_mask is not None
+            else tf.ones([B, N_UT, N_target], dtype=self.rdtype)
+        )
 
-        interference_buffer = tf.zeros(
-            [B, N_UT, N_target], dtype=self.rdtype
-        )  # Accumulate at victim (UT in DL, BS in UL logic mapped back to UT?)
-        # Note: In DL, Victim is UT. We need I_total at each UT.
-        # In UL, Victim is BS. But we calculate SINR per UT. So we need I_total at Serving BS for each UT.
+        i_total_all = []
 
-        # To reuse existing logic structure, let's implement extraction-based interference calc
-        # similar to _process_single_rank_la loop
+        if self.direction == "uplink":
+            # Uplink: Interference sources are all transmitting UTs
+            # Create a buffer for interference at BSs: [B, N_BS, F]
+            interference_buffer_bs = tf.zeros([B, N_BS, N_target], dtype=self.rdtype)
+            interference_buffer_bs = tf.zeros(
+                [B, N_BS, N_target], dtype=self.rdtype
+            )  # For UL
 
-        i_total_all = []  # For DL [B, N_UT, N_target]
-        interference_buffer_bs = tf.zeros(
-            [B, N_BS, N_target], dtype=self.rdtype
-        )  # For UL
+            batch_size_ut = self.config.batch_size_ut
+            for start_ut in range(0, N_UT, batch_size_ut):
+                end_ut = min(start_ut + batch_size_ut, N_UT)
+                curr_batch_size = end_ut - start_ut
+                curr_neigh_inds = self.neighbor_indices[:, start_ut:end_ut, :]
 
-        batch_size_ut = self.config.batch_size_ut
-        for start_ut in range(0, N_UT, batch_size_ut):
-            end_ut = min(start_ut + batch_size_ut, N_UT)
-            curr_neigh_inds = self.neighbor_indices[:, start_ut:end_ut, :]
+                # Neighbor channels (port domain) for current batch of UTs
+                h_batch_port = self.channel_interface.get_neighbor_channel_info(
+                    B,
+                    self.ut_loc[:, start_ut:end_ut, :],
+                    self.bs_loc,
+                    self.ut_orientations[:, start_ut:end_ut, :],
+                    self.bs_orientations,
+                    curr_neigh_inds,
+                    self.ut_velocities[:, start_ut:end_ut, :],
+                    self.in_state[:, start_ut:end_ut],
+                    False,
+                    False,
+                )
 
-            # 隣接チャネル（ポートドメイン）取得
-            h_batch_port = self.channel_interface.get_neighbor_channel_info(
-                B,
-                self.ut_loc[:, start_ut:end_ut, :],
-                self.bs_loc,
-                self.ut_orientations[:, start_ut:end_ut, :],
-                self.bs_orientations,
-                curr_neigh_inds,
-                self.ut_velocities[:, start_ut:end_ut, :],
-                self.in_state[:, start_ut:end_ut],
-                False,
-                False,
-            )
+                neighbor_ids = curr_neigh_inds[
+                    :, :, 1:
+                ]  # [B, BUT, K_neighbors-1] (excluding serving)
 
-            neighbor_ids = curr_neigh_inds[:, :, 1:]
+                # Handle potential extra dimensions (Rank 8: [B, U, N, RxP, TxP, Extra, T, F])
+                if len(h_batch_port.shape) == 8:
+                    # Remove Extra(5), Time(6). Keep Neighbors(1: at dim 2)
+                    # Sliced: [B, U, N(1:), RxP, TxP, F]
+                    h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, 0, :]
+                else:
+                    # Standard Rank 7: [B, U, N, RxP, TxP, T, F]
+                    # Remove Time(5)
+                    h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, :]
 
-            # Handle potential extra dimensions (Rank 8: [B, U, N, RxP, TxP, Extra, T, F])
-            if len(h_batch_port.shape) == 8:
-                # Remove Extra(5), Time(6). Keep Neighbors(1: at dim 2)
-                # Sliced: [B, U, N(1:), RxP, TxP, F]
-                h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, 0, :]
-            else:
-                # Standard Rank 7: [B, U, N, RxP, TxP, T, F]
-                # Remove Time(5)
-                h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, :]
+                h_int = tf.transpose(
+                    h_int_sliced, [0, 1, 2, 5, 3, 4]
+                )  # [B, U_batch, Neighbors, F, RxP, TxP]
 
-            h_int = tf.transpose(
-                h_int_sliced, [0, 1, 2, 5, 3, 4]
-            )  # [B, U_batch, Neighbors, F, RxP, TxP]
-
-            if self.direction == "uplink":
-                # UL Interference: Victim is Neighbor BSs
-                # Source is Self UT
+                # Source UT precoders (v_self)
                 v_self = w_ut[
                     :, start_ut:end_ut, :, :, :
-                ]  # [B, U, F, P, MaxRank] (Masked)
+                ]  # [B, BUT, F, P_tx, MaxRank] (Masked)
 
-                # Neighbor BS Combiner U
+                # Victim BS combiners (u_neighbor)
+                # These are combiners for the *neighboring* BSs, not the serving BS.
+                # The `w_bs` tensor is indexed by UT, but it represents the combiner for the BS serving that UT.
+                # So, `w_bs[b, neighbor_id]` is the combiner for `neighbor_id` BS.
                 u_neighbor = tf.gather(
                     w_bs, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
-                )
+                )  # [B, BUT, K_neighbors-1, F, P_rx, MaxRank]
 
-                # HV = H * V
-                hv = tf.einsum("bukfpt,buftx->bukfpx", h_int, v_self)
-                # U^H * HV
+                # Effective channel: U_neighbor^H * H_int * V_self
+                # hv = H_int * V_self
+                hv = tf.einsum(
+                    "bukfpt,buftx->bukfpx", h_int, v_self
+                )  # [B, BUT, K_neighbors-1, F, P_rx, MaxRank]
+                # heff_matrix = U_neighbor^H * hv
                 heff_matrix = tf.einsum(
                     "bukfpr,bukfpt->bukfrt", tf.math.conj(u_neighbor), hv
-                )
+                )  # [B, BUT, K_neighbors-1, F, MaxRank, MaxRank]
 
-                # Sum over self layers (last dim t), sum over neighbor layers (dim r)
-                # Avoid Rank 6 mult: Sum sq abs first
-                heff_sq = tf.square(tf.abs(heff_matrix))
+                # Power of the interfering signal
+                # p_tx_watt_full: [B, N_UT]
+                # rank_tensor: [B, N_UT]
+                p_layer_slice = p_tx_watt_full[:, start_ut:end_ut] / tf.cast(
+                    rank_tensor[:, start_ut:end_ut], self.rdtype
+                )
+                p_layer_slice_expanded = p_layer_slice[
+                    :, :, None, None, None
+                ]  # [B, BUT, 1, 1, 1]
+
+                # Apply allocation mask to the interfering power
+                # mask_f: [B, N_UT, N_target]
+                mask_f_slice = mask_f[:, start_ut:end_ut, :]  # [B, BUT, N_target]
+                p_layer_masked = (
+                    p_layer_slice_expanded * mask_f_slice[:, :, :, None, None]
+                )  # [B, BUT, N_target, 1, 1]
+
+                # Interference power: P_source * |H_eff|^2
+                heff_sq = tf.square(
+                    tf.abs(heff_matrix)
+                )  # [B, BUT, K_neighbors-1, F, MaxRank, MaxRank]
+                # Sum over source layers (last dim) and victim layers (second to last dim)
                 heff_sq_sum = tf.reduce_sum(
                     heff_sq, axis=[-1, -2]
-                )  # [B, U, Neighbors, F]
+                )  # [B, BUT, K_neighbors-1, F]
 
-                # p_layer slice: [B, BatchUT] -> [B, BatchUT, 1, 1]
-                p_layer_slice = p_layer[:, start_ut:end_ut]
-                p_layer_slice = p_layer_slice[:, :, None, None]
-
-                p_leak_sum = p_layer_slice * heff_sq_sum
+                # Total interference from current batch of UTs to their neighbors
+                # p_leak_sum: [B, BUT, K_neighbors-1, F]
+                p_leak_sum = (
+                    p_layer_masked[:, :, :, 0, 0] * heff_sq_sum
+                )  # [B, BUT, F] * [B, BUT, K_neighbors-1, F] -> broadcast
 
                 # Scatter add to BS buffer
-                # indices setup (same as existing)
+                # indices for scatter_nd_add: [B, K_neighbors-1]
                 batch_indices = tf.range(B)[:, None, None]
                 batch_indices = tf.broadcast_to(batch_indices, tf.shape(neighbor_ids))
-                indices = tf.stack(
-                    [batch_indices, tf.cast(neighbor_ids, tf.int32)], axis=-1
+
+                # Reshape neighbor_ids to [B * BUT * K_neighbors-1]
+                flat_neighbor_ids = tf.reshape(neighbor_ids, [-1])
+                flat_batch_indices = tf.reshape(batch_indices, [-1])
+
+                # Create indices for scatter_nd_add: [B * BUT * K_neighbors-1, 2]
+                scatter_indices = tf.stack(
+                    [flat_batch_indices, flat_neighbor_ids], axis=-1
                 )
+
+                # Reshape p_leak_sum to [B * BUT * K_neighbors-1, F]
+                flat_p_leak_sum = tf.reshape(p_leak_sum, [-1, N_target])
 
                 interference_buffer_bs = tf.tensor_scatter_nd_add(
                     interference_buffer_bs,
-                    tf.reshape(indices, [-1, 2]),
-                    tf.reshape(p_leak_sum, [-1, N_target]),
+                    scatter_indices,
+                    flat_p_leak_sum,
                 )
 
-            else:
-                # DL Interference: Victim is Self UT
-                # Source is Neighbor BSs
+            # After the loop, i_total for UL is the interference at the serving BS for each UT.
+            i_total = tf.gather(
+                interference_buffer_bs,
+                tf.cast(self.serving_bs_ids, tf.int32),
+                axis=1,
+                batch_dims=1,
+            )
+
+        else:
+            # DL Interference: Victim is Self UT
+            # Source is Neighbor BSs
+            # The existing DL interference calculation is already in a batch_size_ut loop.
+            # We need to apply the allocation_mask here.
+
+            batch_size_ut = self.config.batch_size_ut
+            for start_ut in range(0, N_UT, batch_size_ut):
+                end_ut = min(start_ut + batch_size_ut, N_UT)
+                curr_neigh_inds = self.neighbor_indices[:, start_ut:end_ut, :]
+
+                # Neighbor channels (port domain) for current batch of UTs
+                h_batch_port = self.channel_interface.get_neighbor_channel_info(
+                    B,
+                    self.ut_loc[:, start_ut:end_ut, :],
+                    self.bs_loc,
+                    self.ut_orientations[:, start_ut:end_ut, :],
+                    self.bs_orientations,
+                    curr_neigh_inds,
+                    self.ut_velocities[:, start_ut:end_ut, :],
+                    self.in_state[:, start_ut:end_ut],
+                    False,
+                    False,
+                )
+
+                neighbor_ids = curr_neigh_inds[:, :, 1:]
+
+                # Handle potential extra dimensions (Rank 8: [B, U, N, RxP, TxP, Extra, T, F])
+                if len(h_batch_port.shape) == 8:
+                    # Remove Extra(5), Time(6). Keep Neighbors(1: at dim 2)
+                    # Sliced: [B, U, N(1:), RxP, TxP, F]
+                    h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, 0, :]
+                else:
+                    # Standard Rank 7: [B, U, N, RxP, TxP, T, F]
+                    # Remove Time(5)
+                    h_int_sliced = h_batch_port[:, :, 1:, :, :, 0, :]
+
+                h_int = tf.transpose(
+                    h_int_sliced, [0, 1, 2, 5, 3, 4]
+                )  # [B, U_batch, Neighbors, F, RxP, TxP]
+
                 u_self = w_ut[:, start_ut:end_ut, :, :, :]  # Self Rx Combiner
 
                 v_neighbor = tf.gather(
@@ -981,50 +1021,63 @@ class SystemSimulator(Block):
                 p_tx_neighbor_watt, _, _, _ = self._apply_power_control(
                     tx_power_dbm_base, rank_neighbor
                 )  # Simplified PC lookup
-                p_neigh_layer = p_tx_neighbor_watt / tf.cast(rank_neighbor, self.rdtype)
-                p_neigh_layer = p_neigh_layer[..., None, None, None]
 
-                # HV
-                hv = tf.einsum("bukfpt,bukftx->bukfpx", h_int, v_neighbor)
-                heff_matrix = tf.einsum(
-                    "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
-                )
-
-                # Need p_neigh_layer [B, Neighbors, 1, 1, 1] to become [B, 1, Neighbors, 1]
-                # for multiplication with heff_sq_sum [B, U, Neighbors, F]
-
-                heff_sq = tf.square(tf.abs(heff_matrix))
-                heff_sq_sum = tf.reduce_sum(heff_sq, axis=[-1, -2])  # [B, U, N, F]
-
-                # p_neigh_layer was: p_tx_neighbor_watt / rank [B, N_neighbors]
-                # We need to broadcast it to [B, U, N, F]
-                # p_neigh_layer_Bc = p_neigh_layer[:, None, :, None] # [B, 1, N, 1]
-
+                # Power
                 # Re-extract p_neigh_layer from source
                 p_neigh_layer_base = p_tx_neighbor_watt / tf.cast(
                     rank_neighbor, self.rdtype
                 )
-                p_neigh_layer_bc = p_neigh_layer_base[:, None, :, None]
+                p_neigh_layer_bc = p_neigh_layer_base[
+                    :, None, :, None
+                ]  # [B, 1, N_neigh, 1]
 
-                p_int_sum = p_neigh_layer_bc * heff_sq_sum
+                # Fetch mask for neighbor UTs (in DL, neighbors are BS, but let's assume mask applies if we were implementing it)
+                if allocation_mask is not None:
+                    # In DL, allocation mask needs to be [B, N_BS, F]. Since currently allocation is per UT,
+                    # we would need to map UT allocations back to BS DL transmissions.
+                    # For now, we assume the allocation_mask is for the victim UTs.
+                    # If the mask is for the interfering BSs, it would need to be gathered.
+                    # For simplicity, let's assume the mask applies to the victim UT's frequency bins.
+                    # This means if a victim UT is not allocated a certain RB, it doesn't receive interference on it.
+                    # This is a strong assumption, usually interference is always present.
+                    # A more correct approach would be to mask the *interfering* BS's transmission.
+                    # However, the current `allocation_mask` is `[B, N_UT, F]`.
+                    # If we want to mask interfering BSs, we need to map `neighbor_ids` to `allocation_mask`.
+                    # This would require `allocation_mask_bs = tf.gather(allocation_mask, neighbor_ids, axis=1, batch_dims=1)`
+                    # But `allocation_mask` is for UTs, not BSs.
+                    # Let's assume for now that `allocation_mask` is for the victim UT, and it filters out interference
+                    # on RBs not allocated to the victim. This is a common simplification.
+                    mask_f_slice = mask_f[:, start_ut:end_ut, :]  # [B, BUT, N_target]
+                    p_neigh_layer_bc = (
+                        p_neigh_layer_bc * mask_f_slice[:, None, :, None]
+                    )  # [B, 1, N_neigh, 1] * [B, BUT, 1, N_target] -> broadcast
+
+                # HV
+                hv = tf.einsum(
+                    "bukfpt,bukftx->bukfpx", h_int, v_neighbor
+                )  # [B, BUT, K_neighbors-1, F, P_rx, MaxRank]
+                heff_matrix = tf.einsum(
+                    "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
+                )  # [B, BUT, K_neighbors-1, F, MaxRank, MaxRank]
+
+                heff_sq = tf.square(tf.abs(heff_matrix))
+                heff_sq_sum = tf.reduce_sum(
+                    heff_sq, axis=[-1, -2]
+                )  # [B, BUT, K_neighbors-1, F]
+
+                p_int_sum = (
+                    p_neigh_layer_bc[:, :, :, None] * heff_sq_sum
+                )  # [B, BUT, K_neighbors-1, F]
 
                 i_total_all.append(
-                    tf.reduce_sum(p_int_sum, axis=2)
-                )  # Sum over neighbors [B, U, F]
+                    tf.reduce_sum(p_int_sum, axis=2)  # Sum over neighbors [B, BUT, F]
+                )
 
-        if self.direction == "uplink":
-            i_total = tf.gather(
-                interference_buffer_bs,
-                tf.cast(self.serving_bs_ids, tf.int32),
-                axis=1,
-                batch_dims=1,
-            )
-        else:
             i_total = tf.concat(i_total_all, axis=1)
 
         return i_total
 
-    def _apply_power_control(self, tx_power_dbm, rank, mcs_index=None):
+    def _apply_power_control(self, tx_power_dbm, rank, mcs_index=None, num_rbs=None):
         """パスロスと最大電力制約を考慮した送信電力を計算する"""
         B = self.batch_size
         N_UT = self.num_ut
@@ -1069,13 +1122,14 @@ class SystemSimulator(Block):
 
         # 3. MPR (Maximum Power Reduction)
         mod_name = self._get_modulation_name(mcs_index)
-        num_rb = self.config.num_rb
+        if num_rbs is None:
+            num_rbs = self.config.num_rb
         granularity = self.config.precoding_granularity
         mpr_db = self.mpr_model.get_mpr(
             self.config.waveform,
             rank,
             mod_name,
-            num_rb,
+            num_rbs,
             granularity,
         )
         if not tf.is_tensor(mpr_db):
@@ -1083,8 +1137,14 @@ class SystemSimulator(Block):
 
         # 4. Tx Power 計算
         if self.direction == "uplink":
-            num_rbs = self.resource_grid.num_effective_subcarriers / 12.0
-            p_tx_dbm = self.power_control.calculate_uplink_power(pl_db, num_rbs, mpr_db)
+            num_rbs_pc = (
+                tf.cast(num_rbs, self.rdtype)
+                if tf.is_tensor(num_rbs)
+                else tf.cast(num_rbs, self.rdtype)
+            )
+            p_tx_dbm = self.power_control.calculate_uplink_power(
+                pl_db, num_rbs_pc, mpr_db
+            )
             p_cmax_dbm = self.ut_max_power_dbm - mpr_db
         else:
             p_tx_dbm = tx_power_dbm
@@ -1144,9 +1204,11 @@ class SystemSimulator(Block):
         la_iter=0,
         mcs_index_hint=None,
     ):
-        """SINR計算、干渉計算、Link Adaptationを実行する (Rank Adaptation含む)"""
+        """SINR計算、スケーリング、干渉計算、Link Adaptationを実行する (Rank Adaptation含む)"""
+        B = self.batch_size
+        N_UT = self.num_ut
 
-        # Iterative Rank Optimization
+        # 1. Iterative Rank Optimization & Pre-allocation (Algorithm 1)
         final_rank, w_ut_opt, w_bs_opt = self._optimize_rank_allocation(
             w_ut_dig,
             w_bs_dig,
@@ -1157,19 +1219,30 @@ class SystemSimulator(Block):
             mcs_index_hint=mcs_index_hint,
         )
 
-        # 最終的なパフォーマンス評価 (Optimize済みランクと重みを使用)
-        # 最終送信電力計算
-        p_tx_watt, _, _, _ = self._apply_power_control(
-            p_tx_watt_base, final_rank, mcs_index=mcs_index_hint
-        )
+        # 2. Scheduling & Resource Mapping (Algorithm 2)
+        schedule_result = self.scheduler.schedule(self.pre_allocation_results)
+        allocation_mask = schedule_result["allocation_mask"]
+        scheduled_rbs = schedule_result["scheduled_rbs"]
 
-        # 干渉計算 (最終重みで)
+        # Determine actual MCS and RBs assigned
+        self.scheduled_rbs = scheduled_rbs
+        mcs_opt = self.pre_allocation_results["mcs_opt"]
+
+        # 3. Final Interference Calculation based on Allocation Mask
         i_total = self._compute_interference(
             w_ut_opt,
             w_bs_opt,
             final_rank,
-            p_tx_watt_base,
-            mcs_index_hint=mcs_index_hint,
+            tx_power_dbm_base=p_tx_watt_base,
+            mcs_index_hint=mcs_opt,
+            allocation_mask=allocation_mask,
+        )
+
+        # 最終送信電力計算 (スケジューリングされたRB数とMCSに基づいて再計算)
+        # This needs to be done per UT, considering its allocated RBs and MCS.
+        # The `_apply_power_control` function can take `num_rbs` and `mcs_index`.
+        p_tx_watt_sched, pl_alloc, mpr_alloc, p_cmax_alloc = self._apply_power_control(
+            p_tx_watt_base, final_rank, mcs_index=mcs_opt, num_rbs=scheduled_rbs
         )
 
         # 信号電力 (最終ランクで)
@@ -1180,37 +1253,114 @@ class SystemSimulator(Block):
 
         s_srv_eff = tf.where(mask, s_srv, tf.zeros_like(s_srv))
 
-        # Power per layer
-        p_layer = p_tx_watt / tf.cast(final_rank, self.rdtype)
-        p_layer = p_layer[:, :, None, None]
+        # Process exactly the same way across UT batches
+        # Here we substitute p_tx_watt_sched for power calculation and consider masking
+        p_layer = p_tx_watt_sched / tf.cast(final_rank, self.rdtype)
+        p_layer = p_layer[:, :, None, None]  # [B, U, 1, 1]
 
-        s_power = p_layer * tf.square(s_srv_eff)
+        s_power = p_layer * tf.square(s_srv_eff)  # [B, U, F, MaxRank]
 
         # SINR
-        i_floor = i_total[..., None] + self.no
+        i_floor = i_total[..., None] + self.no  # [B, U, F, 1]
         sinr = s_power / i_floor  # [B, U, F, MaxRank] (Zero for unused layers)
 
-        # Avoid log(0) for unused layers
-        sinr_safe = tf.where(mask, sinr, tf.ones_like(sinr))
+        # Apply allocation mask to SINR
+        # allocation_mask: [B, U, F]
+        # Expand allocation_mask to [B, U, F, MaxRank]
+        mask_expanded = allocation_mask[:, :, :, None]  # [B, U, F, 1]
+        sinr = sinr * tf.cast(mask_expanded, self.rdtype)  # [B, U, F, MaxRank]
+
+        # Avoid log(0) for unused layers and unallocated RBs
+        sinr_safe = tf.where(
+            sinr > 0, sinr, tf.ones_like(sinr) * 1e-20
+        )  # Clip to a small positive value
         sinr_db = 10.0 * tf.math.log(sinr_safe) / tf.math.log(10.0)
 
         # Common MCS lookup with mask
-        throughput_per_user, mcs_idx = self.mcs_adapter.get_common_mcs_throughput(
-            sinr_db, reduce_axes=[-1, -2], mask=mask
-        )
+        # The get_common_mcs_throughput function needs to handle the mask correctly.
+        # If mask is passed, it should only consider active RBs/layers.
+        # For now, let's re-calculate throughput based on the scheduled RBs and MCS.
 
-        if self.config.use_rbg_granularity:
-            throughput_per_user *= tf.cast(self.rbg_size_sc, self.rdtype)
+        throughput_per_user_list = []
+        mcs_idx_avg_list = []
+        sinr_eff_avg_list = []
+        interference_power_avg_list = []
 
-        # 修正: 1シンボルあたりのビット数 -> 1スロット分（有効データシンボルのみ）にスケール
-        throughput_per_user *= tf.cast(self.config.num_data_symbols, self.rdtype)
+        batch_size_ut = self.config.batch_size_ut
+        for start_ut in range(0, N_UT, batch_size_ut):
+            end_ut = min(start_ut + batch_size_ut, N_UT)
 
-        # Averaging metrics for active layers only
-        active_layers = tf.cast(final_rank, self.rdtype)
-        sinr_eff_avg = tf.reduce_sum(
-            sinr * tf.cast(mask, self.rdtype), axis=[-1, -2]
-        ) / (active_layers * tf.cast(self.simulation_freq_res, self.rdtype))
-        mcs_idx_avg = tf.cast(mcs_idx, self.rdtype)
+            # Slice relevant tensors for current batch of UTs
+            sinr_db_slice = sinr_db[:, start_ut:end_ut, :, :]  # [B, BUT, F, MaxRank]
+            mask_slice = mask[:, start_ut:end_ut, :, :]  # [B, BUT, 1, MaxRank]
+            mask_f_slice = allocation_mask[:, start_ut:end_ut, :]  # [B, BUT, F]
+            final_rank_slice = final_rank[:, start_ut:end_ut]  # [B, BUT]
+            mcs_opt_slice = mcs_opt[:, start_ut:end_ut]  # [B, BUT]
+            i_total_slice = i_total[:, start_ut:end_ut, :]  # [B, BUT, F]
+
+            # Calculate throughput for allocated RBs
+            # We need to consider only the allocated RBs and active layers.
+            # The `get_common_mcs_throughput` can take a mask.
+            # The mask for `get_common_mcs_throughput` should be `[B, U, F, MaxRank]`
+            # which is `mask_expanded` (from allocation_mask) AND `mask` (from final_rank).
+            combined_mask = tf.cast(
+                mask_expanded[:, start_ut:end_ut, :, :], self.rdtype
+            ) * tf.cast(mask_slice, self.rdtype)
+
+            tp_per_re, _ = self.mcs_adapter.get_common_mcs_throughput(
+                sinr_db_slice, reduce_axes=[-1, -2], mask=combined_mask
+            )  # tp_per_re is [B, BUT], already summed over Layers and Freq bins by get_common_mcs_throughput
+            tp_sum = tp_per_re
+
+            if self.config.use_rbg_granularity:
+                tp_sum *= tf.cast(self.rbg_size_sc, self.rdtype)
+            else:
+                tp_sum *= 12.0  # 1F bin = 1 RB (12 SCs)
+
+            tp_sum *= tf.cast(self.config.num_data_symbols, self.rdtype)
+            # Ensure shape is [B, BUT]
+            tp_sum = tf.reshape(tp_sum, [B, end_ut - start_ut])
+            throughput_per_user_list.append(tp_sum)
+
+            # Calculate average SINR_db for active RBs and layers
+            valid_sinr_db = tf.where(
+                combined_mask > 0.5, sinr_db_slice, tf.zeros_like(sinr_db_slice)
+            )
+            sum_sinr_db = tf.reduce_sum(valid_sinr_db, axis=[-1, -2])  # [B, BUT]
+
+            # Number of active REs = (allocated RBs) * (active layers) * (subcarriers per RB)
+            # active_rbs = tf.reduce_sum(tf.cast(mask_f_slice, self.rdtype), axis=-1) # [B, BUT]
+            # active_layers_count = tf.cast(final_rank_slice, self.rdtype) # [B, BUT]
+            # num_active_res = active_rbs * active_layers_count * 12.0 # Assuming 12 subcarriers per RB
+
+            # More accurately, count non-zero elements in combined_mask
+            num_active_res = tf.reduce_sum(combined_mask, axis=[-1, -2])
+            num_active_res = tf.maximum(num_active_res, 1.0)  # Avoid division by zero
+
+            mean_sinr_db = sum_sinr_db / num_active_res
+            mean_sinr_db = tf.reshape(mean_sinr_db, [B, end_ut - start_ut])
+            sinr_eff_avg_list.append(mean_sinr_db)
+
+            # MCS index is already determined by scheduler
+            mcs_opt_slice = tf.reshape(mcs_opt_slice, [B, end_ut - start_ut])
+            mcs_idx_avg_list.append(mcs_opt_slice)
+
+            # Average interference power over allocated RBs
+            masked_i_total = i_total_slice * tf.cast(mask_f_slice, self.rdtype)
+            sum_masked_i_total = tf.reduce_sum(masked_i_total, axis=-1)  # [B, BUT]
+            num_allocated_rbs = tf.maximum(
+                tf.reduce_sum(tf.cast(mask_f_slice, self.rdtype), axis=-1), 1.0
+            )
+            avg_interference_power = sum_masked_i_total / num_allocated_rbs
+            avg_interference_power = tf.reshape(
+                avg_interference_power, [B, end_ut - start_ut]
+            )
+            interference_power_avg_list.append(avg_interference_power)
+
+        throughput_per_user = tf.concat(throughput_per_user_list, axis=1)
+        mcs_idx_avg = tf.concat(mcs_idx_avg_list, axis=1)
+        sinr_eff_avg = tf.concat(sinr_eff_avg_list, axis=1)
+        interference_power = tf.concat(interference_power_avg_list, axis=1)
 
         return {
             "sinr": sinr,
@@ -1219,7 +1369,11 @@ class SystemSimulator(Block):
             "throughput_per_user": throughput_per_user,
             "mcs_idx_avg": mcs_idx_avg,
             "rank": tf.cast(final_rank, tf.float32),
-            "interference_power": tf.reduce_mean(i_total, axis=[-1]),
+            "interference_power": interference_power,
+            "p_tx_watt_sched": p_tx_watt_sched,
+            "pl_alloc": pl_alloc,
+            "mpr_alloc": mpr_alloc,
+            "p_cmax_alloc": p_cmax_alloc,
         }
 
     def _process_single_rank_la(self, w_ut_dig, w_bs_dig, s_srv, p_tx_watt, rank):
@@ -1299,59 +1453,19 @@ class SystemSimulator(Block):
                 v_neighbor = tf.gather(
                     w_bs_dig, tf.cast(neighbor_ids, tf.int32), axis=1, batch_dims=1
                 )
-                v_neighbor = v_neighbor[..., :rank]
-
+                v_neighbor = v_neighbor[..., :rank]  # HV
                 hv = tf.einsum("bukfpt,bukftx->bukfpx", h_int, v_neighbor)
                 heff_matrix = tf.einsum(
                     "bufpr,bukfpx->bukfrx", tf.math.conj(u_self), hv
                 )
 
-                # p_int = p_layer_expanded[:, start_ut:end_ut, :, None, None] * tf.square(
-                #     tf.abs(heff_matrix)
-                # )
-                # p_int_per_layer = tf.reduce_sum(p_int, axis=-1)
-
                 # Rank reduction optimization
                 heff_sq = tf.square(tf.abs(heff_matrix))
-                heff_sq_sum = tf.reduce_sum(
-                    heff_sq, axis=-1
-                )  # Sum over neighbor tx layers? No.
-                # In _process_single_rank_la (UL/DL mixed logic above line 1112?)
-                # Wait, this chunk targets _process_single_rank_la at ~1195.
-                # Let's check _process_single_rank_la logic first.
-
-                # In _process_single_rank_la:
-                # DL: heff [B, U, N, F, Rx(self), Tx(neigh)]
-                # p_layer is SELF power in previous logic? No, this function arguments p_tx_watt is total power?
-                # _process_single_rank_la tries to calculate SINR for a SPECIFIC rank.
-                # If DL: User U receives desired signal. Interference comes from Neighbor BSs.
-                # Argument p_tx_watt is usually for the transmitter.
-                # In _process_single_rank_la, p_tx_watt is passed.
-                # If UL: Tx is UT. p_tx_watt is UT power.
-                # If DL: Tx is BS. p_tx_watt is BS power?
-
-                # The code at 1195 is for `else` block of `if self.direction == "uplink"`. So it is DL.
-                # p_layer_expanded is used as interference source power??
-                # p_layer = p_tx_watt / rank. p_tx_watt is from argument.
-                # In DL, neighbors are BSs. We need neighbor BS power.
-                # But _process_single_rank_la uses `p_layer` derived from `p_tx_watt`.
-                # If `p_tx_watt` is uniform across all BSs/UTs or passed as full batch...
-                # The logic at 1195 seems to assume `p_layer` corresponds to neighbor power?
-                # Actually, looking at 1120: `p_layer_expanded = tf.reshape(p_layer, [B, N_UT, 1, 1])`
-                # And 1195: `p_int = p_layer_expanded[...] * ...`
-                # This seems WRONG for DL interference if p_layer is Self UT power (or Serving BS power).
-                # Interference source is Neighbor BS.
-                # However, this function is `_process_single_rank_la`, maybe it assumes uniform power or something?
-                # Or maybe `p_tx_watt` contains [B, N_BS] for DL?
-                # But `p_layer` is divided by `rank`.
-
-                # ANYWAY, to fix Rank error:
-                p_layer_slice = p_layer_expanded[:, start_ut:end_ut, :, None, None]
-                heff_sq = tf.square(tf.abs(heff_matrix))
-                # Sum over neighbor layers (last dim)
+                # Sum over neighbor tx layers (last dim)
                 heff_sq_sum = tf.reduce_sum(heff_sq, axis=-1)
 
-                p_int_per_layer = p_layer_slice * heff_sq_sum
+                p_layer_slice = p_layer_expanded[:, start_ut:end_ut, :, None, None]
+                p_int_per_layer = tf.reduce_sum(p_layer_slice * heff_sq_sum, axis=-1)
                 i_total_all.append(tf.reduce_sum(p_int_per_layer, axis=2))
 
         s_power = tf.concat(s_power_all, axis=1)
@@ -1430,7 +1544,7 @@ class SystemSimulator(Block):
             sinr_eff=match_hist_shape(results["sinr_eff_avg"]),
             p_cmax_dbm=match_hist_shape(p_cmax_dbm),
             rank=match_hist_shape(results["rank"]),
-            mpr_db=match_hist_shape(mpr_db),
+            mpr_db=match_hist_shape(results["mpr_alloc"]),  # Use mpr_alloc from results
             beam_idx=match_hist_shape(beam_idx),
             interference_power=match_hist_shape(results["interference_power"]),
             ut_loc=ut_loc,
@@ -1477,6 +1591,8 @@ class SystemSimulator(Block):
 
             for la_iter in range(self.config.max_la_iterations):
                 # 4. 送信電力制御 (直前の反復のRankに基づくMPRを適用)
+                # This initial power control is for the pre-allocation phase.
+                # The actual power control for final SINR is done inside _process_sinr_and_la.
                 p_tx_watt_iter, pl_db_iter, mpr_db_iter, p_cmax_dbm_iter = (
                     self._apply_power_control(tx_power_dbm, rank, mcs_index=mcs_index)
                 )
@@ -1487,7 +1603,7 @@ class SystemSimulator(Block):
                     w_ut_dig,
                     w_bs_dig,
                     s_srv,
-                    tx_power_dbm,
+                    tx_power_dbm,  # Use base tx_power_dbm for initial PC in _optimize_rank_allocation
                     drop_idx=drop_idx,
                     la_iter=la_iter,
                     mcs_index_hint=mcs_index,
@@ -1524,10 +1640,10 @@ class SystemSimulator(Block):
                     hist,
                     record_idx,
                     results_iter,
-                    pl_db_iter,
-                    p_tx_watt_iter,
-                    p_cmax_dbm_iter,
-                    mpr_db_iter,
+                    results_iter["pl_alloc"],  # Use allocated pathloss
+                    results_iter["p_tx_watt_sched"],  # Use scheduled tx power
+                    results_iter["p_cmax_alloc"],  # Use allocated p_cmax
+                    results_iter["mpr_alloc"],  # Use allocated mpr
                     w_rf_bs_idx,
                     ut_loc=ut_loc_batch,
                     bs_loc=bs_loc_batch,

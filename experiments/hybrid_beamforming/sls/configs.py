@@ -62,8 +62,13 @@ class SLSConfig(SimulationCommonConfig):
 
     # Power Settings
     bs_max_power_dbm: float = 43.0
-    ut_max_power_dbm: float = 23.0
+    ut_max_power_dbm: float = 23.0  # UE total max power
+    ut_max_port_power_dbm: float = 23.0  # Max power per port (e.g., PC2/1.5: 23dBm)
     power_control_method: str = "sionna"  # "sionna" or "custom"
+
+    # Scheduling & LA
+    s_fdra_options: List[int] = field(default_factory=lambda: [4, 8, 16, 32, 64])
+    pf_epsilon: float = 1e-3  # Small constant to avoid div by zero in PF metric
 
     # Topology
     topology_type: str = "HexGrid"  # "HexGrid", "Custom", etc.

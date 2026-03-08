@@ -129,10 +129,17 @@ def export_sls_data(history, output_dir, slot_duration=1e-3, max_la_iterations=5
         # Mbps単位に変換: (Bits / Duration) / 1e6
         df["Throughput_Mbps"] = (df["Throughput_Bits"] / slot_duration) / 1e6
 
-    # CSV保存
-    csv_path = os.path.join(output_dir, "detailed_results.csv")
+    # CSV保存 (途中経過を含む全データ)
+    csv_path = os.path.join(output_dir, "detailed_results_all.csv")
     df.to_csv(csv_path, index=False)
-    print(f"詳細CSVを保存しました: {csv_path}")
+    print(f"詳細CSV（全反復）を保存しました: {csv_path}")
+
+    # 最終反復のみのデータを保存
+    df_last = df[df["LA_Iter_ID"] == (max_la_iterations - 1)].copy()
+    csv_path_last = os.path.join(output_dir, "detailed_results.csv")
+    df_last.to_csv(csv_path_last, index=False)
+    print(f"詳細CSV（最終反復のみ）を保存しました: {csv_path_last}")
+
     return df
 
 
