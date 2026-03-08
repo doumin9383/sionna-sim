@@ -48,8 +48,10 @@ class SystemSimulator(Block):
         average_building_height=5.0,
         precision=None,
         external_loader=None,
+        ml_model=None,
     ):
         super().__init__(precision=precision)
+        self.ml_model = ml_model
 
         self.config = config
         self.external_loader = external_loader
@@ -184,6 +186,9 @@ class SystemSimulator(Block):
             external_loader=self.loader_instance,  # Pass the instance, not the class
         )
 
+        # FDD UL interface for sensing (initialized to DL interface, updated in _setup_drop_topology if FDD)
+        self.ul_channel_interface = self.channel_interface
+
         # Instantiate SLS components
         # Instantiate SLS components
         self.mpr_model = MPRModel(config=config)
@@ -236,6 +241,30 @@ class SystemSimulator(Block):
             return self.resource_grid.fft_size // self.rbg_size_sc
         return self.resource_grid.num_effective_subcarriers
 
+    def _create_channel_model(self, scenario, carrier_frequency, o2i_model):
+        """Creates and returns a channel model instance."""
+        common_params = {
+            "carrier_frequency": carrier_frequency,
+            "ut_array": self.config.ut_array,
+            "bs_array": self.config.bs_array,
+            "direction": self.direction,
+            "enable_pathloss": True,
+            "enable_shadow_fading": True,
+            "precision": self.precision,
+        }
+
+        if scenario == "umi":
+            return UMi(o2i_model=o2i_model, **common_params)
+        elif scenario == "uma":
+            return UMa(o2i_model=o2i_model, **common_params)
+        elif scenario == "rma":
+            return RMa(
+                average_street_width=self.average_street_width,
+                average_building_height=self.average_building_height,
+                **common_params,
+            )
+        return None
+
     def _setup_channel_model(
         self,
         scenario,
@@ -247,26 +276,24 @@ class SystemSimulator(Block):
         average_building_height,
     ):
         """Initialize appropriate channel model based on scenario"""
-        common_params = {
-            "carrier_frequency": carrier_frequency,
-            "ut_array": ut_array,
-            "bs_array": bs_array,
-            "direction": self.direction,
-            "enable_pathloss": True,
-            "enable_shadow_fading": True,
-            "precision": self.precision,
-        }
+        self.average_street_width = average_street_width
+        self.average_building_height = average_building_height
+        self.o2i_model = o2i_model
 
-        if scenario == "umi":  # Urban micro-cell
-            self.channel_model = UMi(o2i_model=o2i_model, **common_params)
-        elif scenario == "uma":  # Urban macro-cell
-            self.channel_model = UMa(o2i_model=o2i_model, **common_params)
-        elif scenario == "rma":  # Rural macro-cell
-            self.channel_model = RMa(
-                average_street_width=average_street_width,
-                average_building_height=average_building_height,
-                **common_params,
+        self.channel_model = self._create_channel_model(
+            scenario, carrier_frequency, o2i_model
+        )
+
+        # FDD support: setup auxiliary UL model for sensing if needed
+        if (
+            hasattr(self.config, "ul_carrier_frequency")
+            and self.config.ul_carrier_frequency != carrier_frequency
+        ):
+            self.ul_channel_model = self._create_channel_model(
+                scenario, self.config.ul_carrier_frequency, o2i_model
             )
+        else:
+            self.ul_channel_model = self.channel_model
 
     def _setup_topology(self, num_rings, min_bs_ut_dist, max_bs_ut_dist):
         """Generate and set up network topology"""
@@ -396,6 +423,9 @@ class SystemSimulator(Block):
         # neighbor_indices shape: [batch, num_ut, k_neighbors]
         self.neighbor_indices = neighbor_indices
         self.channel_interface.neighbor_indices = neighbor_indices
+        self.ul_channel_interface.neighbor_indices = (
+            neighbor_indices  # Update UL interface too
+        )
 
         # 3. Set topology in channel model
 
@@ -419,6 +449,18 @@ class SystemSimulator(Block):
             los_arg,
             bs_virtual_loc_arg,
         )
+        # If UL channel model is different, set its topology too
+        if self.ul_channel_model != self.channel_model:
+            self.ul_channel_model.set_topology(
+                self.ut_loc,
+                self.bs_loc,
+                self.ut_orientations,
+                self.bs_orientations,
+                self.ut_velocities,
+                self.in_state,
+                los_arg,
+                bs_virtual_loc_arg,
+            )
 
     def _setup_drop_topology(self, drop_idx):
         """シミュレーションの1ドロップ分のトポロジーセットアップ"""
@@ -606,15 +648,154 @@ class SystemSimulator(Block):
 
             # 2. 粒度に応じた重み計算（SVD）& ターゲット解像度への展開
             # use get_digital_precoders orchestration utility
-            u_exp, v_exp, s_exp = weight_utils.get_digital_precoders(
-                h_srv,
-                rank,
-                granularity,
-                N_target,
-                rbg_size_sc=self.rbg_size_sc,
-                weight_type="svd",
-                force_tx_identity=self.config.force_tx_identity,
-            )
+
+            if self.config.precoding_strategy == "Random":
+                # Random Beam Strategy
+                tx_p = (
+                    self.num_tx_ports
+                    if self.direction == "uplink"
+                    else self.num_rx_ports
+                )
+                rx_p = (
+                    self.num_rx_ports
+                    if self.direction == "uplink"
+                    else self.num_tx_ports
+                )
+
+                # Generate random complex normal vectors
+                v_exp = tf.complex(
+                    tf.random.normal([B, curr_batch_size, N_target, tx_p, rank]),
+                    tf.random.normal([B, curr_batch_size, N_target, tx_p, rank]),
+                )
+                v_exp, _ = tf.linalg.qr(v_exp)  # Orthogonalize
+
+                u_exp = tf.complex(
+                    tf.random.normal([B, curr_batch_size, N_target, rx_p, rank]),
+                    tf.random.normal([B, curr_batch_size, N_target, rx_p, rank]),
+                )
+                u_exp, _ = tf.linalg.qr(u_exp)
+
+                # Singular values dummy (e.g. all 1.0 or from true channel to see performance with random beam)
+                _, _, s_exp = weight_utils.get_digital_precoders(
+                    h_srv, rank, granularity, N_target
+                )
+
+            elif self.config.precoding_strategy == "UL_Reuse":
+                # UL Reuse Strategy: Compute UL channel first and get its SVD vectors
+                h_ul_port = self.ul_channel_interface.get_neighbor_channel_info(
+                    batch_size=B,
+                    ut_loc=self.ut_loc[:, start_ut:end_ut, :],
+                    bs_loc=self.bs_loc,
+                    ut_orient=self.ut_orientations[:, start_ut:end_ut, :],
+                    bs_orient=self.bs_orientations,
+                    neighbor_indices=srv_indices,
+                    ut_velocities=self.ut_velocities[:, start_ut:end_ut, :],
+                    in_state=self.in_state[:, start_ut:end_ut],
+                    return_element_channel=False,
+                    return_s_u_v=False,
+                )
+                h_ul_sliced = (
+                    h_ul_port[:, :, 0, :, :, 0, :]
+                    if len(h_ul_port.shape) == 7
+                    else h_ul_port[:, :, 0, :, :, 0, 0, :]
+                )
+                h_ul = tf.transpose(h_ul_sliced, [0, 1, 4, 2, 3])
+
+                # Extract UL weights (u_ul, v_ul)
+                u_ul, v_ul, _ = weight_utils.get_digital_precoders(
+                    h_ul,
+                    rank,
+                    granularity,
+                    N_target,
+                    rbg_size_sc=self.rbg_size_sc,
+                    weight_type="svd",
+                )
+
+                # Reuse UL weights for DL
+                u_exp, v_exp = u_ul, v_ul
+                # But we still need singular values from the true DL channel for Link Adaptation
+                _, _, s_exp = weight_utils.get_digital_precoders(
+                    h_srv, rank, granularity, N_target
+                )
+
+            elif (
+                self.config.precoding_strategy == "ML_Predicted"
+                and self.ml_model is not None
+            ):
+                # ML Predicted Strategy
+                # 1. Get UL Channel for features
+                h_ul_port = self.ul_channel_interface.get_neighbor_channel_info(
+                    batch_size=B,
+                    ut_loc=self.ut_loc[:, start_ut:end_ut, :],
+                    bs_loc=self.bs_loc,
+                    ut_orient=self.ut_orientations[:, start_ut:end_ut, :],
+                    bs_orient=self.bs_orientations,
+                    neighbor_indices=srv_indices,
+                    ut_velocities=self.ut_velocities[:, start_ut:end_ut, :],
+                    in_state=self.in_state[:, start_ut:end_ut],
+                    return_element_channel=False,
+                    return_s_u_v=False,
+                )
+                h_ul_sliced = (
+                    h_ul_port[:, :, 0, :, :, 0, :]
+                    if len(h_ul_port.shape) == 7
+                    else h_ul_port[:, :, 0, :, :, 0, 0, :]
+                )
+                h_ul = tf.transpose(h_ul_sliced, [0, 1, 4, 2, 3])
+
+                # 2. Extract Features (Consistency with run_fdd_sim.py MVP: Pattern A)
+                u_ul, v_ul, s_ul = weight_utils.get_digital_precoders(
+                    h_ul, rank, granularity, N_target
+                )
+
+                # Features: Flattened real/imag UL V. Shape: [B*curr_batch_size, Features]
+                # v_ul: [B, curr_batch_size, N_target, TxP, Rank]
+                feat_input = tf.reshape(v_ul, [B * curr_batch_size, -1])
+                # Note: Model might expect specific real/imag format.
+                # Let's follow run_fdd_sim.py: X = UL V (complex flatten if using certain models, but Keras/LGBM usually needs real)
+                # If we use simple MLP/CNN and complex inputs, we should concat real/imag.
+                feat_input_real = tf.concat(
+                    [tf.math.real(feat_input), tf.math.imag(feat_input)], axis=-1
+                )
+
+                # 3. Predict DL V using ML model
+                # predicted: [B*curr_batch_size, OutputDim]
+                if self.config.fdd_ml_model_type == "lightgbm":
+                    predicted = self.ml_model.predict(feat_input_real.numpy())
+                    predicted = tf.convert_to_tensor(predicted, dtype=self.rdtype)
+                else:
+                    predicted = self.ml_model(feat_input_real, training=False)
+
+                # 4. Convert back to complex V
+                # predicted output format: [real_part, imag_part]
+                out_dim = predicted.shape[-1] // 2
+                res_real = tf.reshape(
+                    predicted[:, :out_dim], [B, curr_batch_size, N_target, -1, rank]
+                )
+                res_imag = tf.reshape(
+                    predicted[:, out_dim:], [B, curr_batch_size, N_target, -1, rank]
+                )
+                v_exp = tf.complex(res_real, res_imag)
+
+                # Orthogonalize predicted V to ensure valid precoder
+                v_exp, _ = tf.linalg.qr(v_exp)
+
+                # Use standard DL SVD for combiner (U) and singular values (s) to see beam gain
+                u_exp, _, s_exp = weight_utils.get_digital_precoders(
+                    h_srv, rank, granularity, N_target
+                )
+
+            else:
+                # Default: SVD
+                u_exp, v_exp, s_exp = weight_utils.get_digital_precoders(
+                    h_srv,
+                    rank,
+                    granularity,
+                    N_target,
+                    rbg_size_sc=self.rbg_size_sc,
+                    weight_type="svd",
+                    force_tx_identity=self.config.force_tx_identity,
+                )
 
             # 3. バッファに格納
             # Batch方向も考慮したインデックス作成

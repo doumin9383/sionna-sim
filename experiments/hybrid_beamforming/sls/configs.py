@@ -58,7 +58,7 @@ class SLSConfig(SimulationCommonConfig):
         "subpanel_sweep"  # "subpanel_sweep" or "full_array_sweep"
     )
 
-    num_rb = 66
+    num_rb = 64
     num_subcarriers = num_rb * 12
 
     # Power Settings
@@ -81,7 +81,7 @@ class SLSConfig(SimulationCommonConfig):
     topology_wrap: bool = True  # wrapネットワーク干渉を考慮するか
     # hex gridの場合
     num_rings: int = 1
-    num_ut_per_sector: int = 1
+    num_ut_per_sector: int = 2
     min_bs_ut_dist: float = 10.0  # Min distance between BS and UT
     max_bs_ut_dist: Optional[float] = (
         None  # Max distance, None means infinite/cell edge
@@ -109,6 +109,23 @@ class SLSConfig(SimulationCommonConfig):
 
     # Mobility/Link Adaptation
     pf_beta: float = 0.98
+
+    # FDD Settings
+    ul_carrier_frequency: float = 2.0e9
+    dl_carrier_frequency: float = 2.1e9
+
+    # Path Feature Flags for ML
+    use_path_gain: bool = True
+    use_path_delay: bool = True
+    use_path_aoa: bool = True
+    use_path_aod: bool = True
+    use_singular_vectors: bool = (
+        False  # Alternative: use SVD singular vectors instead of path info
+    )
+
+    # ML Model Selection
+    # "mlp", "cnn", "transformer", "lightgbm"
+    fdd_ml_model_type: str = "mlp"
 
     # Results
     output_dir: str = "experiments/hybrid_beamforming/sls/results"
