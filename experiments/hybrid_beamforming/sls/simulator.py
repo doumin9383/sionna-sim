@@ -214,9 +214,17 @@ class SystemSimulator(Block):
             dtype=self.rdtype,  # Use simulation precision
         )
 
-        # Instantiate PF Scheduler
+        rb_per_unit = 1.0
+        if self.config.use_rbg_granularity:
+            rb_per_unit = float(self.config.num_rb) / (
+                self.resource_grid.fft_size // self.rbg_size_sc
+            )
+
         self.scheduler = PFScheduler(
-            config=config, num_ut=self.num_ut, num_rb=self.simulation_freq_res
+            config=config,
+            num_ut=self.num_ut,
+            num_rb=self.simulation_freq_res,
+            rb_per_unit=rb_per_unit,
         )
 
     @property
@@ -1220,6 +1228,7 @@ class SystemSimulator(Block):
         )
 
         # 2. Scheduling & Resource Mapping (Algorithm 2)
+
         schedule_result = self.scheduler.schedule(self.pre_allocation_results)
         allocation_mask = schedule_result["allocation_mask"]
         scheduled_rbs = schedule_result["scheduled_rbs"]
@@ -1238,9 +1247,6 @@ class SystemSimulator(Block):
             allocation_mask=allocation_mask,
         )
 
-        # 最終送信電力計算 (スケジューリングされたRB数とMCSに基づいて再計算)
-        # This needs to be done per UT, considering its allocated RBs and MCS.
-        # The `_apply_power_control` function can take `num_rbs` and `mcs_index`.
         p_tx_watt_sched, pl_alloc, mpr_alloc, p_cmax_alloc = self._apply_power_control(
             p_tx_watt_base, final_rank, mcs_index=mcs_opt, num_rbs=scheduled_rbs
         )

@@ -79,43 +79,6 @@ class PowerControl:
         else:
             p_cmax = tf.minimum(self.p_power_class, p_total_from_ports)
 
-            # Sionna expects linear pathloss
-            path_loss_lin_flat = db_to_lin(path_loss_flat)
-
-            # num_allocated_subcarriers = num_rbs * 12
-            num_subcarriers = tf.cast(num_rbs, tf.float32) * 12.0
-
-            # Broadcast scalar num_subcarriers to match pathloss shape
-            if tf.rank(num_subcarriers) == 0:
-                num_subcarriers = tf.broadcast_to(
-                    num_subcarriers, tf.shape(path_loss_flat)
-                )
-            elif tf.rank(num_subcarriers) > 0:
-                num_subcarriers = tf.reshape(num_subcarriers, [-1])
-
-            # Call Sionna function
-            # Output is in Watts, we need dBm
-            p_tx_watt_flat = open_loop_uplink_power_control(
-                pathloss=path_loss_lin_flat,
-                num_allocated_subcarriers=num_subcarriers,
-                alpha=self.alpha,
-                p0_dbm=self.p0,
-                ut_max_power_dbm=p_cmax_flat,  # We pass adjusted P_cmax as max power
-            )
-
-            # Avoid log(0)
-            p_tx_dbm_flat = (
-                10.0
-                * tf.math.log(tf.maximum(p_tx_watt_flat, 1e-20))
-                / tf.math.log(10.0)
-                + 30.0
-            )
-
-            # Reshape back to original shape
-            p_tx_dbm = tf.reshape(p_tx_dbm_flat, original_shape)
-
-            return p_tx_dbm
-
         if self.method == "sionna" and open_loop_uplink_power_control is not None:
             # Flatten inputs to handle arbitrary batch dimensions
             original_shape = tf.shape(path_loss_db)

@@ -3,10 +3,11 @@ import numpy as np
 
 
 class PFScheduler:
-    def __init__(self, config, num_ut, num_rb):
+    def __init__(self, config, num_ut, num_rb, rb_per_unit=1.0):
         self.config = config
         self.num_ut = num_ut
         self.num_rb = num_rb
+        self.rb_per_unit = rb_per_unit
 
         # 移動平均エクスウィンドー T_avg_u
         self.avg_throughput = tf.zeros([num_ut], dtype=tf.float32)
@@ -75,34 +76,36 @@ class PFScheduler:
             free_rbs = np.ones(N_RB, dtype=bool)
 
             for u in sorted_ues:
-                req_rb = n_req_b[u]
-                if req_rb <= 0 or np.sum(free_rbs) < req_rb:
+                req_rb_orig = n_req_b[u]
+                req_unit = n_req_unit_b[u]
+                if req_unit <= 0 or np.sum(free_rbs) < req_unit:
                     continue
 
                 selected_rbs = []
 
                 if self.config.waveform == "CP-OFDM":
                     # [CP-OFDM: 非連続・Greedy選択]
-                    # 空きRBの中でCQIが高い上位 req_rb 個を取得
+                    # 空きUnitの中でCQIが高い上位 req_unit 個を取得
                     free_indices = np.where(free_rbs)[0]
                     free_cqi = cqi_b[u, free_indices]
 
                     # Sort by CQI descending
-                    top_k_indices = np.argsort(-free_cqi)[:req_rb]
+                    top_k_indices = np.argsort(-free_cqi)[:req_unit]
                     selected_rbs = free_indices[top_k_indices]
 
                 else:
-                    # [DFT-s-OFDM: 連続・RBGベース選択]
+                    # [DFT-s-OFDM: 連続・ Unit(RBG)ベース選択]
                     # 最小RBGサイズ(min of S_FDRA)を満たすチャンク単位での連続割当
-                    min_rbg = (
+                    min_rbg_rbs = (
                         min(self.config.s_fdra_options)
                         if hasattr(self.config, "s_fdra_options")
                         else 4
                     )
+                    min_rbg_units = max(1, int(np.ceil(min_rbg_rbs / self.rb_per_unit)))
 
-                    # If target is non-multiple of chunk, round down or up. Usually it is already a size from s_fdra.
-                    needed_chunks = req_rb // min_rbg
-                    chunks_total = N_RB // min_rbg
+                    # If target is non-multiple of chunk, round down or up
+                    needed_chunks = req_unit // min_rbg_units
+                    chunks_total = N_RB // min_rbg_units
 
                     if needed_chunks == 0:
                         continue
@@ -110,7 +113,9 @@ class PFScheduler:
                     # チャンク単位の空き状況配列
                     free_chunks = np.array(
                         [
-                            np.all(free_rbs[c * min_rbg : (c + 1) * min_rbg])
+                            np.all(
+                                free_rbs[c * min_rbg_units : (c + 1) * min_rbg_units]
+                            )
                             for c in range(chunks_total)
                         ]
                     )
@@ -126,17 +131,17 @@ class PFScheduler:
                         best_c = -1
                         best_cqi = -np.inf
                         for c in contiguous_candidates:
-                            start_rb = c * min_rbg
-                            end_rb = start_rb + (needed_chunks * min_rbg)
-                            avg_cqi = np.mean(cqi_b[u, start_rb:end_rb])
+                            start_unit = c * min_rbg_units
+                            end_unit = start_unit + (needed_chunks * min_rbg_units)
+                            avg_cqi = np.mean(cqi_b[u, start_unit:end_unit])
                             if avg_cqi > best_cqi:
                                 best_cqi = avg_cqi
                                 best_c = c
 
-                        start_rb = best_c * min_rbg
-                        actual_rbs_to_allocate = needed_chunks * min_rbg
+                        start_unit = best_c * min_rbg_units
+                        actual_units_to_allocate = needed_chunks * min_rbg_units
                         selected_rbs = np.arange(
-                            start_rb, start_rb + actual_rbs_to_allocate
+                            start_unit, start_unit + actual_units_to_allocate
                         )
                     else:
                         # 連続ブロックが確保できない場合はスキップ
@@ -145,7 +150,10 @@ class PFScheduler:
                 if len(selected_rbs) > 0:
                     allocation_mask[b, u, selected_rbs] = True
                     free_rbs[selected_rbs] = False
-                    scheduled_rbs[b, u] = len(selected_rbs)
+                    # Convert units back to RBs for scheduled_rbs output
+                    scheduled_rbs[b, u] = min(
+                        req_rb_orig, len(selected_rbs) * int(self.rb_per_unit)
+                    )
 
         # TF Tensorに変換
         allocation_mask_tf = tf.convert_to_tensor(allocation_mask, dtype=tf.bool)
