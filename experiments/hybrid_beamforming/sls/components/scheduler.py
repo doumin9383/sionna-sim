@@ -102,6 +102,11 @@ class PFScheduler:
             for u in sorted_ues:
                 req_rb_orig = n_req_b[u]
                 req_unit = n_req_unit_b[u]
+
+                # 要求サイズが0（バッファが空など）の場合はスキップ
+                if req_unit <= 0:
+                    continue
+
                 bs_id = bs_ids_b[u]
                 free_rbs = free_rbs_per_bs[bs_id]
 

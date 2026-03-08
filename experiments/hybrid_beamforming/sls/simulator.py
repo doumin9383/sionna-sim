@@ -669,6 +669,7 @@ class SystemSimulator(Block):
         w_bs_dig_full,
         s_srv_full,
         tx_power_dbm_base,
+        ue_buffers=None,
         drop_idx=0,
         la_iter=0,
         mcs_index_hint=None,
@@ -755,6 +756,10 @@ class SystemSimulator(Block):
                         * tf.cast(n_rb * 12, self.rdtype)
                     )
                     tp_total_rb *= tf.cast(self.config.num_data_symbols, self.rdtype)
+
+                    # バッファ量で期待スループットをクリップ
+                    if ue_buffers is not None:
+                        tp_total_rb = tf.minimum(tp_total_rb, ue_buffers)
 
                     total_tp_r_list.append(tp_total_rb)
                     mcs_list.append(mcs_idx)
@@ -1208,6 +1213,7 @@ class SystemSimulator(Block):
         w_bs_dig,
         s_srv,
         p_tx_watt_base,
+        ue_buffers=None,
         drop_idx=0,
         la_iter=0,
         mcs_index_hint=None,
@@ -1222,6 +1228,7 @@ class SystemSimulator(Block):
             w_bs_dig,
             s_srv,
             p_tx_watt_base,
+            ue_buffers=ue_buffers,
             drop_idx=drop_idx,
             la_iter=la_iter,
             mcs_index_hint=mcs_index_hint,
@@ -1326,6 +1333,11 @@ class SystemSimulator(Block):
                 tp_sum *= 12.0  # 1F bin = 1 RB (12 SCs)
 
             tp_sum *= tf.cast(self.config.num_data_symbols, self.rdtype)
+
+            # バッファ量でスループット（送信ビット数）をクリップ
+            if ue_buffers is not None:
+                tp_sum = tf.minimum(tp_sum, ue_buffers[:, start_ut:end_ut])
+
             # Ensure shape is [B, BUT]
             tp_sum = tf.reshape(tp_sum, [B, end_ut - start_ut])
             throughput_per_user_list.append(tp_sum)
@@ -1600,8 +1612,33 @@ class SystemSimulator(Block):
             # 1. トポロジーのセットアップ
             self._setup_drop_topology(drop_idx)
 
+            # UEごとのバッファ初期化 [Batch, N_UT]
+            # traffic_model が "ftp_model_1" の場合のみ管理。Full Bufferの場合は None
+            if self.config.traffic_model == "ftp_model_1":
+                ue_buffers = tf.zeros([self.batch_size, self.num_ut], dtype=self.rdtype)
+            else:
+                ue_buffers = None
+
             # --- Slot Loop ---
             for slot_idx in range(self.config.num_slots):
+                # 1.5. トラフィック到着 (FTP Model 1)
+                if ue_buffers is not None:
+                    # lambda * slot_duration [sec] に基づくポアソン到着
+                    # slot_duration は1シンボル分なので、num_symbols_per_slot を掛ける
+                    total_slot_time = (
+                        self.slot_duration * self.config.num_symbols_per_slot
+                    )
+                    avg_arrivals = self.config.ftp_arrival_rate_lambda * total_slot_time
+                    # 到着したファイル数（ポアソン乱数）
+                    num_arrivals = tf.random.poisson(
+                        shape=[],
+                        lam=tf.fill([self.batch_size, self.num_ut], avg_arrivals),
+                    )
+                    # ファイルサイズ（Byte）を Bit に変換して加算
+                    ue_buffers += num_arrivals * (
+                        float(self.config.ftp_file_size_bytes) * 8.0
+                    )
+
                 # coherence_time に基づいてチャネル情報を更新するか決定
                 # 初回、または指定されたコヒーレンスタイムが経過した時に更新
                 if slot_idx % self.config.coherence_time == 0:
@@ -1622,6 +1659,7 @@ class SystemSimulator(Block):
                 )
                 mcs_index = None
 
+                results_iter = None
                 for la_iter in range(self.config.max_la_iterations):
                     # 4. 送信電力制御 (直前の反復のRankに基づくMPRを適用)
                     # This initial power control is for the pre-allocation phase.
@@ -1639,6 +1677,7 @@ class SystemSimulator(Block):
                         w_bs_dig,
                         s_srv,
                         tx_power_dbm,  # Use base tx_power_dbm for initial PC in _optimize_rank_allocation
+                        ue_buffers=ue_buffers,
                         drop_idx=drop_idx,
                         la_iter=la_iter,
                         mcs_index_hint=mcs_index,
@@ -1696,6 +1735,19 @@ class SystemSimulator(Block):
                         ut_loc=ut_loc_batch,
                         bs_loc=bs_loc_batch,
                     )
+
+                # --- Slot終了時のバッファ更新 ---
+                if ue_buffers is not None and results_iter is not None:
+                    # 実際に送信されたビット数を減算
+                    transmitted_bits = results_iter["throughput_per_user"]
+                    ue_buffers = tf.maximum(0.0, ue_buffers - transmitted_bits)
+
+                # --- 早期終了判定 ---
+                if self.config.enable_early_termination and ue_buffers is not None:
+                    # すべてのUEのバッファが空（閾値以下）になったらスロットループを抜ける
+                    if tf.reduce_all(ue_buffers < 0.1):
+                        # print(f"Drop {drop_idx}: All buffers empty at slot {slot_idx}. Early terminating.")
+                        break
 
         # 履歴をTensorに変換
         final_hist = {}

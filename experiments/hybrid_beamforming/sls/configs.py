@@ -68,6 +68,11 @@ class SLSConfig(SimulationCommonConfig):
     power_control_method: str = "sionna"  # "sionna" or "custom"
 
     # Scheduling & LA
+    traffic_model: str = "full_buffer"  # "full_buffer" or "ftp_model_1"
+    ftp_arrival_rate_lambda: float = 2.0  # Poisson arrival rate [files/sec]
+    ftp_file_size_bytes: int = 500 * 1024  # Size of each arrival [Bytes]
+    enable_early_termination: bool = False  # Early exit if all buffers are empty
+
     s_fdra_options: List[int] = field(default_factory=lambda: [4, 8, 16, 32, 64])
     pf_epsilon: float = 1e-3  # Small constant to avoid div by zero in PF metric
 
