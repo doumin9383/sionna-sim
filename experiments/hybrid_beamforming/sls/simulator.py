@@ -1229,7 +1229,9 @@ class SystemSimulator(Block):
 
         # 2. Scheduling & Resource Mapping (Algorithm 2)
 
-        schedule_result = self.scheduler.schedule(self.pre_allocation_results)
+        schedule_result = self.scheduler.schedule(
+            self.pre_allocation_results, serving_bs_ids=self.serving_bs_ids
+        )
         allocation_mask = schedule_result["allocation_mask"]
         scheduled_rbs = schedule_result["scheduled_rbs"]
 

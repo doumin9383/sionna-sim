@@ -26,8 +26,8 @@ class SLSConfig(SimulationCommonConfig):
     # precoding_strategy: str = "SVD"  # "SVD", "Identity" (Non-coherent)
     precoding_strategy: str = "Identity"  # "SVD", "Identity" (Non-coherent)
     use_rbg_granularity: bool = True  # If True, calculate channel only at RBG centers
-    waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
-    # waveform: str = "DFT-s-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
+    # waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
+    waveform: str = "DFT-s-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
     cyclic_prefix_length: int = 0  # CP length for ResourceGrid
     export_detailed_logs: bool = False  # If True, export detailed rank selection logs
     num_neighbors: Optional[int] = (

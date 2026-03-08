@@ -20,7 +20,12 @@ class PFScheduler:
         # IIRフィルタの重み
         self.beta = self.config.pf_beta if hasattr(self.config, "pf_beta") else 0.98
 
-    def schedule(self, pre_allocation_results, channel_quality_metric=None):
+    def schedule(
+        self,
+        pre_allocation_results,
+        channel_quality_metric=None,
+        serving_bs_ids=None,
+    ):
         """
         [Phase 2: Resource Mapping (Algorithm 2)]
         事前計算結果（要求RB数、期待スループット）を用いてPFメトリックを計算し、
@@ -33,6 +38,7 @@ class PFScheduler:
                 "mcs_opt": [Batch, UT]
                 "rank_opt": [Batch, UT]
             channel_quality_metric (tf.Tensor, optional): [Batch, UT, RB] の各RBの通信品質（SINR等）
+            serving_bs_ids (tf.Tensor, optional): [Batch, UT] 各UEのサービングBS ID
 
         Returns:
             dict:
@@ -43,6 +49,9 @@ class PFScheduler:
         B = tf.shape(pre_allocation_results["max_thp"])[0]
         N_UT = self.num_ut
         N_RB = self.num_rb
+        num_bs = (
+            int(tf.reduce_max(serving_bs_ids) + 1) if serving_bs_ids is not None else 1
+        )
 
         n_req = pre_allocation_results["n_req"]
         max_thp = pre_allocation_results["max_thp"]
@@ -59,10 +68,17 @@ class PFScheduler:
         allocation_mask = np.zeros((B, N_UT, N_RB), dtype=bool)
         scheduled_rbs = np.zeros((B, N_UT), dtype=np.int32)
 
+        serving_bs_ids_np = (
+            serving_bs_ids.numpy()
+            if serving_bs_ids is not None
+            else np.zeros((B, N_UT), dtype=int)
+        )
+
         for b in range(B):
             # 優先度順にUEをソート (降順)
             pf_b = pf_metric[b].numpy()
             n_req_b = n_req[b].numpy()
+            bs_ids_b = serving_bs_ids_np[b]
             cqi_b = (
                 channel_quality_metric[b].numpy()
                 if channel_quality_metric is not None
@@ -73,29 +89,54 @@ class PFScheduler:
             ue_indices = np.where(pf_b > 0)[0]
             sorted_ues = ue_indices[np.argsort(-pf_b[ue_indices])]
 
-            free_rbs = np.ones(N_RB, dtype=bool)
+            # 各BSごとに独立したリソースを管理
+            free_rbs_per_bs = np.ones((num_bs, N_RB), dtype=bool)
+            n_req_unit_b = np.ceil(n_req_b / self.rb_per_unit).astype(int)
+
+            fdra_options = (
+                sorted(self.config.s_fdra_options, reverse=True)
+                if hasattr(self.config, "s_fdra_options")
+                else [N_RB]
+            )
 
             for u in sorted_ues:
                 req_rb_orig = n_req_b[u]
                 req_unit = n_req_unit_b[u]
-                if req_unit <= 0 or np.sum(free_rbs) < req_unit:
+                bs_id = bs_ids_b[u]
+                free_rbs = free_rbs_per_bs[bs_id]
+
+                available_rbs_count = np.sum(free_rbs)
+                if available_rbs_count <= 0:
                     continue
+
+                # 要求サイズが確保できない場合、FDRA設定に従ってダウンサイズ
+                if available_rbs_count < req_unit:
+                    # 確保可能な最大ユニット数 (Unitベース)
+                    max_available_unit = int(available_rbs_count)
+                    # FDRAオプションから適合する最大サイズを選択
+                    # Unitに変換して比較
+                    found_valid_size = False
+                    for opt_rb in fdra_options:
+                        opt_unit = int(np.ceil(opt_rb / self.rb_per_unit))
+                        if opt_unit <= max_available_unit:
+                            req_unit = opt_unit
+                            found_valid_size = True
+                            break
+                    if not found_valid_size:
+                        continue
 
                 selected_rbs = []
 
                 if self.config.waveform == "CP-OFDM":
                     # [CP-OFDM: 非連続・Greedy選択]
-                    # 空きUnitの中でCQIが高い上位 req_unit 個を取得
                     free_indices = np.where(free_rbs)[0]
                     free_cqi = cqi_b[u, free_indices]
 
-                    # Sort by CQI descending
                     top_k_indices = np.argsort(-free_cqi)[:req_unit]
                     selected_rbs = free_indices[top_k_indices]
 
                 else:
                     # [DFT-s-OFDM: 連続・ Unit(RBG)ベース選択]
-                    # 最小RBGサイズ(min of S_FDRA)を満たすチャンク単位での連続割当
                     min_rbg_rbs = (
                         min(self.config.s_fdra_options)
                         if hasattr(self.config, "s_fdra_options")
@@ -103,7 +144,6 @@ class PFScheduler:
                     )
                     min_rbg_units = max(1, int(np.ceil(min_rbg_rbs / self.rb_per_unit)))
 
-                    # If target is non-multiple of chunk, round down or up
                     needed_chunks = req_unit // min_rbg_units
                     chunks_total = N_RB // min_rbg_units
 
@@ -127,7 +167,6 @@ class PFScheduler:
                             contiguous_candidates.append(c)
 
                     if len(contiguous_candidates) > 0:
-                        # 複数候補がある場合、該当領域のCQI平均が最大のものを選択
                         best_c = -1
                         best_cqi = -np.inf
                         for c in contiguous_candidates:
@@ -144,16 +183,13 @@ class PFScheduler:
                             start_unit, start_unit + actual_units_to_allocate
                         )
                     else:
-                        # 連続ブロックが確保できない場合はスキップ
                         continue
 
                 if len(selected_rbs) > 0:
                     allocation_mask[b, u, selected_rbs] = True
-                    free_rbs[selected_rbs] = False
-                    # Convert units back to RBs for scheduled_rbs output
-                    scheduled_rbs[b, u] = min(
-                        req_rb_orig, len(selected_rbs) * int(self.rb_per_unit)
-                    )
+                    free_rbs_per_bs[bs_id, selected_rbs] = False
+                    # 実際に割り当てられたRB数を計算 (UnitをRBに戻す)
+                    scheduled_rbs[b, u] = len(selected_rbs) * int(self.rb_per_unit)
 
         # TF Tensorに変換
         allocation_mask_tf = tf.convert_to_tensor(allocation_mask, dtype=tf.bool)
