@@ -61,6 +61,7 @@ def init_result_history(
         "mpr_db",
         "beam_idx",
         "interference_power",
+        "allocation_mask",
     ]
 
     for key in link_metric_keys:
@@ -90,6 +91,7 @@ def record_results(
     mpr_db=None,
     beam_idx=None,
     interference_power=None,
+    allocation_mask=None,
     ut_loc=None,
     bs_loc=None,
     shape=None,
@@ -111,6 +113,7 @@ def record_results(
                 "mpr_db",
                 "beam_idx",
                 "interference_power",
+                "allocation_mask",
                 "ut_loc",
                 "bs_loc",
             ],
@@ -128,6 +131,7 @@ def record_results(
                 mpr_db,
                 beam_idx,
                 interference_power,
+                allocation_mask,
                 ut_loc,
                 bs_loc,
             ],

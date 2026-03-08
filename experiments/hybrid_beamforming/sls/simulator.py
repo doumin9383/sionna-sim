@@ -1520,6 +1520,7 @@ class SystemSimulator(Block):
         p_cmax_dbm,
         mpr_db,
         beam_idx,
+        allocation_mask=None,
         ut_loc=None,
         bs_loc=None,
     ):
@@ -1555,6 +1556,13 @@ class SystemSimulator(Block):
             mpr_db=match_hist_shape(results["mpr_alloc"]),  # Use mpr_alloc from results
             beam_idx=match_hist_shape(beam_idx),
             interference_power=match_hist_shape(results["interference_power"]),
+            allocation_mask=(
+                match_hist_shape(
+                    tf.reduce_mean(tf.cast(allocation_mask, tf.float32), axis=-1)
+                )
+                if allocation_mask is not None
+                else tf.zeros(match_hist_shape(pl_db).shape, dtype=tf.float32)
+            ),
             ut_loc=ut_loc,
             bs_loc=bs_loc,
             pf_metric=tf.reshape(
@@ -1653,6 +1661,7 @@ class SystemSimulator(Block):
                     results_iter["p_cmax_alloc"],  # Use allocated p_cmax
                     results_iter["mpr_alloc"],  # Use allocated mpr
                     w_rf_bs_idx,
+                    allocation_mask=results_iter.get("allocation_mask"),
                     ut_loc=ut_loc_batch,
                     bs_loc=bs_loc_batch,
                 )
