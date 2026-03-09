@@ -481,75 +481,91 @@ class SystemSimulator(Block):
 
     def _select_analog_beams(self):
         """コードブックベースのアナログビーム選択を実行し、重みをセットする"""
-        h_serv_list = []
-        batch_size_beam = 1  # 1 UTずつ処理（メモリ節約）
-
-        for i in range(0, self.num_ut, batch_size_beam):
-            end_i = min(i + batch_size_beam, self.num_ut)
-            curr_neigh_inds = self.neighbor_indices[:, i:end_i, :]
-            curr_ut_loc = self.ut_loc[:, i:end_i, :]
-            curr_ut_orient = self.ut_orientations[:, i:end_i, :]
-            curr_ut_vel = self.ut_velocities[:, i:end_i, :]
-            curr_in_state = self.in_state[:, i:end_i]
-
-            h_elem_batch = (
-                self.channel_interface.get_element_channel_for_beam_selection(
-                    batch_size=self.batch_size,
-                    ut_loc=curr_ut_loc,
-                    bs_loc=self.bs_loc,
-                    ut_orient=curr_ut_orient,
-                    bs_orient=self.bs_orientations,
-                    neighbor_indices=curr_neigh_inds,
-                    ut_velocities=curr_ut_vel,
-                    in_state=curr_in_state,
-                )
-            )
-            # Neighbor=0, Time=0
-            h_serv_batch = h_elem_batch[:, :, 0, :, :, 0, :]
-
-            # 周波数方向のサブサンプリング（メモリ節約）
-            if self.config.use_rbg_granularity:
-                # RBG単位での周波数サンプリング（中心付近の1点を使用）
-                # 完全に平均をとるのではなく、計算負荷を減らすために間引く
-                h_serv_batch = h_serv_batch[..., :: self.rbg_size_sc]
-
-            h_serv_list.append(h_serv_batch)
-
-        h_serv = tf.concat(h_serv_list, axis=1)
-
-        # BS側のビーム選択
         B = self.batch_size
         N_BS = self.num_bs
-        N_UT_Sec = self.num_ut_per_sector
         N_UT_Total = self.num_ut
-        RxA = tf.shape(h_serv)[2]
-        TxA = tf.shape(h_serv)[3]
-        FFT = tf.shape(h_serv)[4]
 
-        batch_indices = tf.broadcast_to(tf.range(B)[:, None], [B, N_UT_Total])
-        bs_indices = tf.cast(self.serving_bs_ids, tf.int32)
-        indices = tf.stack(
-            [batch_indices, bs_indices, tf.zeros_like(bs_indices)], axis=-1
-        )
-
-        h_serv_flat = tf.reshape(h_serv, [B, N_UT_Total, -1])
-        h_bs_shape = [B, N_BS, N_UT_Sec, RxA * TxA * FFT]
-        h_bs_flat = tf.scatter_nd(indices, h_serv_flat, h_bs_shape)
-        h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, RxA, TxA, FFT])
-
-        if self.direction == "uplink":
-            h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 3, 5])
+        # 1x1 サブパネル (ハイブリッドなし) の場合はバイパス
+        if (
+            self.config.bs_num_rows_per_panel == 1
+            and self.config.bs_num_cols_per_panel == 1
+        ):
+            # Identity: [Ant, Port]
+            # 1x1サブパネルの場合、アンテナ要素数とポート数は一致する（偏波分含む）
+            bs_ports = (
+                self.num_rx_ports if self.direction == "uplink" else self.num_tx_ports
+            )
+            w_rf_bs = tf.eye(self.num_bs_ant, num_columns=bs_ports, dtype=tf.complex64)
+            w_rf_bs = tf.broadcast_to(
+                w_rf_bs[None, None, ...], [B, N_BS, self.num_bs_ant, bs_ports]
+            )
+            # 記録用の形状 [B, N_UT] に合わせる (match_hist_shapeでのリシェイプに備える)
+            best_beam_idx = tf.zeros([B, N_UT_Total], dtype=tf.int32)
         else:
-            h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 3, 4, 5])
+            h_serv_list = []
+            batch_size_beam = 1  # 1 UTずつ処理（メモリ節約）
 
-        h_selector_input = tf.reshape(
-            h_bs_permuted,
-            [-1, N_UT_Sec, tf.shape(h_bs_permuted)[3], self.num_bs_ant, FFT],
-        )
-        w_rf_bs_flat, best_beam_idx = self.beam_selector(
-            h_selector_input, self.config.bs_array
-        )
-        w_rf_bs = tf.reshape(w_rf_bs_flat, [B, N_BS, self.num_bs_ant, -1])
+            for i in range(0, self.num_ut, batch_size_beam):
+                end_i = min(i + batch_size_beam, self.num_ut)
+                curr_neigh_inds = self.neighbor_indices[:, i:end_i, :]
+                curr_ut_loc = self.ut_loc[:, i:end_i, :]
+                curr_ut_orient = (self.ut_orientations[:, i:end_i, :],)
+                curr_ut_vel = self.ut_velocities[:, i:end_i, :]
+                curr_in_state = self.in_state[:, i:end_i]
+
+                h_elem_batch = (
+                    self.channel_interface.get_element_channel_for_beam_selection(
+                        batch_size=self.batch_size,
+                        ut_loc=curr_ut_loc,
+                        bs_loc=self.bs_loc,
+                        ut_orient=curr_ut_orient,
+                        bs_orient=self.bs_orientations,
+                        neighbor_indices=curr_neigh_inds,
+                        ut_velocities=curr_ut_vel,
+                        in_state=curr_in_state,
+                    )
+                )
+                # Neighbor=0, Time=0
+                h_serv_batch = h_elem_batch[:, :, 0, :, :, 0, :]
+
+                # 周波数方向のサブサンプリング（メモリ節約）
+                if self.config.use_rbg_granularity:
+                    h_serv_batch = h_serv_batch[..., :: self.rbg_size_sc]
+
+                h_serv_list.append(h_serv_batch)
+
+            h_serv = tf.concat(h_serv_list, axis=1)
+
+            # BS側のビーム選択
+            N_UT_Sec = self.num_ut_per_sector
+            RxA = tf.shape(h_serv)[2]
+            TxA = tf.shape(h_serv)[3]
+            FFT = tf.shape(h_serv)[4]
+
+            batch_indices = tf.broadcast_to(tf.range(B)[:, None], [B, N_UT_Total])
+            bs_indices = tf.cast(self.serving_bs_ids, tf.int32)
+            indices = tf.stack(
+                [batch_indices, bs_indices, tf.zeros_like(bs_indices)], axis=-1
+            )
+
+            h_serv_flat = tf.reshape(h_serv, [B, N_UT_Total, -1])
+            h_bs_shape = [B, N_BS, N_UT_Sec, RxA * TxA * FFT]
+            h_bs_flat = tf.scatter_nd(indices, h_serv_flat, h_bs_shape)
+            h_bs = tf.reshape(h_bs_flat, [B, N_BS, N_UT_Sec, RxA, TxA, FFT])
+
+            if self.direction == "uplink":
+                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 4, 3, 5])
+            else:
+                h_bs_permuted = tf.transpose(h_bs, [0, 1, 2, 3, 4, 5])
+
+            h_selector_input = tf.reshape(
+                h_bs_permuted,
+                [-1, N_UT_Sec, tf.shape(h_bs_permuted)[3], self.num_bs_ant, FFT],
+            )
+            w_rf_bs_flat, best_beam_idx = self.beam_selector(
+                h_selector_input, self.config.bs_array
+            )
+            w_rf_bs = tf.reshape(w_rf_bs_flat, [B, N_BS, self.num_bs_ant, -1])
 
         # Store best_beam_idx for recording
         self.last_best_beam_idx = best_beam_idx
@@ -748,7 +764,7 @@ class SystemSimulator(Block):
                             p_srv.append(p[:, bs_idx, ut_idx, :])
                         feat_list.append(
                             tf.reshape(
-                                tf.stack(p_srv, axis=1), [B * curr_batch_size, -1]
+                                tf.stack(p_srv, axis=1), [B * curr_batch_size, 1, -1]
                             )
                         )
 
@@ -760,7 +776,7 @@ class SystemSimulator(Block):
                             d_srv.append(d[:, bs_idx, ut_idx, :])
                         feat_list.append(
                             tf.reshape(
-                                tf.stack(d_srv, axis=1), [B * curr_batch_size, -1]
+                                tf.stack(d_srv, axis=1), [B * curr_batch_size, 1, -1]
                             )
                         )
 
@@ -772,7 +788,7 @@ class SystemSimulator(Block):
                             a_srv.append(a[:, bs_idx, ut_idx, :])
                         feat_list.append(
                             tf.reshape(
-                                tf.stack(a_srv, axis=1), [B * curr_batch_size, -1]
+                                tf.stack(a_srv, axis=1), [B * curr_batch_size, 1, -1]
                             )
                         )
 
@@ -784,11 +800,16 @@ class SystemSimulator(Block):
                             o_srv.append(o[:, bs_idx, ut_idx, :])
                         feat_list.append(
                             tf.reshape(
-                                tf.stack(o_srv, axis=1), [B * curr_batch_size, -1]
+                                tf.stack(o_srv, axis=1), [B * curr_batch_size, 1, -1]
                             )
                         )
 
-                    feat_input_real = tf.concat(feat_list, axis=-1)
+                    feat_input_wideband = tf.concat(feat_list, axis=-1)
+                    # 周波数方向にタイル展開 [B*UT*N_target, Feat]
+                    feat_input_real = tf.reshape(
+                        tf.tile(feat_input_wideband, [1, N_target, 1]),
+                        [B * curr_batch_size * N_target, -1],
+                    )
                 else:
                     # Case: SVD Singular Vectors (Pattern A)
                     # 1. Get port channel for SVD
@@ -814,8 +835,8 @@ class SystemSimulator(Block):
                     u_ul, v_ul, s_ul = weight_utils.get_digital_precoders(
                         h_ul, rank, granularity, N_target
                     )
-                    # feat_input: [B, curr_batch_size, N_target, TxP, Rank] -> [B*curr_batch_size, -1]
-                    feat_flat = tf.reshape(v_ul, [B * curr_batch_size, -1])
+                    # Per-RB予測のためにリシェイプ [B*UT*N_target, Port*Rank]
+                    feat_flat = tf.reshape(v_ul, [B * curr_batch_size * N_target, -1])
                     feat_input_real = tf.concat(
                         [tf.math.real(feat_flat), tf.math.imag(feat_flat)], axis=-1
                     )
@@ -873,10 +894,6 @@ class SystemSimulator(Block):
             indices_bs = tf.stack([batch_indices, bs_ids_flat], axis=-1)
             indices_bs_flat = tf.reshape(indices_bs, [-1, 2])
 
-            # DEBUG print before reshape
-            print(
-                f"DEBUG: s_exp shape={s_exp.shape}, N_target={N_target}, rank={rank}, curr_batch={curr_batch_size}"
-            )
             s_exp_flat = tf.reshape(s_exp, [-1, N_target, rank])
             s_srv_full = tf.tensor_scatter_nd_update(
                 s_srv_full, indices_ut_flat, s_exp_flat
@@ -1192,8 +1209,8 @@ class SystemSimulator(Block):
                 # Total interference from current batch of UTs to their neighbors
                 # p_leak_sum: [B, BUT, K_neighbors-1, F]
                 p_leak_sum = (
-                    p_layer_masked[:, :, :, 0, 0] * heff_sq_sum
-                )  # [B, BUT, F] * [B, BUT, K_neighbors-1, F] -> broadcast
+                    p_layer_masked[:, :, None, :, 0, 0] * heff_sq_sum
+                )  # [B, BUT, 1, F] * [B, BUT, K_neighbors-1, F] -> broadcast
 
                 # Scatter add to BS buffer
                 # indices for scatter_nd_add: [B, K_neighbors-1]

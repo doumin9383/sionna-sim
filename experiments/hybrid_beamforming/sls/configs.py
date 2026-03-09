@@ -158,3 +158,39 @@ class SLSConfig(SimulationCommonConfig):
             antenna_pattern="omni",
             carrier_frequency=self.carrier_frequency,
         )
+
+
+@dataclass
+class FDDConfig(SLSConfig):
+    """FDD実験に特化した設定クラス"""
+
+    waveform: str = "CP-OFDM"  # "CP-OFDM" or "DFT-s-OFDM"
+
+    # 1-Rank設定
+    num_layers: int = 1
+    available_layers: List[int] = field(default_factory=lambda: [1])
+
+    # 32ポート設定 (4x4パネル * 偏波2)
+    bs_num_rows_panel: int = 4
+    bs_num_cols_panel: int = 4
+    bs_polarization: str = "dual"
+
+    # 1x1 サブパネル (ハイブリッドなし)
+    bs_num_rows_per_panel: int = 1
+    bs_num_cols_per_panel: int = 1
+
+    # 学習高速化 (CIR固定)
+    num_slots: int = 5
+    coherence_time: int = 5
+
+    # ML Feature/Target
+    use_singular_vectors: bool = False  # Path features (Pattern B) as default
+    precoding_granularity: str = "Subband"
+
+    # FDD周波数設定 (一例)
+    ul_carrier_frequency: float = 1.9e9
+    dl_carrier_frequency: float = 2.1e9
+
+    # その他 run_fdd_sim にハードコードされていた値の移行
+    num_ut_drops: int = 1
+    batch_size: int = 1

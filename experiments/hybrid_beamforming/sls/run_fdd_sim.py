@@ -5,7 +5,7 @@ import pickle
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from experiments.hybrid_beamforming.sls.configs import SLSConfig
+from experiments.hybrid_beamforming.sls.configs import SLSConfig, FDDConfig
 from experiments.hybrid_beamforming.sls.simulator import SystemSimulator
 from experiments.hybrid_beamforming.sls.components.fdd_data_generator import (
     FDDDataGenerator,
@@ -37,34 +37,47 @@ def train_fdd_model(config, data_path):
 
         for b in range(B_val):
             for u in range(BUT_val):
-                # Target: DL V (complex flatten)
-                target = np.concatenate(
-                    [np.real(dl_v[b, u]).flatten(), np.imag(dl_v[b, u]).flatten()]
-                )
-                Y.append(target)
-
-                # Features
-                if config.use_singular_vectors:
-                    # Pattern A: UL V Vectors
-                    feat = np.concatenate(
-                        [np.real(ul_v[b, u]).flatten(), np.imag(ul_v[b, u]).flatten()]
+                for f in range(F_val):
+                    # Target: DL V (complex flatten)
+                    # dl_v shape: [B, BUT, F, Ant, Rank]
+                    target = np.concatenate(
+                        [
+                            np.real(dl_v[b, u, f]).flatten(),
+                            np.imag(dl_v[b, u, f]).flatten(),
+                        ]
                     )
-                    X.append(feat)
-                else:
-                    # Pattern B: Path Features
-                    # Indexing: paths['gain_abs'] is [B, num_bs, num_ut, C]
-                    # We take the serving BS index
-                    bs_idx = u // num_ut_per_sector
-                    feat_list = []
-                    if "gain_abs" in paths:
-                        feat_list.append(paths["gain_abs"][b, bs_idx, u].flatten())
-                    if "delay" in paths:
-                        feat_list.append(paths["delay"][b, bs_idx, u].flatten())
-                    if "aoa_azimuth" in paths:
-                        feat_list.append(paths["aoa_azimuth"][b, bs_idx, u].flatten())
-                    if "aod_azimuth" in paths:
-                        feat_list.append(paths["aod_azimuth"][b, bs_idx, u].flatten())
-                    X.append(np.concatenate(feat_list))
+                    Y.append(target)
+
+                    # Features
+                    if config.use_singular_vectors:
+                        # Pattern A: UL V Vectors
+                        feat = np.concatenate(
+                            [
+                                np.real(ul_v[b, u, f]).flatten(),
+                                np.imag(ul_v[b, u, f]).flatten(),
+                            ]
+                        )
+                        X.append(feat)
+                    else:
+                        # Pattern B: Path Features
+                        # Indexing: paths['gain_abs'] is [B, num_bs, num_ut, C]
+                        # We take the serving BS index
+                        bs_idx = u // num_ut_per_sector
+                        feat_list = []
+                        # Note: Path features are usually same for all subbands in the same slot
+                        if "gain_abs" in paths:
+                            feat_list.append(paths["gain_abs"][b, bs_idx, u].flatten())
+                        if "delay" in paths:
+                            feat_list.append(paths["delay"][b, bs_idx, u].flatten())
+                        if "aoa_azimuth" in paths:
+                            feat_list.append(
+                                paths["aoa_azimuth"][b, bs_idx, u].flatten()
+                            )
+                        if "aod_azimuth" in paths:
+                            feat_list.append(
+                                paths["aod_azimuth"][b, bs_idx, u].flatten()
+                            )
+                        X.append(np.concatenate(feat_list))
 
     X = np.array(X)
     Y = np.array(Y)
@@ -106,7 +119,7 @@ def run_fdd_evaluation(config, ml_model=None):
         hist = sim.call(
             num_drops=config.num_ut_drops, tx_power_dbm=config.bs_max_power_dbm
         )
-        results[mode] = hist["throughput_per_user"]
+        results[mode] = hist["num_decoded_bits"].numpy()
 
     return results
 
@@ -130,18 +143,17 @@ def plot_fdd_results(results, output_dir):
 
 
 def main():
-    config = SLSConfig()
-    config.num_ut_drops = 2  # Small for quick check
-    config.num_slots = 2
-    config.precoding_granularity = "Wideband"
+    config = FDDConfig()
 
     # Step 1: Data Generation
     data_path = os.path.join(config.output_dir, "fdd_training_data.pkl")
     if not os.path.exists(data_path):
         print("Starting Data Generation Phase...")
         generator = FDDDataGenerator(config)
-        # Collect very small data for quick verification
-        data = generator.collect_data(num_drops=2, num_slots_per_drop=2)
+        # Collect data for training
+        data = generator.collect_data(
+            num_drops=config.num_ut_drops, num_slots_per_drop=1
+        )
         generator.save_data(data, data_path)
     else:
         print(f"Using existing data at {data_path}")

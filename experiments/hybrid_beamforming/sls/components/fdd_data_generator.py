@@ -88,15 +88,22 @@ class FDDDataGenerator:
         # Transpose to [B, U, F, RxA, TxA]
         h_srv = tf.transpose(h_srv, [0, 1, 4, 2, 3])
 
+        # Calculate target_res consistent with simulator.py
+        n_f = self.resource_grid.fft_size
+        rbg_size_sc = (
+            self.config.rbg_size_rb * 12 if hasattr(self.config, "rbg_size_rb") else 72
+        )
+        target_res = (
+            (n_f + rbg_size_sc - 1) // rbg_size_sc if granularity == "subband" else n_f
+        )
+
         # Compute SVD using weight_utils
         u, v, s = weight_utils.get_digital_precoders(
             h_srv,
             num_layers=self.config.num_layers,
             granularity=granularity,
-            target_res=self.config.num_rb,  # N_target
-            rbg_size_sc=(
-                self.config.rbg_size_sc if hasattr(self.config, "rbg_size_sc") else 12
-            ),
+            target_res=target_res,
+            rbg_size_sc=rbg_size_sc,
             weight_type="svd",
         )
         return u, v, s
